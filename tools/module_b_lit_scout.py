@@ -1,62 +1,44 @@
 # -*- coding: utf-8 -*-
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
 import time
-import traceback
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import requests  # type: ignore
 except Exception:
     requests = None
-    import urllib.request
     import urllib.parse
+    import urllib.request
 
 
-
-def now_stamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="ignore")
-
-
-def write_text(path: Path, text: str) -> None:
-    path.write_text(text, encoding="utf-8")
-
-
-def parse_secrets_env(path: Path) -> Dict[str, str]:
-    data: Dict[str, str] = {}
-    if not path.exists():
-        return data
-    for raw in read_text(path).splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        data[k.strip()] = v.strip()
-    return data
-
-
+RU_STOPWORDS = {
+    "и", "или", "но", "для", "это", "как", "что", "при", "без", "над", "под", "между", "если", "чтобы",
+    "экзамен", "объяснение", "ожидаемые", "expected_patterns", "шаг", "этап", "идея", "почему", "как", "проверка",
+    "данные", "результат", "гипотеза", "исследование", "метод", "подход", "тест", "вероятно", "может",
+}
+EN_STOPWORDS = {
+    "the", "and", "or", "for", "with", "without", "this", "that", "from", "into", "about", "expected", "patterns",
+    "explanation", "exam", "step", "stage", "idea", "result", "results", "method", "approach", "test", "tests",
+    "hypothesis", "research", "likely", "possible", "should", "would", "could", "data",
+}
 
 
 class _MiniResp:
-    def __init__(self, status_code:int, body:str):
-        self.status_code=status_code
-        self._body=body
+    def __init__(self, status_code: int, body: str):
+        self.status_code = status_code
+        self._body = body
+
     def json(self):
         return json.loads(self._body or "{}")
+
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
@@ -76,83 +58,82 @@ class _MiniSession:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read().decode("utf-8", errors="ignore")
             return _MiniResp(r.getcode(), body)
+
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def parse_secrets_env(path: Path) -> Dict[str, str]:
+    data: Dict[str, str] = {}
+    if not path.exists():
+        return data
+    for raw in read_text(path).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        data[k.strip()] = v.strip()
+    return data
+
+
 class StageB:
-    def __init__(self, idea_dir: Path, mode: str, offline_fixtures: Optional[Path] = None):
+    def __init__(self, idea_dir: Path, mode: str, offline_fixtures: Optional[Path]):
         self.idea_dir = idea_dir
         self.mode = mode.upper()
         self.offline_fixtures = offline_fixtures
         self.in_dir = idea_dir / "in"
         self.out_dir = idea_dir / "out"
         self.logs_dir = idea_dir / "logs"
-        ensure_dir(self.in_dir)
-        ensure_dir(self.out_dir)
-        ensure_dir(self.logs_dir)
-        self.module_log_path = self.logs_dir / f"moduleB_{now_stamp()}.log"
-        self.run_log_path = self.out_dir / "runB.log"
+        self.cache_dir = self.out_dir / "cache_openalex"
+        for d in (self.in_dir, self.out_dir, self.logs_dir, self.cache_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        self.run_log = self.out_dir / "runB.log"
         self.search_log_path = self.out_dir / "search_log_B.json"
-        self.http_trace_path = self.out_dir / "http_trace_B.jsonl"
+        self.trace_path = self.out_dir / "http_trace_B.jsonl"
+        self.module_log_path = self.logs_dir / f"moduleB_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
         self.debug_http = os.getenv("PIPELINE_DEBUG", "0") == "1"
+        self.secrets = parse_secrets_env(self.idea_dir.parents[1] / "config" / "secrets.env")
+        self.mailto = self.secrets.get("OPENALEX_MAILTO", "")
+
+        self.session = requests.Session() if requests else _MiniSession()
+        self.ua = "IDEA_PIPELINE_2.0-StageB/2.0"
+
         self.search_log: Dict[str, Any] = {
             "mode": self.mode,
-            "started_at": datetime.utcnow().isoformat() + "Z",
+            "started_at": now_iso(),
+            "anchor_candidates": [],
+            "anchor_top20": [],
             "abbreviation_decisions": [],
             "queries": [],
             "gating": {},
             "timings_ms": {},
-            "scoring": {
-                "formula": "anchor_bonus + source_bonus + cited_bonus - drift_penalty - generic_penalty",
-                "weights": {
-                    "anchor_bonus": 4.0,
-                    "source_bonus": {"seed": 2.0, "citation": 1.4, "related": 1.2, "s2_reco": 1.0, "researchrabbit": 0.8},
-                    "cited_by_multiplier": 0.015,
-                    "drift_penalty": 2.5,
-                    "generic_penalty": 1.5,
-                },
-            },
-            "stats": {},
             "errors": [],
+            "stats": {},
         }
-        self.secrets = parse_secrets_env(self.idea_dir.parents[1] / "config" / "secrets.env")
-        self.session = requests.Session() if requests else _MiniSession()
-        self.ua = "IDEA_PIPELINE_2.0-StageB/1.0"
-        self.mailto = self.secrets.get("OPENALEX_MAILTO", "")
 
-    def log(self, msg: str) -> None:
-        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-        with self.module_log_path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        with self.run_log_path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+    def log(self, message: str) -> None:
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+        for p in (self.run_log, self.module_log_path):
+            with p.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
 
     def trace_http(self, payload: Dict[str, Any]) -> None:
         if not self.debug_http:
             return
-        with self.http_trace_path.open("a", encoding="utf-8") as f:
+        with self.trace_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-    def request_json(self, method: str, url: str, source: str, **kwargs) -> Dict[str, Any]:
-        retries = 3
-        timeout = kwargs.pop("timeout", 20)
-        headers = kwargs.pop("headers", {})
-        headers["User-Agent"] = self.ua
-        for attempt in range(1, retries + 1):
-            t0 = time.time()
-            try:
-                r = self.session.request(method, url, timeout=timeout, headers=headers, **kwargs)
-                ms = int((time.time() - t0) * 1000)
-                self.trace_http({"url": url, "status": r.status_code, "ms": ms, "retries": attempt - 1, "source": source})
-                if r.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(1.2 * attempt)
-                    continue
-                r.raise_for_status()
-                return r.json()
-            except Exception as e:
-                ms = int((time.time() - t0) * 1000)
-                self.trace_http({"url": url, "status": -1, "ms": ms, "retries": attempt - 1, "source": source})
-                if attempt == retries:
-                    raise
-                time.sleep(1.2 * attempt)
-        return {}
 
     def ensure_idea_text(self) -> Tuple[bool, str]:
         idea_top = self.idea_dir / "idea.txt"
@@ -168,117 +149,266 @@ class StageB:
         if p.exists():
             try:
                 return json.loads(read_text(p))
-            except Exception:
-                self.search_log["errors"].append("structured_idea.json parse error")
+            except Exception as e:
+                self.search_log["errors"].append(f"structured parse error: {e}")
         return {}
 
-    def extract_abbrev_map(self, text: str) -> Dict[str, str]:
-        m = {}
-        for full, abbr in re.findall(r"([A-Za-zА-Яа-я0-9\-\s]{5,})\(([A-Z0-9]{2,6})\)", text):
-            m[abbr] = full.strip()
-        for abbr, full in re.findall(r"\b([A-Z0-9]{2,6})\s*[—-]\s*([A-Za-zА-Яа-я0-9\-\s]{5,})", text):
-            m[abbr] = full.strip()
-        return m
+    def _cache_file(self, url: str, params: Dict[str, Any]) -> Path:
+        payload = json.dumps({"url": url, "params": params}, sort_keys=True, ensure_ascii=False)
+        key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{key}.json"
 
-    def extract_anchors(self, idea_text: str, structured: Dict[str, Any]) -> List[str]:
+    def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        params = params or {}
+        headers = {"User-Agent": self.ua}
+        if source == "openalex" and method.upper() == "GET":
+            cached = self._cache_file(url, params)
+            if cached.exists():
+                return json.loads(read_text(cached)), {"status": 200, "retries": 0, "cached": True}
+
+        retries = 4
+        last_status = -1
+        for attempt in range(1, retries + 1):
+            t0 = time.time()
+            try:
+                resp = self.session.request(method.upper(), url, timeout=25, headers=headers, params=params, json=payload)
+                ms = int((time.time() - t0) * 1000)
+                last_status = getattr(resp, "status_code", -1)
+                self.trace_http({"url": url, "status": last_status, "ms": ms, "retries": attempt - 1, "engine": source})
+                if last_status in (429, 500, 502, 503, 504):
+                    time.sleep(1.2 * attempt)
+                    continue
+                resp.raise_for_status()
+                obj = resp.json()
+                if source == "openalex" and method.upper() == "GET":
+                    write_text(self._cache_file(url, params), json.dumps(obj, ensure_ascii=False))
+                return obj, {"status": last_status, "retries": attempt - 1, "cached": False}
+            except Exception as e:
+                ms = int((time.time() - t0) * 1000)
+                self.trace_http({"url": url, "status": last_status, "ms": ms, "retries": attempt - 1, "engine": source, "error": str(e)})
+                if attempt == retries:
+                    raise
+                time.sleep(1.2 * attempt)
+        raise RuntimeError("unreachable")
+
+    def extract_abbrev_map(self, text: str) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for full, abbr in re.findall(r"([A-Za-zА-Яа-я0-9\-\s]{6,80})\(([A-Z0-9]{2,6})\)", text):
+            out[abbr] = full.strip()
+        for abbr, full in re.findall(r"\b([A-Z0-9]{2,6})\s*[—-]\s*([A-Za-zА-Яа-я0-9\-\s]{6,80})", text):
+            out[abbr] = full.strip()
+        return out
+
+    def _tokenize(self, text: str) -> List[str]:
+        return [t for t in re.split(r"[^A-Za-zА-Яа-я0-9\-]+", text.lower()) if t]
+
+    def _too_generic(self, phrase: str) -> bool:
+        toks = self._tokenize(phrase)
+        if not toks:
+            return True
+        if len(toks) > 5:
+            return True
+        if len(phrase) > 50:
+            return True
+        return all(t in RU_STOPWORDS or t in EN_STOPWORDS for t in toks)
+
+    def extract_anchors(self, idea_text: str, structured: Dict[str, Any]) -> Tuple[List[str], Dict[str, str], Set[str]]:
         blob_parts = [idea_text]
+        s = structured.get("structured_idea", {}) if isinstance(structured.get("structured_idea", {}), dict) else {}
         for k in ("problem", "main_hypothesis", "key_predictions", "decisive_tests"):
-            v = structured.get("structured_idea", {}).get(k)
+            v = s.get(k)
             if isinstance(v, str):
                 blob_parts.append(v)
             elif isinstance(v, list):
-                blob_parts.append(json.dumps(v, ensure_ascii=False))
+                blob_parts.extend([str(x) for x in v if isinstance(x, str)])
         blob = "\n".join(blob_parts)
 
-        anchors = set()
-        for q in re.findall(r"[\"«]([^\"»]{4,120})[\"»]", blob):
-            anchors.add(q.strip())
-        for t in re.findall(r"\b[\wА-Яа-я]+[-][\wА-Яа-я]+\b", blob):
-            if len(t) >= 6:
-                anchors.add(t)
-        for t in re.findall(r"\b[A-Za-z][A-Za-z0-9]{5,}\b", blob):
-            if any(ch.isdigit() for ch in t) or re.search(r"[A-Z].*[A-Z]", t):
-                anchors.add(t)
-        for t in re.findall(r"\b(?:[A-ZА-Я][\w-]+\s+){1,3}[A-ZА-Я][\w-]+\b", blob):
-            if len(t) > 6:
-                anchors.add(t)
+        scored: Dict[str, float] = {}
+        reasons: Dict[str, List[str]] = {}
+
+        def add_anchor(a: str, why: str, score: float) -> None:
+            a = re.sub(r"\s+", " ", a.strip())
+            if not a or self._too_generic(a):
+                return
+            scored[a] = max(scored.get(a, 0.0), score)
+            reasons.setdefault(a, []).append(why)
+
+        for q in re.findall(r"[\"«]([^\"»]{2,180})[\"»]", blob):
+            add_anchor(q, "quoted_short", 2.5)
+
+        for t in re.findall(r"\b[\wА-Яа-я]+-[\wА-Яа-я]+\b", blob):
+            add_anchor(t, "hyphen_term", 2.2)
+
+        for t in re.findall(r"\b[A-Za-z][A-Za-z0-9]{2,}\b", blob):
+            if any(ch.isdigit() for ch in t) or re.search(r"[a-z][A-Z]|[A-Z]{2,}", t):
+                add_anchor(t, "camel_or_digit", 2.1)
+
+        for t in re.findall(r"\b(?:[A-ZА-Я][a-zа-я]+\s+){0,3}[A-ZА-Я][a-zа-я]+\b", blob):
+            add_anchor(t, "named_entity_like", 1.8)
+
+        words = re.findall(r"[A-Za-zА-Яа-я0-9\-]{3,}", blob)
+        cnt = Counter(w.lower() for w in words)
+        for tok, c in cnt.items():
+            if c < 2:
+                continue
+            if tok in RU_STOPWORDS or tok in EN_STOPWORDS:
+                continue
+            if len(tok) > 2:
+                add_anchor(tok, "freq_term", min(2.0, 1 + c / 5.0))
+
+        ranked = sorted(scored.items(), key=lambda x: (-x[1], x[0].lower()))
+        anchors = [k for k, _ in ranked[:20]]
+        self.search_log["anchor_candidates"] = [{"anchor": a, "score": round(scored[a], 2), "reasons": reasons[a]} for a in anchors]
+        self.search_log["anchor_top20"] = self.search_log["anchor_candidates"]
+        self.log("TOP-20 anchors: " + "; ".join([f"{a['anchor']} [{','.join(a['reasons'])}]" for a in self.search_log["anchor_top20"][:20]]))
 
         ab_map = self.extract_abbrev_map(blob)
         all_abbr = set(re.findall(r"\b[A-Z0-9]{2,6}\b", blob))
-        for ab in sorted(all_abbr):
-            allow = ab in ab_map
-            self.search_log["abbreviation_decisions"].append({"abbr": ab, "allowed": allow, "reason": "expanded" if allow else "blocked"})
-            if allow:
-                anchors.add(f"{ab} {ab_map[ab]}")
+        return anchors, ab_map, all_abbr
 
-        clean = [a.strip() for a in anchors if len(a.strip()) >= 4]
-        clean.sort(key=lambda x: (-len(x), x))
-        return clean[:18]
-
-    def build_anchor_packs(self, anchors: List[str]) -> List[List[str]]:
-        packs = []
-        n = min(6, max(3, len(anchors) // 3 if anchors else 3))
-        for i in range(n):
-            chunk = anchors[i * 3:(i * 3) + 3]
+    def build_seed_queries(self, anchors: List[str]) -> List[Dict[str, Any]]:
+        packs: List[List[str]] = []
+        for i in range(0, min(len(anchors), 18), 3):
+            chunk = anchors[i:i + 3]
             if len(chunk) >= 2:
-                packs.append(chunk[:3])
-        if not packs and len(anchors) >= 2:
-            packs.append(anchors[:2])
-        return packs[:6]
+                packs.append(chunk)
+        packs = packs[:6]
 
-    def openalex_search(self, pack: List[str]) -> List[Dict[str, Any]]:
-        query = " AND ".join([f'"{p}"' for p in pack])
-        params = {"search": query, "per-page": 50, "page": 1}
+        out: List[Dict[str, Any]] = []
+        for pack in packs:
+            strict_terms = [f'"{p}"' if len(p) <= 50 and len(p.split()) <= 5 else p for p in pack]
+            out.append({"variant": "strict", "query": " AND ".join(strict_terms), "anchors": pack})
+        for pack in packs[:3]:
+            out.append({"variant": "loose", "query": " ".join(pack[:2]), "anchors": pack[:2]})
+        return out
+
+    def openalex_search(self, query: str, variant: str) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"search": query, "per-page": 50, "page": 1}
         if self.mailto:
             params["mailto"] = self.mailto
         t0 = time.time()
-        obj = self.request_json("GET", "https://api.openalex.org/works", source="openalex", params=params)
-        self.search_log["queries"].append({"query": query, "engine": "openalex", "results": len(obj.get("results", []))})
+        obj, meta = self.request_json("GET", "https://api.openalex.org/works", source="openalex", params=params)
+        results = obj.get("results", [])
+        self.search_log["queries"].append({
+            "query": query,
+            "variant": variant,
+            "engine": "openalex",
+            "results": len(results),
+            "http_status": meta.get("status", -1),
+            "retries": meta.get("retries", 0),
+            "cached": meta.get("cached", False),
+        })
         self.search_log["timings_ms"][query] = int((time.time() - t0) * 1000)
-        return obj.get("results", [])
+        return results
 
     def _paper_from_openalex(self, w: Dict[str, Any], source: str) -> Dict[str, Any]:
         doi = (w.get("doi") or "").replace("https://doi.org/", "")
-        authors = ", ".join([(a.get("author", {}) or {}).get("display_name", "") for a in (w.get("authorships") or [])[:4]])
-        concepts = [c.get("display_name", "") for c in (w.get("concepts") or [])[:5]]
+        concepts = [c.get("display_name", "") for c in (w.get("concepts") or [])[:5] if c.get("display_name")]
+        topics = [t.get("display_name", "") for t in (w.get("topics") or [])[:3] if t.get("display_name")]
         return {
             "title": w.get("title", ""),
             "year": w.get("publication_year", ""),
             "doi": doi,
             "openalex_id": w.get("id", ""),
-            "venue": (w.get("host_venue") or {}).get("display_name", ""),
-            "authors_short": authors,
+            "venue": (w.get("host_venue") or {}).get("display_name", "") or (w.get("primary_location", {}).get("source") or {}).get("display_name", ""),
+            "authors_short": ", ".join([(a.get("author", {}) or {}).get("display_name", "") for a in (w.get("authorships") or [])[:4]]),
             "cited_by_count": w.get("cited_by_count", 0) or 0,
             "source_tags": {source},
             "url": w.get("primary_location", {}).get("landing_page_url") or w.get("id", ""),
             "concepts": concepts,
+            "topics": topics,
+            "referenced_works": w.get("referenced_works", [])[:15],
+            "related_works": w.get("related_works", [])[:15],
         }
 
-    def subject_gate(self, papers: List[Dict[str, Any]]) -> List[str]:
-        concepts = Counter()
-        for p in papers:
-            for c in p.get("concepts", [])[:3]:
-                if c:
-                    concepts[c] += 1
-        allowed = [name for name, _ in concepts.most_common(2)]
-        self.search_log["gating"] = {"allowed_concepts": allowed}
+    def apply_abbreviation_policy(self, all_abbr: Set[str], ab_map: Dict[str, str], seed_papers: List[Dict[str, Any]], anchors: List[str]) -> List[str]:
+        allowed: List[str] = []
+        seed_titles = [p.get("title", "") for p in seed_papers]
+        for ab in sorted(all_abbr):
+            reason = "blocked_default"
+            ok = False
+            if ab in ab_map:
+                ok = True
+                reason = "explicit_expansion"
+            else:
+                hit = sum(1 for t in seed_titles if re.search(rf"\b{re.escape(ab)}\b", t))
+                co = sum(1 for t in seed_titles if re.search(rf"\b{re.escape(ab)}\b", t) and any(a.lower() in t.lower() for a in anchors[:8]))
+                if hit >= 2 and co >= 1:
+                    ok = True
+                    reason = "seed_self_validated"
+            self.search_log["abbreviation_decisions"].append({"abbr": ab, "allowed": ok, "reason": reason})
+            if ok:
+                allowed.append(ab)
         return allowed
 
-    def expand_openalex(self, seed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out = []
-        budget = 20 if self.mode == "WIDE" else 12 if self.mode == "BALANCED" else 8
+    def subject_gate(self, papers: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        cc, tc, vc = Counter(), Counter(), Counter()
+        for p in papers:
+            for c in p.get("concepts", [])[:3]:
+                cc[c] += 1
+            for t in p.get("topics", [])[:2]:
+                tc[t] += 1
+            if p.get("venue"):
+                vc[p["venue"]] += 1
+        topc = [x for x, _ in cc.most_common(3)]
+        topt = [x for x, _ in tc.most_common(3)]
+        topv = [x for x, _ in vc.most_common(3)]
+        if self.mode == "FOCUSED":
+            k = 1
+            explore_budget = 0
+        elif self.mode == "BALANCED":
+            k = 2
+            explore_budget = 2
+        else:
+            k = 3
+            explore_budget = 4
+        gating = {
+            "allowed_concepts": topc[:k],
+            "allowed_topics": topt[:k],
+            "allowed_venues": topv[:k],
+            "explore_budget": explore_budget,
+            "why": f"mode={self.mode}; seed-profile top concepts/topics/venues",
+        }
+        self.search_log["gating"] = gating
+        return gating
+
+    def _passes_gate(self, p: Dict[str, Any], gating: Dict[str, List[str]]) -> bool:
+        c_ok = not gating.get("allowed_concepts") or any(c in gating["allowed_concepts"] for c in p.get("concepts", []))
+        t_ok = not gating.get("allowed_topics") or any(t in gating["allowed_topics"] for t in p.get("topics", []))
+        v_ok = not gating.get("allowed_venues") or p.get("venue") in gating.get("allowed_venues", [])
+        return c_ok or t_ok or v_ok
+
+    def expand_openalex(self, seed: List[Dict[str, Any]], gating: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        budget = 14 if self.mode == "WIDE" else 10 if self.mode == "BALANCED" else 6
         for p in seed[:budget]:
             wid = p.get("openalex_id", "").split("/")[-1]
             if not wid:
                 continue
-            params = {"filter": f"cites:{wid}", "per-page": 10}
-            if self.mailto:
-                params["mailto"] = self.mailto
-            try:
-                res = self.request_json("GET", "https://api.openalex.org/works", source="openalex", params=params)
-                out.extend([self._paper_from_openalex(w, "citation") for w in res.get("results", [])])
-            except Exception as e:
-                self.search_log["errors"].append(f"expand cites failed {wid}: {e}")
+            queries = [
+                {"filter": f"cites:{wid}", "tag": "forward"},
+            ]
+            for ref in p.get("referenced_works", [])[:5]:
+                rid = ref.split("/")[-1]
+                if rid:
+                    queries.append({"filter": f"openalex:{rid}", "tag": "backward"})
+            for rel in p.get("related_works", [])[:5]:
+                rid = rel.split("/")[-1]
+                if rid:
+                    queries.append({"filter": f"openalex:{rid}", "tag": "related"})
+
+            for q in queries[:8]:
+                params = {"filter": q["filter"], "per-page": 10}
+                if self.mailto:
+                    params["mailto"] = self.mailto
+                try:
+                    obj, _ = self.request_json("GET", "https://api.openalex.org/works", source="openalex", params=params)
+                    for w in obj.get("results", []):
+                        pw = self._paper_from_openalex(w, "citation")
+                        if self._passes_gate(pw, gating):
+                            out.append(pw)
+                except Exception as e:
+                    self.search_log["errors"].append(f"expand {q['tag']} {wid}: {e}")
         return out
 
     def s2_recommend(self, seed: List[Dict[str, Any]], negatives: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -288,7 +418,7 @@ class StageB:
             return []
         payload = {"positive_paper_ids": positive, "negative_paper_ids": negative}
         try:
-            obj = self.request_json("POST", "https://api.semanticscholar.org/recommendations/v1/papers", source="s2", json=payload)
+            obj, _ = self.request_json("POST", "https://api.semanticscholar.org/recommendations/v1/papers", source="s2", payload=payload)
             out = []
             for p in obj.get("recommendedPapers", []):
                 out.append({
@@ -302,6 +432,9 @@ class StageB:
                     "source_tags": {"s2_reco"},
                     "url": f"https://www.semanticscholar.org/paper/{p.get('paperId','')}",
                     "concepts": [],
+                    "topics": [],
+                    "referenced_works": [],
+                    "related_works": [],
                 })
             return out
         except Exception as e:
@@ -310,50 +443,39 @@ class StageB:
 
     def write_rr_import(self, seeds: List[Dict[str, Any]]) -> None:
         rr_dir = self.out_dir / "researchrabbit"
-        ensure_dir(rr_dir)
-        ris = []
+        rr_dir.mkdir(parents=True, exist_ok=True)
+        lines: List[str] = []
         for p in seeds[:50]:
-            ris.append("TY  - JOUR")
-            ris.append(f"TI  - {p.get('title','')}")
+            lines.extend(["TY  - JOUR", f"TI  - {p.get('title','')}"])
             if p.get("year"):
-                ris.append(f"PY  - {p.get('year')}")
+                lines.append(f"PY  - {p.get('year')}")
             if p.get("doi"):
-                ris.append(f"DO  - {p.get('doi')}")
-            ris.append("ER  -")
-        write_text(rr_dir / "RR_IMPORT.ris", "\n".join(ris) + "\n")
+                lines.append(f"DO  - {p.get('doi')}")
+            lines.append("ER  -")
+        write_text(rr_dir / "RR_IMPORT.ris", "\n".join(lines) + "\n")
 
-    def parse_rr_export(self) -> List[Dict[str, Any]]:
+    def parse_rr_export(self) -> List[Dict[str, str]]:
         rr_dir = self.out_dir / "researchrabbit"
-        if not rr_dir.exists():
-            return []
-        export = None
         for name in ("RR_EXPORT.ris", "RR_EXPORT.bib", "RR_EXPORT.csv"):
             p = rr_dir / name
-            if p.exists():
-                export = p
-                break
-        if not export:
-            return []
-        items = []
-        txt = read_text(export)
-        if export.suffix.lower() == ".ris":
-            chunks = [c for c in txt.split("ER  -") if c.strip()]
-            for ch in chunks:
-                doi = ""
-                title = ""
-                year = ""
-                for line in ch.splitlines():
-                    if line.startswith("DO  -"):
-                        doi = line.split("-", 1)[1].strip()
-                    if line.startswith("TI  -"):
-                        title = line.split("-", 1)[1].strip()
-                    if line.startswith("PY  -"):
-                        year = line.split("-", 1)[1].strip()
-                items.append({"doi": doi, "title": title, "year": year})
-        return items
+            if p.exists() and p.suffix.lower() == ".ris":
+                out = []
+                chunks = [c for c in read_text(p).split("ER  -") if c.strip()]
+                for ch in chunks:
+                    item = {"title": "", "doi": "", "year": ""}
+                    for line in ch.splitlines():
+                        if line.startswith("TI  -"):
+                            item["title"] = line.split("-", 1)[1].strip()
+                        elif line.startswith("DO  -"):
+                            item["doi"] = line.split("-", 1)[1].strip()
+                        elif line.startswith("PY  -"):
+                            item["year"] = line.split("-", 1)[1].strip()
+                    out.append(item)
+                return out
+        return []
 
-    def enrich_rr(self, rr_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out = []
+    def enrich_rr(self, rr_items: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
         for it in rr_items[:100]:
             doi = it.get("doi", "")
             if not doi:
@@ -362,186 +484,237 @@ class StageB:
             if self.mailto:
                 params["mailto"] = self.mailto
             try:
-                obj = self.request_json("GET", "https://api.openalex.org/works", source="openalex", params=params)
+                obj, _ = self.request_json("GET", "https://api.openalex.org/works", source="openalex", params=params)
                 if obj.get("results"):
                     out.append(self._paper_from_openalex(obj["results"][0], "researchrabbit"))
             except Exception as e:
-                self.search_log["errors"].append(f"rr enrich failed for doi {doi}: {e}")
+                self.search_log["errors"].append(f"rr enrich {doi}: {e}")
         return out
 
-    def score(self, papers: List[Dict[str, Any]], anchors: List[str], allowed_concepts: List[str]) -> List[Dict[str, Any]]:
-        w = self.search_log["scoring"]["weights"]
-        rows = []
-        for p in papers:
-            text = (p.get("title", "") + " " + p.get("venue", "")).lower()
-            anchor_hits = sum(1 for a in anchors if a.lower() in text)
-            source = next(iter(p.get("source_tags") or {"citation"}))
-            source_bonus = w["source_bonus"].get(source, 0.5)
-            cited_bonus = (p.get("cited_by_count", 0) or 0) * w["cited_by_multiplier"]
-            drift = 0.0
-            if allowed_concepts:
-                if not any(c in allowed_concepts for c in p.get("concepts", [])):
-                    drift = w["drift_penalty"]
-            generic_penalty = w["generic_penalty"] if len((p.get("title") or "").split()) < 4 else 0.0
-            score = anchor_hits * w["anchor_bonus"] + source_bonus + cited_bonus - drift - generic_penalty
-            p2 = dict(p)
-            p2["score"] = round(score, 3)
-            rows.append(p2)
-        rows.sort(key=lambda x: x["score"], reverse=True)
-        for i, r in enumerate(rows, 1):
-            r["rank"] = i
-        return rows
-
-    def dedup_merge(self, batches: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-        acc: Dict[str, Dict[str, Any]] = {}
-        for batch in batches:
-            for p in batch:
-                key = (p.get("doi") or p.get("openalex_id") or p.get("title") or "").lower()
+    def dedup_merge(self, groups: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        by_key: Dict[str, Dict[str, Any]] = {}
+        for g in groups:
+            for p in g:
+                key = p.get("doi") or p.get("openalex_id") or p.get("title", "").strip().lower()
                 if not key:
                     continue
-                if key in acc:
-                    acc[key]["source_tags"] = set(acc[key].get("source_tags", set())) | set(p.get("source_tags", set()))
-                    acc[key]["cited_by_count"] = max(acc[key].get("cited_by_count", 0), p.get("cited_by_count", 0))
+                if key not in by_key:
+                    by_key[key] = p
                 else:
-                    acc[key] = p
-        for p in acc.values():
-            p["source_tags"] = sorted(list(p.get("source_tags", [])))
-        return list(acc.values())
+                    by_key[key]["source_tags"] = set(by_key[key].get("source_tags", set())) | set(p.get("source_tags", set()))
+                    by_key[key]["cited_by_count"] = max(by_key[key].get("cited_by_count", 0), p.get("cited_by_count", 0))
+        return list(by_key.values())
+
+    def score(self, papers: List[Dict[str, Any]], anchors: List[str], negatives: List[str], gating: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+        ranked = []
+        for p in papers:
+            text = (p.get("title", "") + " " + p.get("venue", "")).lower()
+            hits = sum(1 for a in anchors[:15] if a.lower() in text)
+            neg_hits = sum(1 for n in negatives if n.lower() in text)
+            gate_bonus = 1.0 if self._passes_gate(p, gating) else -2.0
+            source_bonus = 1.2 if "seed" in p.get("source_tags", set()) else 0.7
+            score = hits * 2.0 + source_bonus + (p.get("cited_by_count", 0) or 0) * 0.015 + gate_bonus - neg_hits * 1.5
+            p["score"] = round(score, 3)
+            p["source_tags"] = ",".join(sorted(list(p.get("source_tags", set()))))
+            ranked.append(p)
+        ranked.sort(key=lambda x: (-x["score"], -(x.get("cited_by_count", 0) or 0)))
+        return ranked
 
     def write_corpus(self, papers: List[Dict[str, Any]]) -> None:
-        cols = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
-
-        def write(path: Path, rows: List[Dict[str, Any]]):
-            with path.open("w", encoding="utf-8", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=cols)
+        fields = ["title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "score", "url"]
+        for name, rows in (("corpus_all.csv", papers), ("corpus.csv", papers[:300])):
+            with (self.out_dir / name).open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fields)
                 w.writeheader()
-                for r in rows:
-                    row = {c: r.get(c, "") for c in cols}
-                    row["source_tags"] = ",".join(r.get("source_tags", [])) if isinstance(r.get("source_tags"), list) else r.get("source_tags", "")
-                    w.writerow(row)
-
-        write(self.out_dir / "corpus_all.csv", papers)
-        write(self.out_dir / "corpus.csv", papers[:300])
+                for p in rows:
+                    w.writerow({k: p.get(k, "") for k in fields})
 
     def write_prisma(self, stats: Dict[str, Any]) -> None:
-        lines = [
-            "# PRISMA-lite (Stage B)",
-            f"- Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"- Mode: {self.mode}",
-            f"- Seed queries: {stats.get('seed_queries', 0)}",
-            f"- Seed papers: {stats.get('seed_count', 0)}",
-            f"- Expanded papers: {stats.get('expanded_count', 0)}",
-            f"- S2 recommendations: {stats.get('s2_count', 0)}",
-            f"- ResearchRabbit merged: {stats.get('rr_count', 0)}",
-            f"- Deduplicated total: {stats.get('dedup_count', 0)}",
-            f"- Final ranked: {stats.get('final_count', 0)}",
-            "- Sources: OpenAlex Works API, Semantic Scholar Recommendations API, ResearchRabbit export/import bridge",
-            "- Strategy: precision-first anchor packs with subject gating and drift penalties",
-        ]
-        write_text(self.out_dir / "prisma_lite_B.md", "\n".join(lines) + "\n")
+        txt = (
+            "# PRISMA-lite Stage B\n\n"
+            f"- Seed queries: {stats.get('seed_queries', 0)}\n"
+            f"- Seed found: {stats.get('seed_count', 0)}\n"
+            f"- Expansion found: {stats.get('expanded_count', 0)}\n"
+            f"- S2 recommendations: {stats.get('s2_count', 0)}\n"
+            f"- RR merged: {stats.get('rr_count', 0)}\n"
+            f"- Final corpus size: {stats.get('final_count', 0)}\n"
+        )
+        write_text(self.out_dir / "prisma_lite_B.md", txt)
 
-    def write_summary(self, stats: Dict[str, Any], degraded: bool, note: str = "") -> None:
-        lines = [
-            "Stage B (Literature Scout) выполнен.",
-            f"Режим: {self.mode}.",
-            "1) Проверены входы идеи и синхронизация in/idea.txt -> idea.txt.",
-            "2) Если был structured_idea.json из Stage A, использован как главный источник якорей.",
-            "3) Извлечены якоря и собраны точные anchor packs (2-4 якоря в запросе).",
-            "4) Аббревиатуры проверены по правилам безопасности против шума.",
-            "5) Выполнен seed-поиск через OpenAlex с ограничением выдачи.",
-            "6) Построен subject-gating по top concepts, чтобы снизить дрейф.",
-            "7) Выполнено расширение через citation network OpenAlex.",
-            "8) Выполнены рекомендации Semantic Scholar (если доступны DOI/сеть).",
-            "9) Сформирован RR_IMPORT.ris для bridge в ResearchRabbit/Zotero.",
-            "10) Если присутствовал RR_EXPORT.*, данные объединены обратно в корпус.",
-            f"11) Всего после дедупликации: {stats.get('dedup_count', 0)} записей.",
-            f"12) В corpus.csv записан top-300 (фактически {min(300, stats.get('final_count', 0))}).",
-            "13) Подробный machine-log: out/search_log_B.json.",
-            "14) Человекочитаемый лог: out/runB.log.",
-            f"15) Лог модуля: {self.module_log_path.name} в ideas/.../logs.",
-            "16) Для API-отладки включите PIPELINE_DEBUG=1 (http_trace_B.jsonl).",
-            "17) Секреты из config/secrets.env читаются без вывода значений в лог.",
-            "18) Следующий шаг: просмотреть top-20 и уточнить якоря/режим.",
-            "19) Для строгого режима запустите FOCUSED; для разведки — WIDE.",
-            "20) Повторный запуск перезаписывает только файлы Stage B.",
-        ]
-        if degraded:
-            lines.append("21) Режим DEGRADED: сеть/API были недоступны, созданы безопасные выходные файлы-заглушки.")
-        if note:
-            lines.append(f"22) Примечание: {note}")
+    def write_wait_files(self, anchors: List[str]) -> None:
+        prompt = (
+            "Ты помогаешь Stage B научного поиска. Верни ТОЛЬКО валидный JSON:\n"
+            "{\n"
+            "  \"keywords_en\": [\"...\"],\n"
+            "  \"openalex_queries\": [\"...\"],\n"
+            "  \"negative_terms\": [\"...\"],\n"
+            "  \"abbrev_expansions\": {\"ABBR\": \"full term\"}\n"
+            "}\n"
+            "Ограничения: openalex_queries максимум 8, короткие (2-6 терминов), без длинных предложений и без длинных цитат.\n"
+            f"Текущие якоря Stage B: {', '.join(anchors[:20])}\n"
+        )
+        write_text(self.out_dir / "llm_prompt_B_keywords.txt", prompt)
+        template = {
+            "_instruction": "Вставьте сюда ответ ChatGPT (только JSON объект без markdown).",
+            "keywords_en": [],
+            "openalex_queries": [],
+            "negative_terms": [],
+            "abbrev_expansions": {},
+        }
+        write_text(self.in_dir / "llm_response_B.json", json.dumps(template, ensure_ascii=False, indent=2))
+
+    def write_summary(self, stats: Dict[str, Any], wait_mode: bool = False) -> None:
+        if wait_mode:
+            lines = [
+                "Stage B: нужен 1 ручной шаг через ChatGPT.",
+                f"Идея: {self.idea_dir.name}",
+                f"Seed-статистика: найдено {stats.get('seed_count', 0)} работ (минимум 5).",
+                "Что делать:",
+                f"1) Откройте: {self.out_dir / 'llm_prompt_B_keywords.txt'}",
+                "2) Вставьте prompt в ChatGPT.",
+                "3) Скопируйте JSON-ответ без markdown.",
+                f"4) Вставьте JSON в: {self.in_dir / 'llm_response_B.json'}",
+                "5) Сохраните файл и снова запустите RUN_B.bat.",
+                f"Логи: {self.out_dir / 'runB.log'} и {self.out_dir / 'search_log_B.json'}",
+            ]
+        else:
+            lines = [
+                "Stage B завершена.",
+                f"Идея: {self.idea_dir.name}",
+                f"Seed-запросов: {stats.get('seed_queries', 0)}",
+                f"Seed-работ: {stats.get('seed_count', 0)}",
+                f"Expansion: {stats.get('expanded_count', 0)}",
+                f"S2 recommendations: {stats.get('s2_count', 0)}",
+                f"ResearchRabbit merged: {stats.get('rr_count', 0)}",
+                f"Итоговый корпус: {stats.get('final_count', 0)}",
+                f"Файлы: {self.out_dir / 'corpus.csv'}",
+                f"Файлы: {self.out_dir / 'corpus_all.csv'}",
+                f"Файлы: {self.out_dir / 'prisma_lite_B.md'}",
+                f"Логи: {self.out_dir / 'runB.log'}",
+                f"Логи: {self.out_dir / 'search_log_B.json'}",
+            ]
         write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines) + "\n")
 
-    def load_offline_fixture(self) -> Dict[str, Any]:
+    def load_offline_fixture(self) -> List[Dict[str, Any]]:
         if not self.offline_fixtures:
-            return {}
+            return []
         fp = self.offline_fixtures / "openalex_seed.json"
-        if fp.exists():
-            return json.loads(read_text(fp))
-        return {}
+        if not fp.exists():
+            return []
+        obj = json.loads(read_text(fp))
+        return [self._paper_from_openalex(w, "seed") for w in obj.get("results", [])]
+
+    def _load_llm_response(self) -> Dict[str, Any]:
+        p = self.in_dir / "llm_response_B.json"
+        if not p.exists():
+            return {}
+        try:
+            data = json.loads(read_text(p))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
     def run(self) -> int:
+        t_start = time.time()
         self.log("Stage B started")
         self.log(f"Mode={self.mode}")
         self.log(f"Secrets: OPENALEX_API_KEY={'***' if self.secrets.get('OPENALEX_API_KEY') else '(missing)'}, OPENALEX_MAILTO={'***' if self.mailto else '(missing)'}")
+
         ok, idea_or_msg = self.ensure_idea_text()
         if not ok:
-            self.log(idea_or_msg)
+            self.search_log["errors"].append(idea_or_msg)
             self.write_corpus([])
             self.write_prisma({})
-            self.write_summary({}, degraded=True, note=idea_or_msg)
+            self.write_summary({"seed_count": 0, "final_count": 0}, wait_mode=False)
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+            self.log(idea_or_msg)
             return 0
 
-        idea_text = idea_or_msg
         structured = self.load_structured()
-        anchors = self.extract_anchors(idea_text, structured)
-        packs = self.build_anchor_packs(anchors)
-        seed_papers = []
-        expanded = []
-        s2 = []
-        rr = []
-        degraded = False
+        anchors, ab_map, all_abbr = self.extract_anchors(idea_or_msg, structured)
+        llm_data = self._load_llm_response()
+        if llm_data.get("keywords_en"):
+            for kw in llm_data.get("keywords_en", [])[:12]:
+                if isinstance(kw, str) and kw.strip():
+                    anchors.append(kw.strip())
 
-        try:
-            if self.offline_fixtures:
-                fx = self.load_offline_fixture()
-                seed_papers = [self._paper_from_openalex(w, "seed") for w in fx.get("results", [])]
-            else:
-                for pack in packs[:8]:
-                    results = self.openalex_search(pack)
-                    seed_papers.extend([self._paper_from_openalex(w, "seed") for w in results])
-            allowed = self.subject_gate(seed_papers)
-            negatives = [p for p in seed_papers if allowed and not any(c in allowed for c in p.get("concepts", []))]
-            if not self.offline_fixtures:
-                expanded = self.expand_openalex(seed_papers)
-                s2 = self.s2_recommend(seed_papers, negatives)
-            self.write_rr_import(seed_papers)
-            rr_items = self.parse_rr_export()
-            if rr_items and not self.offline_fixtures:
-                rr = self.enrich_rr(rr_items)
-            merged = self.dedup_merge([seed_papers, expanded, s2, rr])
-            ranked = self.score(merged, anchors, allowed)
-        except Exception as e:
-            degraded = True
-            self.search_log["errors"].append(f"DEGRADED: {repr(e)}")
-            self.search_log["errors"].append(traceback.format_exc())
-            ranked = []
+        queries = self.build_seed_queries(anchors)
+        if llm_data.get("openalex_queries"):
+            priority = [{"variant": "llm_priority", "query": q, "anchors": []} for q in llm_data.get("openalex_queries", []) if isinstance(q, str) and q.strip()][:8]
+            queries = priority + queries
+
+        seed_papers: List[Dict[str, Any]] = []
+        if self.offline_fixtures:
+            seed_papers = self.load_offline_fixture()
+        else:
+            strict_queries = [q for q in queries if q["variant"] != "loose"][:6]
+            loose_queries = [q for q in queries if q["variant"] == "loose"][:3]
+            for q in strict_queries:
+                try:
+                    seed_papers.extend([self._paper_from_openalex(w, "seed") for w in self.openalex_search(q["query"], q["variant"])])
+                except Exception as e:
+                    self.search_log["errors"].append(f"seed strict query failed: {q['query']} | {e}")
+            if len(seed_papers) < 5:
+                for q in loose_queries:
+                    try:
+                        seed_papers.extend([self._paper_from_openalex(w, "seed") for w in self.openalex_search(q["query"], q["variant"])])
+                    except Exception as e:
+                        self.search_log["errors"].append(f"seed loose query failed: {q['query']} | {e}")
+
+        allowed_abbr = self.apply_abbreviation_policy(all_abbr, ab_map, seed_papers, anchors)
+        if (not self.offline_fixtures) and seed_papers and allowed_abbr:
+            for ab in allowed_abbr[:3]:
+                for anchor in anchors[:5]:
+                    q = f"{ab} AND {anchor}"
+                    try:
+                        seed_papers.extend([self._paper_from_openalex(w, "seed") for w in self.openalex_search(q, "abbr_pair")])
+                    except Exception as e:
+                        self.search_log["errors"].append(f"abbr query failed: {q} | {e}")
+
+        if len(seed_papers) < 5 and not self.offline_fixtures:
+            self.write_wait_files(anchors)
+            stats = {"seed_queries": len(self.search_log["queries"]), "seed_count": len(seed_papers), "final_count": 0}
+            self.search_log["stats"] = stats
+            self.search_log["finished_at"] = now_iso()
+            self.write_summary(stats, wait_mode=True)
+            write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+            self.log("Seed count <5 after strict+loose, entering WAIT mode")
+            return 2
+
+        gating = self.subject_gate(seed_papers)
+        negatives = [p for p in seed_papers if not self._passes_gate(p, gating)]
+        negative_terms = [x for x in llm_data.get("negative_terms", []) if isinstance(x, str)] if llm_data else []
+
+        expanded: List[Dict[str, Any]] = []
+        s2: List[Dict[str, Any]] = []
+        rr: List[Dict[str, Any]] = []
+        if not self.offline_fixtures:
+            expanded = self.expand_openalex(seed_papers, gating)
+            s2 = self.s2_recommend(seed_papers, negatives)
+
+        self.write_rr_import(seed_papers)
+        rr_items = self.parse_rr_export()
+        if rr_items and not self.offline_fixtures:
+            rr = self.enrich_rr(rr_items)
+
+        merged = self.dedup_merge([seed_papers, expanded, s2, rr])
+        ranked = self.score(merged, anchors, negative_terms, gating)
+        self.write_corpus(ranked)
 
         stats = {
-            "seed_queries": len(packs[:8]),
+            "seed_queries": len(self.search_log["queries"]),
             "seed_count": len(seed_papers),
             "expanded_count": len(expanded),
             "s2_count": len(s2),
             "rr_count": len(rr),
-            "dedup_count": len(ranked),
+            "dedup_count": len(merged),
             "final_count": len(ranked),
+            "elapsed_ms": int((time.time() - t_start) * 1000),
         }
         self.search_log["stats"] = stats
-        self.search_log["finished_at"] = datetime.utcnow().isoformat() + "Z"
-
-        self.write_corpus(ranked)
+        self.search_log["finished_at"] = now_iso()
         self.write_prisma(stats)
-        self.write_summary(stats, degraded=degraded)
+        self.write_summary(stats, wait_mode=False)
         write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
         self.log("Stage B finished")
         return 0
@@ -555,8 +728,7 @@ def main() -> int:
     args = ap.parse_args()
 
     offline = Path(args.offline_fixtures) if args.offline_fixtures else None
-    runner = StageB(Path(args.idea), args.mode, offline)
-    return runner.run()
+    return StageB(Path(args.idea), args.mode, offline).run()
 
 
 if __name__ == "__main__":

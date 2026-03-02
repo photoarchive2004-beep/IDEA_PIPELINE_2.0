@@ -67,6 +67,17 @@ function Ensure-IdeaLayout([string]$ideaDir){
   return $true
 }
 
+function Find-Prompt([string]$outDir){
+  $p = Join-Path $outDir "llm_prompt_B_keywords.txt"
+  if (Test-Path $p) { return $p }
+  $cand = Get-ChildItem -LiteralPath $outDir -File -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -match '(?i)prompt' } |
+          Sort-Object LastWriteTime -Descending |
+          Select-Object -First 1
+  if ($cand) { return $cand.FullName }
+  return $null
+}
+
 try {
   $IdeaDir = Resolve-IdeaDir $IdeaDir
   $IdeaDir = (Resolve-Path $IdeaDir).Path
@@ -100,6 +111,27 @@ try {
     Say "✅ Stage B готова."
     Say "Проверь: out\\corpus.csv, out\\stageB_summary.txt, out\\search_log_B.json"
     exit 0
+  }
+
+  if ($rc -eq 2) {
+    $prompt = Find-Prompt (Join-Path $IdeaDir "out")
+    $resp = Join-Path $IdeaDir "in\llm_response_B.json"
+    if (-not (Test-Path $resp)) { New-Item -ItemType File -Force -Path $resp | Out-Null }
+
+    Say ""
+    Say "Нужен ChatGPT (1 раз) для Stage B:"
+    Say "1) Откроются prompt и файл ответа."
+    Say "2) Prompt уже в буфере обмена (Ctrl+V в ChatGPT)."
+    Say "3) Скопируй только JSON-ответ."
+    Say "4) Вставь JSON в in\llm_response_B.json и сохрани."
+    Say "5) Запусти RUN_B.bat ещё раз."
+
+    if ($prompt) {
+      Set-Clipboard -Value (Get-Content -Raw -LiteralPath $prompt)
+      Start-Process notepad.exe -ArgumentList $prompt | Out-Null
+    }
+    Start-Process notepad.exe -ArgumentList $resp | Out-Null
+    exit 2
   }
 
   Say ""
