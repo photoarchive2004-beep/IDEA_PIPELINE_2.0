@@ -20,21 +20,38 @@ Ok "Idea selected: $idea"
 & $py -m pip install -r (Join-Path $Root "tools\requirements_b.txt") | Out-Null
 
 $module = Join-Path $Root "tools\module_b_lit_scout.py"
-$code = 0
 & $py $module --idea $idea --mode BALANCED
-$code = $LASTEXITCODE
-
-if ($code -ne 0) {
-  Warn "Online run failed, switching to offline fixtures"
-}
+$rc = $LASTEXITCODE
 
 $corpusPath = Join-Path $idea "out\corpus.csv"
-$linesOnline = 0
-if (Test-Path $corpusPath) { $linesOnline = (Get-Content -LiteralPath $corpusPath | Measure-Object -Line).Lines }
-if ($code -ne 0 -or $linesOnline -le 1) {
-  Warn "Running offline fixtures validation"
+$waitPrompt = Join-Path $idea "out\llm_prompt_B_keywords.txt"
+$waitResp = Join-Path $idea "in\llm_response_B.json"
+
+if ($rc -eq 2) {
+  if (-not (Test-Path $waitPrompt)) { Fail "WAIT mode without llm_prompt_B_keywords.txt" }
+  if (-not (Test-Path $waitResp)) { Fail "WAIT mode without in\llm_response_B.json" }
+  Ok "WAIT acceptance passed (exit code 2 + prompt/response files created)"
+}
+elseif ($rc -eq 0) {
+  if (-not (Test-Path $corpusPath)) { Fail "Success mode but corpus.csv missing" }
+  $rows = (Get-Content -LiteralPath $corpusPath | Measure-Object -Line).Lines
+  if ($rows -le 10) {
+    Warn "Online run returned <=10 rows; validating offline fixtures"
+    & $py $module --idea $idea --mode BALANCED --offline-fixtures (Join-Path $Root "tools\tests\fixtures")
+    if ($LASTEXITCODE -ne 0) { Fail "Offline fixture run failed" }
+    $rows = (Get-Content -LiteralPath $corpusPath | Measure-Object -Line).Lines
+    if ($rows -le 10) { Fail "corpus.csv still <=10 rows after offline fixture run" }
+  }
+  Ok "Success acceptance passed (corpus.csv >10 lines)"
+}
+else {
+  Warn "Online run failed with code $rc; running offline fixtures"
   & $py $module --idea $idea --mode BALANCED --offline-fixtures (Join-Path $Root "tools\tests\fixtures")
-  if ($LASTEXITCODE -ne 0) { Fail "Offline run failed too" }
+  if ($LASTEXITCODE -ne 0) { Fail "Offline fixture run failed" }
+  if (-not (Test-Path $corpusPath)) { Fail "Offline run produced no corpus.csv" }
+  $rows = (Get-Content -LiteralPath $corpusPath | Measure-Object -Line).Lines
+  if ($rows -le 10) { Fail "Offline run corpus.csv <=10 lines" }
+  Ok "Offline acceptance passed"
 }
 
 $need = @(
@@ -52,6 +69,4 @@ foreach($rel in $need){
   Ok "Exists: $rel"
 }
 
-$rows = (Get-Content -LiteralPath (Join-Path $idea "out\corpus.csv") | Measure-Object -Line).Lines
-Ok "corpus.csv lines: $rows"
 Write-Host "Selfcheck B complete"
