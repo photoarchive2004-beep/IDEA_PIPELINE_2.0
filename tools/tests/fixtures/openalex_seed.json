@@ -1,0 +1,26 @@
+{
+  "results": [
+    {
+      "id": "https://openalex.org/W1001",
+      "title": "Kelp forest trophic cascade dynamics in coastal ecosystems",
+      "doi": "https://doi.org/10.1000/kelp.1",
+      "publication_year": 2022,
+      "cited_by_count": 21,
+      "host_venue": {"display_name": "Marine Ecology"},
+      "primary_location": {"landing_page_url": "https://example.org/kelp1"},
+      "authorships": [{"author": {"display_name": "A. Ivanov"}}],
+      "concepts": [{"display_name": "Ecology"}, {"display_name": "Marine biology"}]
+    },
+    {
+      "id": "https://openalex.org/W1002",
+      "title": "Remote sensing indicators for kelp canopy stability",
+      "doi": "https://doi.org/10.1000/kelp.2",
+      "publication_year": 2021,
+      "cited_by_count": 15,
+      "host_venue": {"display_name": "Ocean Monitoring"},
+      "primary_location": {"landing_page_url": "https://example.org/kelp2"},
+      "authorships": [{"author": {"display_name": "B. Smirnov"}}],
+      "concepts": [{"display_name": "Ecology"}, {"display_name": "Remote sensing"}]
+    }
+  ]
+}
