@@ -5,6 +5,8 @@ import json
 import os
 import re
 import time
+import urllib.parse
+import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,13 @@ EN_STOP = {
 }
 GENERIC_BLACKLIST = {
     "хиты", "и т.п", "и тп", "по чистым", "чистым деревом", "baseline", "overview", "introduction", "введение",
+}
+
+CYR_MAP = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i",
+    "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+    "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch", "ъ": "", "ы": "y", "ь": "",
+    "э": "e", "ю": "yu", "я": "ya",
 }
 
 
@@ -90,7 +99,8 @@ class StageB:
             "started_at": now_iso(),
             "mode": self.mode,
             "anchor_candidates": [],
-            "anchor_top": [],
+            "anchor_top_display": [],
+            "anchor_top_search": [],
             "anchor_packs": [],
             "abbreviation_map": {},
             "queries": [],
@@ -104,6 +114,9 @@ class StageB:
             },
             "stats": {},
         }
+        self.abbr_full_map: Dict[str, str] = {}
+        self.abbr_mentions: Set[str] = set()
+        self.query_snippets: List[Dict[str, Any]] = []
 
     def log(self, msg: str) -> None:
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -114,17 +127,63 @@ class StageB:
     def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], int, int]:
         if self.offline_fixtures:
             raise RuntimeError("offline")
-        if not self.session:
-            raise RuntimeError("requests is unavailable")
         t0 = time.time()
         headers = {"User-Agent": "IDEA_PIPELINE_2.0-StageB/3.0", "Content-Type": "application/json"}
         if source == "semantic_scholar" and self.s2_key:
             headers["x-api-key"] = self.s2_key
-        resp = self.session.request(method, url, params=params, json=payload, timeout=25, headers=headers)
-        ms = int((time.time() - t0) * 1000)
-        self.search_log["queries"].append({"source": source, "url": url, "status": resp.status_code, "elapsed_ms": ms})
-        resp.raise_for_status()
-        return resp.json(), resp.status_code, ms
+
+        qtxt = ""
+        if isinstance(params, dict):
+            qtxt = str(params.get("search") or params.get("query") or params.get("query.title") or "")
+
+        try:
+            if self.session:
+                resp = self.session.request(method, url, params=params, json=payload, timeout=25, headers=headers)
+                ms = int((time.time() - t0) * 1000)
+                status_code = resp.status_code
+                body_text = resp.text
+            else:
+                final_url = url
+                if params:
+                    final_url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
+                data = None
+                if payload is not None:
+                    data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(final_url, data=data, headers=headers, method=method)
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    status_code = int(getattr(r, "status", 200))
+                    body_text = r.read().decode("utf-8", errors="ignore")
+                ms = int((time.time() - t0) * 1000)
+        except Exception as e:
+            ms = int((time.time() - t0) * 1000)
+            self.search_log["queries"].append({
+                "source": source,
+                "endpoint_url": url,
+                "params": params or {},
+                "query_text": qtxt,
+                "anchor_pack_used": [],
+                "http_status": 0,
+                "elapsed_ms": ms,
+                "result_total": 0,
+                "result_items": 0,
+                "error": str(e),
+            })
+            raise
+
+        self.search_log["queries"].append({
+            "source": source,
+            "endpoint_url": url,
+            "params": params or {},
+            "query_text": qtxt,
+            "anchor_pack_used": [],
+            "http_status": status_code,
+            "elapsed_ms": ms,
+            "result_total": 0,
+            "result_items": 0,
+        })
+        if status_code >= 400:
+            raise RuntimeError(f"HTTP {status_code}")
+        return json.loads(body_text or "{}"), status_code, ms
 
     def ensure_idea_text(self) -> Tuple[bool, str]:
         top = self.idea_dir / "idea.txt"
@@ -144,6 +203,26 @@ class StageB:
         except Exception as e:
             self.search_log["errors"].append(f"structured_parse_error: {e}")
             return {}
+
+    def translit_cyr(self, text: str) -> str:
+        out = []
+        for ch in text:
+            lo = ch.lower()
+            if lo in CYR_MAP:
+                tr = CYR_MAP[lo]
+                out.append(tr.capitalize() if ch.isupper() else tr)
+            elif ch.isalnum() or ch in " -":
+                out.append(ch)
+        return re.sub(r"\s+", " ", "".join(out)).strip(" -")
+
+    def format_human_abbr(self, text: str) -> str:
+        def repl(m: re.Match[str]) -> str:
+            ab = m.group(0)
+            if ab not in self.abbr_mentions:
+                return ab
+            full = self.abbr_full_map.get(ab)
+            return f"{full} ({ab})" if full else f"аббревиатура не раскрыта: {ab}"
+        return re.sub(r"\b[A-Z]{2,6}\b", repl, text)
 
     def extract_abbr(self, text: str) -> Dict[str, str]:
         out: Dict[str, str] = {}
@@ -185,7 +264,7 @@ class StageB:
             s += 0.8
         return s
 
-    def build_anchors(self, idea_text: str, structured: Dict[str, Any]) -> Tuple[List[str], Dict[str, str], Set[str]]:
+    def build_anchors(self, idea_text: str, structured: Dict[str, Any]) -> Tuple[List[str], List[str], Dict[str, str], Set[str]]:
         pieces: List[str] = []
         src = structured.get("structured_idea", {}) if isinstance(structured.get("structured_idea", {}), dict) else structured
         for k in ("problem", "main_hypothesis", "key_predictions", "decisive_tests", "title"):
@@ -198,8 +277,10 @@ class StageB:
         blob = "\n".join([p for p in pieces if p])
 
         ab_map = self.extract_abbr(blob)
-        all_abbr = set(re.findall(r"\b[A-Z0-9]{2,6}\b", blob))
+        all_abbr = set(re.findall(r"\b[A-Z]{2,6}\b", blob))
         self.search_log["abbreviation_map"] = ab_map
+        self.abbr_full_map = dict(ab_map)
+        self.abbr_mentions = set(all_abbr)
 
         candidates: List[str] = []
         candidates += re.findall(r"[«\"]([^\"»]{6,140})[»\"]", blob)
@@ -232,8 +313,20 @@ class StageB:
                 if len(top) >= 10:
                     break
 
-        self.search_log["anchor_top"] = top[:20]
-        return top[:20], ab_map, all_abbr
+        # search anchors: latin/digits/hyphen and transliterated Cyrillic entities
+        latin_like = set(re.findall(r"\b(?=[A-Za-z0-9\-]{4,}\b)(?=.*[A-Za-z])[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\b", blob))
+        cyr_entities: Set[str] = set()
+        for line in blob.splitlines():
+            toks = re.findall(r"\b[А-ЯЁ][а-яё]{3,}\b", line)
+            if len(toks) > 1:
+                cyr_entities.update(toks[1:])
+        ru_common = {"для", "даже", "базовые", "главный", "главные", "глубокие", "внутри", "между", "узким", "стресс", "тест", "модели", "количественно", "нейтральная"}
+        translit_terms = {self.translit_cyr(x) for x in cyr_entities if len(x) >= 4 and x.lower() not in ru_common}
+        search_top = sorted({x for x in latin_like | translit_terms if len(x) >= 4})[:30]
+
+        self.search_log["anchor_top_display"] = top[:20]
+        self.search_log["anchor_top_search"] = search_top[:20]
+        return top[:20], search_top[:20], ab_map, all_abbr
 
     def build_anchor_packs(self, anchors: List[str]) -> List[List[str]]:
         packs: List[List[str]] = []
@@ -250,19 +343,36 @@ class StageB:
         self.search_log["anchor_packs"] = packs
         return packs
 
-    def pack_query(self, pack: List[str], loose: bool = False) -> str:
-        if loose:
-            return f"({pack[0]}) OR ({pack[1]})" if len(pack) >= 2 else pack[0]
-        return " AND ".join([f'"{x}"' if len(x) > 10 else x for x in pack])
+    def pack_query(self, pack: List[str]) -> str:
+        return " ".join(pack)
 
-    def openalex_search_pack(self, pack: List[str], loose: bool = False) -> List[Dict[str, Any]]:
-        query = self.pack_query(pack, loose=loose)
+    def openalex_search_pack(self, pack: List[str]) -> Tuple[List[Dict[str, Any]], int]:
+        query = self.pack_query(pack)
         params = {"search": query, "per-page": 50}
         if self.mailto:
             params["mailto"] = self.mailto
-        obj, _, _ = self.request_json("GET", "https://api.openalex.org/works", "openalex", params=params)
-        self.search_log["service_status"]["openalex"] = "success"
-        return obj.get("results", [])
+        endpoint = "https://api.openalex.org/works"
+        try:
+            obj, status, elapsed = self.request_json("GET", endpoint, "openalex", params=params)
+            total = int((obj.get("meta") or {}).get("count") or 0)
+            items = obj.get("results", [])
+            if self.search_log["queries"]:
+                self.search_log["queries"][-1].update({
+                    "query_text": query,
+                    "anchor_pack_used": pack,
+                    "result_total": total,
+                    "result_items": len(items),
+                })
+            if len(self.query_snippets) < 3:
+                self.query_snippets.append({"query_text": query, "result_total": total})
+            self.search_log["service_status"]["openalex"] = "success"
+            return items, total
+        except Exception:
+            if self.search_log["queries"]:
+                self.search_log["queries"][-1].update({"query_text": query, "anchor_pack_used": pack})
+            if len(self.query_snippets) < 3:
+                self.query_snippets.append({"query_text": query, "result_total": 0})
+            raise
 
     def paper_openalex(self, w: Dict[str, Any], tag: str) -> Dict[str, Any]:
         return {
@@ -361,7 +471,7 @@ class StageB:
                 cand = self.paper_openalex(obj, "openalex_related")
                 text = (cand.get("title", "") + " " + cand.get("venue", "")).lower()
                 pack_match = any(sum(1 for a in pack if a.lower() in text) >= 1 for pack in anchor_packs)
-                strong = cand.get("cited_by_count", 0) >= 100 and sum(1 for a in self.search_log["anchor_top"][:8] if a.lower() in text) >= 2
+                strong = cand.get("cited_by_count", 0) >= 100 and sum(1 for a in self.search_log["anchor_top_search"][:8] if a.lower() in text) >= 2
                 if pack_match or strong:
                     out.append(cand)
             except Exception:
@@ -418,7 +528,7 @@ class StageB:
                     })
 
     def write_prisma(self, stats: Dict[str, Any]) -> None:
-        txt = "\n".join([
+        lines = [
             "# PRISMA-lite Stage B",
             "",
             f"- Seed queries: {stats.get('seed_queries', 0)}",
@@ -428,8 +538,8 @@ class StageB:
             f"- Crossref count: {stats.get('crossref_count', 0)}",
             f"- Dedup count: {stats.get('dedup_count', 0)}",
             f"- Final count: {stats.get('final_count', 0)}",
-        ]) + "\n"
-        write_text(self.out_dir / "prisma_lite_B.md", txt)
+        ]
+        write_text(self.out_dir / "prisma_lite_B.md", "\n".join([self.format_human_abbr(x) for x in lines]) + "\n")
 
     def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]]) -> None:
         txt = (
@@ -468,7 +578,7 @@ class StageB:
             f"Количество нормализованных через Crossref: {stats.get('crossref_count', 0)}",
             f"Количество после дедупликации: {stats.get('dedup_count', 0)}",
             f"Итоговый размер корпуса: {stats.get('final_count', 0)}",
-            "Europe PMC не использовался: тема не определена как биомедицинская по быстрому признаку." if not used_europe else "Europe PMC использован из-за биомедицинского профиля.",
+            "Europe PubMed Central (PMC) не использовался: тема не определена как биомедицинская по быстрому признаку." if not used_europe else "Europe PubMed Central (PMC) использован из-за биомедицинского профиля.",
             f"Статус OpenAlex: {self.search_log['service_status']['openalex']}",
             f"Статус Semantic Scholar: {self.search_log['service_status']['semantic_scholar']}",
             f"Статус Crossref: {self.search_log['service_status']['crossref']}",
@@ -477,12 +587,18 @@ class StageB:
             f"Диагностика: {self.out_dir / 'search_log_B.json'}",
             f"Текстовый лог: {self.out_dir / 'runB.log'}",
         ]
+        if self.query_snippets:
+            lines.append("Первые 3 выполненных запроса:")
+            for q in self.query_snippets[:3]:
+                lines.append(f"- {q['query_text']} -> {q['result_total']}")
+        if stats.get("seed_count", 0) == 0:
+            lines.append("Seed=0: включён безопасный план Б (якоря от языковой модели), проверь термины поиска.")
         if wait_llm:
             lines += [
                 f"Создан prompt: {self.out_dir / 'llm_prompt_B_anchors.txt'}",
                 f"Ожидаемый ответ: {self.in_dir / 'llm_response_B_anchors.json'}",
             ]
-        write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines[:25]) + "\n")
+        write_text(self.out_dir / "stageB_summary.txt", "\n".join([self.format_human_abbr(x) for x in lines[:28]]) + "\n")
 
     def load_fixture(self) -> List[Dict[str, Any]]:
         fp = self.offline_fixtures / "openalex_seed.json" if self.offline_fixtures else None
@@ -507,15 +623,17 @@ class StageB:
             return 0
 
         structured = self.load_structured()
-        anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
-        packs = self.build_anchor_packs(anchors)
+        display_anchors, search_anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
+        packs = self.build_anchor_packs(search_anchors)
 
         llm = self.load_llm_anchor_response()
         if llm.get("cleaned_anchors") and llm.get("anchor_packs"):
-            anchors = [a for a in llm.get("cleaned_anchors", []) if isinstance(a, str)][:20]
+            search_anchors = [a for a in llm.get("cleaned_anchors", []) if isinstance(a, str)][:20]
+            display_anchors = display_anchors[:20]
             packs = [p for p in llm.get("anchor_packs", []) if isinstance(p, list) and len(p) >= 2][:6]
             ab_map.update({k: v for k, v in (llm.get("abbreviation_map", {}) or {}).items() if isinstance(k, str) and isinstance(v, str)})
             self.search_log["abbreviation_map"] = ab_map
+            self.abbr_full_map = dict(ab_map)
 
         seed_rows: List[Dict[str, Any]] = []
         used_queries = 0
@@ -525,16 +643,17 @@ class StageB:
         else:
             for p in packs[:6]:
                 try:
-                    rows = self.openalex_search_pack(p, loose=False)
+                    rows, _ = self.openalex_search_pack(p)
                     seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
                     used_queries += 1
                 except Exception as e:
                     self.search_log["service_status"]["openalex"] = "degraded"
                     self.search_log["errors"].append(f"openalex_seed_error: {e}")
-            if len(seed_rows) < 20:
-                for p in packs[:2]:
+            if len(seed_rows) == 0:
+                broad_pack = search_anchors[:10]
+                if broad_pack:
                     try:
-                        rows = self.openalex_search_pack(p[:2], loose=True)
+                        rows, _ = self.openalex_search_pack(broad_pack)
                         seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
                         used_queries += 1
                     except Exception as e:
@@ -544,9 +663,9 @@ class StageB:
         if len(seed_rows) >= 30:
             for ab in list(all_abbr):
                 if ab in ab_map:
-                    anchors.append(f"{ab_map[ab]} ({ab})")
+                    search_anchors.append(f"{ab_map[ab]} {ab}")
 
-        need_llm = len(seed_rows) < 20
+        need_llm = len(seed_rows) == 0
         if self.offline_fixtures:
             need_llm = False
         filtered_drift_share = 0.0
@@ -562,21 +681,24 @@ class StageB:
             recommend_rows = self.semantic_recommend(seed_rows)
             expanded = self.expand_openalex(seed_rows, packs)
 
+        if len(seed_rows) < 20:
+            expanded = []
+
         merged = self.dedup(seed_rows + semantic_rows + recommend_rows + expanded)
         crossref_count = self.crossref_enrich(merged) if not self.offline_fixtures else 0
-        ranked = self.score(merged, anchors, packs)
+        ranked = self.score(merged, search_anchors, packs)
 
         # drift estimation: rows with zero anchor hits
         if ranked:
             drifted = 0
             for p in ranked:
                 txt = (p.get("title", "") + " " + p.get("venue", "")).lower()
-                if sum(1 for a in anchors[:10] if a.lower() in txt) == 0:
+                if sum(1 for a in search_anchors[:10] if a.lower() in txt) == 0:
                     drifted += 1
             filtered_drift_share = drifted / len(ranked)
 
         if (need_llm or filtered_drift_share > 0.4) and not llm and not self.offline_fixtures:
-            self.write_llm_anchor_prompt(anchors[:20], packs[:6])
+            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6])
             stats = {
                 "seed_queries": min(used_queries, 8),
                 "seed_count": len(seed_rows),
