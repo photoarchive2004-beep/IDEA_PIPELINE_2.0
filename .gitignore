@@ -27,3 +27,6 @@ setup_log.txt
 # ---- OS ----
 Thumbs.db
 .DS_Store
+
+# ---- Local secrets ----
+config/secrets.env
