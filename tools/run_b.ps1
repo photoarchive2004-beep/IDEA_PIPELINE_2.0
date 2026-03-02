@@ -68,7 +68,7 @@ function Ensure-IdeaLayout([string]$ideaDir){
 }
 
 function Find-Prompt([string]$outDir){
-  $p = Join-Path $outDir "llm_prompt_B_keywords.txt"
+  $p = Join-Path $outDir "llm_prompt_B_anchors.txt"
   if (Test-Path $p) { return $p }
   $cand = Get-ChildItem -LiteralPath $outDir -File -ErrorAction SilentlyContinue |
           Where-Object { $_.Name -match '(?i)prompt' } |
@@ -115,7 +115,7 @@ try {
 
   if ($rc -eq 2) {
     $prompt = Find-Prompt (Join-Path $IdeaDir "out")
-    $resp = Join-Path $IdeaDir "in\llm_response_B.json"
+    $resp = Join-Path $IdeaDir "in\llm_response_B_anchors.json"
     if (-not (Test-Path $resp)) { New-Item -ItemType File -Force -Path $resp | Out-Null }
 
     Say ""
@@ -123,7 +123,7 @@ try {
     Say "1) Откроются prompt и файл ответа."
     Say "2) Prompt уже в буфере обмена (Ctrl+V в ChatGPT)."
     Say "3) Скопируй только JSON-ответ."
-    Say "4) Вставь JSON в in\llm_response_B.json и сохрани."
+    Say "4) Вставь JSON в in\llm_response_B_anchors.json и сохрани."
     Say "5) Запусти RUN_B.bat ещё раз."
 
     if ($prompt) {

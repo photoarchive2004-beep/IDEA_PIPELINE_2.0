@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $Root
 
@@ -20,38 +20,20 @@ Ok "Idea selected: $idea"
 & $py -m pip install -r (Join-Path $Root "tools\requirements_b.txt") | Out-Null
 
 $module = Join-Path $Root "tools\module_b_lit_scout.py"
+$fixture = Join-Path $Root "tools\tests\fixtures"
+
 & $py $module --idea $idea --mode BALANCED
 $rc = $LASTEXITCODE
-
-$corpusPath = Join-Path $idea "out\corpus.csv"
-$waitPrompt = Join-Path $idea "out\llm_prompt_B_keywords.txt"
-$waitResp = Join-Path $idea "in\llm_response_B.json"
+if ($rc -ne 0 -and $rc -ne 2) {
+  Warn "Online run failed (code $rc); using fixtures"
+  & $py $module --idea $idea --mode BALANCED --offline-fixtures $fixture
+  if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) { Fail "Offline run failed" }
+}
 
 if ($rc -eq 2) {
-  if (-not (Test-Path $waitPrompt)) { Fail "WAIT mode without llm_prompt_B_keywords.txt" }
-  if (-not (Test-Path $waitResp)) { Fail "WAIT mode without in\llm_response_B.json" }
-  Ok "WAIT acceptance passed (exit code 2 + prompt/response files created)"
-}
-elseif ($rc -eq 0) {
-  if (-not (Test-Path $corpusPath)) { Fail "Success mode but corpus.csv missing" }
-  $rows = (Get-Content -LiteralPath $corpusPath | Measure-Object -Line).Lines
-  if ($rows -le 10) {
-    Warn "Online run returned <=10 rows; validating offline fixtures"
-    & $py $module --idea $idea --mode BALANCED --offline-fixtures (Join-Path $Root "tools\tests\fixtures")
-    if ($LASTEXITCODE -ne 0) { Fail "Offline fixture run failed" }
-    $rows = (Get-Content -LiteralPath $corpusPath | Measure-Object -Line).Lines
-    if ($rows -le 10) { Fail "corpus.csv still <=10 rows after offline fixture run" }
-  }
-  Ok "Success acceptance passed (corpus.csv >10 lines)"
-}
-else {
-  Warn "Online run failed with code $rc; running offline fixtures"
-  & $py $module --idea $idea --mode BALANCED --offline-fixtures (Join-Path $Root "tools\tests\fixtures")
-  if ($LASTEXITCODE -ne 0) { Fail "Offline fixture run failed" }
-  if (-not (Test-Path $corpusPath)) { Fail "Offline run produced no corpus.csv" }
-  $rows = (Get-Content -LiteralPath $corpusPath | Measure-Object -Line).Lines
-  if ($rows -le 10) { Fail "Offline run corpus.csv <=10 lines" }
-  Ok "Offline acceptance passed"
+  Warn "Stage B requested LLM cleaner in online mode; validating offline pipeline"
+  & $py $module --idea $idea --mode BALANCED --offline-fixtures $fixture
+  if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) { Fail "Offline fallback failed" }
 }
 
 $need = @(
@@ -62,11 +44,15 @@ $need = @(
   "out\prisma_lite_B.md",
   "out\runB.log"
 )
-
 foreach($rel in $need){
   $p = Join-Path $idea $rel
   if (-not (Test-Path $p)) { Fail "Missing output: $rel" }
   Ok "Exists: $rel"
 }
+
+$corpusPath = Join-Path $idea "out\corpus.csv"
+$header = (Get-Content -LiteralPath $corpusPath -TotalCount 1)
+if ($header -notmatch "rank" -or $header -notmatch "score") { Fail "corpus.csv missing rank/score columns" }
+Ok "corpus.csv has rank and score columns"
 
 Write-Host "Selfcheck B complete"

@@ -1,67 +1,35 @@
 # -*- coding: utf-8 -*-
 import argparse
 import csv
-import hashlib
 import json
 import os
 import re
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import requests  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     requests = None
-    import urllib.parse
-    import urllib.request
 
-
-RU_STOPWORDS = {
+RU_STOP = {
     "и", "или", "но", "для", "это", "как", "что", "при", "без", "над", "под", "между", "если", "чтобы",
-    "экзамен", "объяснение", "ожидаемые", "expected_patterns", "шаг", "этап", "идея", "почему", "как", "проверка",
-    "данные", "результат", "гипотеза", "исследование", "метод", "подход", "тест", "вероятно", "может",
+    "так", "еще", "только", "уже", "все", "всех", "этап", "идея", "тест", "тесты", "результат", "данные",
 }
-EN_STOPWORDS = {
-    "the", "and", "or", "for", "with", "without", "this", "that", "from", "into", "about", "expected", "patterns",
-    "explanation", "exam", "step", "stage", "idea", "result", "results", "method", "approach", "test", "tests",
-    "hypothesis", "research", "likely", "possible", "should", "would", "could", "data",
+EN_STOP = {
+    "the", "and", "or", "for", "with", "without", "this", "that", "from", "into", "about", "stage", "idea",
+    "test", "tests", "result", "results", "data", "method", "approach", "research", "study",
 }
-
-
-class _MiniResp:
-    def __init__(self, status_code: int, body: str):
-        self.status_code = status_code
-        self._body = body
-
-    def json(self):
-        return json.loads(self._body or "{}")
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
-
-
-class _MiniSession:
-    def request(self, method, url, timeout=20, headers=None, params=None, json=None, **kwargs):
-        headers = headers or {}
-        if params:
-            qs = urllib.parse.urlencode(params)
-            url = url + ("&" if "?" in url else "?") + qs
-        data = None
-        if json is not None:
-            data = __import__("json").dumps(json).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url=url, method=method, headers=headers, data=data)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = r.read().decode("utf-8", errors="ignore")
-            return _MiniResp(r.getcode(), body)
+GENERIC_BLACKLIST = {
+    "хиты", "и т.п", "и тп", "по чистым", "чистым деревом", "baseline", "overview", "introduction", "введение",
+}
 
 
 def now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def read_text(path: Path) -> str:
@@ -73,17 +41,27 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def parse_secrets_env(path: Path) -> Dict[str, str]:
-    data: Dict[str, str] = {}
+def parse_env(path: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
     if not path.exists():
-        return data
+        return out
     for raw in read_text(path).splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        data[k.strip()] = v.strip()
-    return data
+        out[k.strip()] = v.strip()
+    return out
+
+
+def normalize_doi(doi: str) -> str:
+    x = (doi or "").strip().lower()
+    x = x.replace("https://doi.org/", "").replace("http://doi.org/", "").replace("doi:", "")
+    return x.strip()
+
+
+def norm_title(title: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-zа-я0-9 ]+", " ", (title or "").lower())).strip()
 
 
 class StageB:
@@ -91,521 +69,385 @@ class StageB:
         self.idea_dir = idea_dir
         self.mode = mode.upper()
         self.offline_fixtures = offline_fixtures
+
         self.in_dir = idea_dir / "in"
         self.out_dir = idea_dir / "out"
         self.logs_dir = idea_dir / "logs"
-        self.cache_dir = self.out_dir / "cache_openalex"
-        for d in (self.in_dir, self.out_dir, self.logs_dir, self.cache_dir):
+        for d in (self.in_dir, self.out_dir, self.logs_dir):
             d.mkdir(parents=True, exist_ok=True)
 
         self.run_log = self.out_dir / "runB.log"
         self.search_log_path = self.out_dir / "search_log_B.json"
-        self.trace_path = self.out_dir / "http_trace_B.jsonl"
-        self.module_log_path = self.logs_dir / f"moduleB_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.module_log = self.logs_dir / f"moduleB_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-        self.debug_http = os.getenv("PIPELINE_DEBUG", "0") == "1"
-        self.secrets = parse_secrets_env(self.idea_dir.parents[1] / "config" / "secrets.env")
+        repo = self.idea_dir.parents[1]
+        self.secrets = parse_env(repo / "config" / "secrets.env")
         self.mailto = self.secrets.get("OPENALEX_MAILTO", "")
+        self.s2_key = self.secrets.get("SEMANTIC_SCHOLAR_API_KEY", "")
 
-        self.session = requests.Session() if requests else _MiniSession()
-        self.ua = "IDEA_PIPELINE_2.0-StageB/2.0"
-
+        self.session = requests.Session() if requests else None
         self.search_log: Dict[str, Any] = {
-            "mode": self.mode,
             "started_at": now_iso(),
+            "mode": self.mode,
             "anchor_candidates": [],
-            "anchor_top20": [],
-            "abbreviation_decisions": [],
+            "anchor_top": [],
+            "anchor_packs": [],
+            "abbreviation_map": {},
             "queries": [],
-            "gating": {},
-            "timings_ms": {},
             "errors": [],
+            "service_status": {
+                "openalex": "offline",
+                "semantic_scholar": "offline",
+                "crossref": "offline",
+                "researchrabbit": "degraded",
+                "europe_pmc": "offline",
+            },
             "stats": {},
         }
 
-    def log(self, message: str) -> None:
-        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
-        for p in (self.run_log, self.module_log_path):
+    def log(self, msg: str) -> None:
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        for p in (self.run_log, self.module_log):
             with p.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
 
-    def trace_http(self, payload: Dict[str, Any]) -> None:
-        if not self.debug_http:
-            return
-        with self.trace_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], int, int]:
+        if self.offline_fixtures:
+            raise RuntimeError("offline")
+        if not self.session:
+            raise RuntimeError("requests is unavailable")
+        t0 = time.time()
+        headers = {"User-Agent": "IDEA_PIPELINE_2.0-StageB/3.0", "Content-Type": "application/json"}
+        if source == "semantic_scholar" and self.s2_key:
+            headers["x-api-key"] = self.s2_key
+        resp = self.session.request(method, url, params=params, json=payload, timeout=25, headers=headers)
+        ms = int((time.time() - t0) * 1000)
+        self.search_log["queries"].append({"source": source, "url": url, "status": resp.status_code, "elapsed_ms": ms})
+        resp.raise_for_status()
+        return resp.json(), resp.status_code, ms
 
     def ensure_idea_text(self) -> Tuple[bool, str]:
-        idea_top = self.idea_dir / "idea.txt"
-        idea_in = self.in_dir / "idea.txt"
-        if idea_in.exists() and (not idea_top.exists() or idea_in.stat().st_mtime > idea_top.stat().st_mtime):
-            idea_top.write_text(read_text(idea_in), encoding="utf-8")
-        if not idea_top.exists():
-            return False, "Не найден idea.txt. Заполни in/idea.txt и запусти RUN_B.bat снова."
-        return True, read_text(idea_top)
+        top = self.idea_dir / "idea.txt"
+        in_txt = self.in_dir / "idea.txt"
+        if in_txt.exists() and (not top.exists() or in_txt.stat().st_mtime > top.stat().st_mtime):
+            top.write_text(read_text(in_txt), encoding="utf-8")
+        if not top.exists():
+            return False, "Не найден idea.txt"
+        return True, read_text(top)
 
     def load_structured(self) -> Dict[str, Any]:
         p = self.out_dir / "structured_idea.json"
-        if p.exists():
-            try:
-                return json.loads(read_text(p))
-            except Exception as e:
-                self.search_log["errors"].append(f"structured parse error: {e}")
-        return {}
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(read_text(p))
+        except Exception as e:
+            self.search_log["errors"].append(f"structured_parse_error: {e}")
+            return {}
 
-    def _cache_file(self, url: str, params: Dict[str, Any]) -> Path:
-        payload = json.dumps({"url": url, "params": params}, sort_keys=True, ensure_ascii=False)
-        key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{key}.json"
-
-    def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        params = params or {}
-        headers = {"User-Agent": self.ua}
-        if source == "openalex" and method.upper() == "GET":
-            cached = self._cache_file(url, params)
-            if cached.exists():
-                return json.loads(read_text(cached)), {"status": 200, "retries": 0, "cached": True}
-
-        retries = 4
-        last_status = -1
-        for attempt in range(1, retries + 1):
-            t0 = time.time()
-            try:
-                resp = self.session.request(method.upper(), url, timeout=25, headers=headers, params=params, json=payload)
-                ms = int((time.time() - t0) * 1000)
-                last_status = getattr(resp, "status_code", -1)
-                self.trace_http({"url": url, "status": last_status, "ms": ms, "retries": attempt - 1, "engine": source})
-                if last_status in (429, 500, 502, 503, 504):
-                    time.sleep(1.2 * attempt)
-                    continue
-                resp.raise_for_status()
-                obj = resp.json()
-                if source == "openalex" and method.upper() == "GET":
-                    write_text(self._cache_file(url, params), json.dumps(obj, ensure_ascii=False))
-                return obj, {"status": last_status, "retries": attempt - 1, "cached": False}
-            except Exception as e:
-                ms = int((time.time() - t0) * 1000)
-                self.trace_http({"url": url, "status": last_status, "ms": ms, "retries": attempt - 1, "engine": source, "error": str(e)})
-                if attempt == retries:
-                    raise
-                time.sleep(1.2 * attempt)
-        raise RuntimeError("unreachable")
-
-    def extract_abbrev_map(self, text: str) -> Dict[str, str]:
+    def extract_abbr(self, text: str) -> Dict[str, str]:
         out: Dict[str, str] = {}
-        for full, abbr in re.findall(r"([A-Za-zА-Яа-я0-9\-\s]{6,80})\(([A-Z0-9]{2,6})\)", text):
-            out[abbr] = full.strip()
-        for abbr, full in re.findall(r"\b([A-Z0-9]{2,6})\s*[—-]\s*([A-Za-zА-Яа-я0-9\-\s]{6,80})", text):
-            out[abbr] = full.strip()
+        for full, abbr in re.findall(r"([A-Za-zА-Яа-я0-9\-\s]{6,120})\(([A-Z0-9]{2,6})\)", text):
+            out[abbr] = re.sub(r"\s+", " ", full.strip())
+        for abbr, full in re.findall(r"\b([A-Z0-9]{2,6})\s*[—-]\s*([A-Za-zА-Яа-я0-9\-\s]{6,120})", text):
+            out[abbr] = re.sub(r"\s+", " ", full.strip())
         return out
 
-    def _tokenize(self, text: str) -> List[str]:
-        return [t for t in re.split(r"[^A-Za-zА-Яа-я0-9\-]+", text.lower()) if t]
+    def tokenized(self, s: str) -> List[str]:
+        return [t for t in re.split(r"[^A-Za-zА-Яа-я0-9\-]+", s.lower()) if t]
 
-    def _too_generic(self, phrase: str) -> bool:
-        toks = self._tokenize(phrase)
-        if not toks:
-            return True
-        if len(toks) > 5:
-            return True
-        if len(phrase) > 50:
-            return True
-        return all(t in RU_STOPWORDS or t in EN_STOPWORDS for t in toks)
+    def is_bad_anchor(self, a: str) -> Optional[str]:
+        x = a.strip()
+        toks = self.tokenized(x)
+        if not x:
+            return "empty"
+        if x.lower() in GENERIC_BLACKLIST:
+            return "generic_blacklist"
+        if len(x) < 8 and not re.search(r"\d", x) and "-" not in x:
+            return "too_short"
+        if len(toks) == 1 and len(toks[0]) <= 4 and not re.search(r"\d", toks[0]) and "-" not in toks[0]:
+            return "single_short_word"
+        if toks and sum(1 for t in toks if t in RU_STOP or t in EN_STOP) / max(len(toks), 1) > 0.7:
+            return "mostly_stop_words"
+        if re.search(r"(^|\s)(и т\.?п\.?|etc\.?)(\s|$)", x.lower()):
+            return "service_phrase"
+        return None
 
-    def extract_anchors(self, idea_text: str, structured: Dict[str, Any]) -> Tuple[List[str], Dict[str, str], Set[str]]:
-        blob_parts = [idea_text]
-        s = structured.get("structured_idea", {}) if isinstance(structured.get("structured_idea", {}), dict) else {}
-        for k in ("problem", "main_hypothesis", "key_predictions", "decisive_tests"):
-            v = s.get(k)
+    def score_anchor(self, a: str) -> float:
+        s = 1.0
+        if "-" in a or re.search(r"\d", a):
+            s += 1.2
+        if len(a.split()) in (2, 3, 4):
+            s += 1.0
+        if re.search(r"\b(?:[A-ZА-Я][a-zа-я]+\s+){1,3}[A-ZА-Я][a-zа-я]+\b", a):
+            s += 0.9
+        if re.search(r"[A-Za-z]+\d+|\d+[A-Za-z]+", a):
+            s += 0.8
+        return s
+
+    def build_anchors(self, idea_text: str, structured: Dict[str, Any]) -> Tuple[List[str], Dict[str, str], Set[str]]:
+        pieces: List[str] = []
+        src = structured.get("structured_idea", {}) if isinstance(structured.get("structured_idea", {}), dict) else structured
+        for k in ("problem", "main_hypothesis", "key_predictions", "decisive_tests", "title"):
+            v = src.get(k)
             if isinstance(v, str):
-                blob_parts.append(v)
+                pieces.append(v)
             elif isinstance(v, list):
-                blob_parts.extend([str(x) for x in v if isinstance(x, str)])
-        blob = "\n".join(blob_parts)
+                pieces.extend([str(x) for x in v if isinstance(x, str)])
+        pieces.append(idea_text)
+        blob = "\n".join([p for p in pieces if p])
+
+        ab_map = self.extract_abbr(blob)
+        all_abbr = set(re.findall(r"\b[A-Z0-9]{2,6}\b", blob))
+        self.search_log["abbreviation_map"] = ab_map
+
+        candidates: List[str] = []
+        candidates += re.findall(r"[«\"]([^\"»]{6,140})[»\"]", blob)
+        candidates += re.findall(r"\b[\wА-Яа-я]+-[\wА-Яа-я]+\b", blob)
+        candidates += re.findall(r"\b(?:[A-ZА-Я][a-zа-я]+\s+){1,3}[A-ZА-Я][a-zа-я]+\b", blob)
+
+        for line in blob.splitlines():
+            clean = re.sub(r"^[\-\d\.\)\s]+", "", line).strip()
+            if 12 <= len(clean) <= 120:
+                candidates.append(clean)
 
         scored: Dict[str, float] = {}
-        reasons: Dict[str, List[str]] = {}
-
-        def add_anchor(a: str, why: str, score: float) -> None:
-            a = re.sub(r"\s+", " ", a.strip())
-            if not a or self._too_generic(a):
-                return
-            scored[a] = max(scored.get(a, 0.0), score)
-            reasons.setdefault(a, []).append(why)
-
-        for q in re.findall(r"[\"«]([^\"»]{2,180})[\"»]", blob):
-            add_anchor(q, "quoted_short", 2.5)
-
-        for t in re.findall(r"\b[\wА-Яа-я]+-[\wА-Яа-я]+\b", blob):
-            add_anchor(t, "hyphen_term", 2.2)
-
-        for t in re.findall(r"\b[A-Za-z][A-Za-z0-9]{2,}\b", blob):
-            if any(ch.isdigit() for ch in t) or re.search(r"[a-z][A-Z]|[A-Z]{2,}", t):
-                add_anchor(t, "camel_or_digit", 2.1)
-
-        for t in re.findall(r"\b(?:[A-ZА-Я][a-zа-я]+\s+){0,3}[A-ZА-Я][a-zа-я]+\b", blob):
-            add_anchor(t, "named_entity_like", 1.8)
-
-        words = re.findall(r"[A-Za-zА-Яа-я0-9\-]{3,}", blob)
-        cnt = Counter(w.lower() for w in words)
-        for tok, c in cnt.items():
-            if c < 2:
+        for c in candidates:
+            c = re.sub(r"\s+", " ", c.strip(" .,;:"))
+            reason = self.is_bad_anchor(c)
+            if reason:
+                self.search_log["anchor_candidates"].append({"anchor": c, "decision": "excluded", "reason": reason})
                 continue
-            if tok in RU_STOPWORDS or tok in EN_STOPWORDS:
-                continue
-            if len(tok) > 2:
-                add_anchor(tok, "freq_term", min(2.0, 1 + c / 5.0))
+            sc = self.score_anchor(c)
+            if c not in scored or sc > scored[c]:
+                scored[c] = sc
+                self.search_log["anchor_candidates"].append({"anchor": c, "decision": "included", "score": round(sc, 2)})
 
-        ranked = sorted(scored.items(), key=lambda x: (-x[1], x[0].lower()))
-        anchors = [k for k, _ in ranked[:20]]
-        self.search_log["anchor_candidates"] = [{"anchor": a, "score": round(scored[a], 2), "reasons": reasons[a]} for a in anchors]
-        self.search_log["anchor_top20"] = self.search_log["anchor_candidates"]
-        self.log("TOP-20 anchors: " + "; ".join([f"{a['anchor']} [{','.join(a['reasons'])}]" for a in self.search_log["anchor_top20"][:20]]))
+        top = [k for k, _ in sorted(scored.items(), key=lambda x: (-x[1], x[0]))[:20]]
+        if len(top) < 8:
+            words = [w for w in re.findall(r"[A-Za-zА-Яа-я0-9\-]{5,}", blob) if self.is_bad_anchor(w) is None]
+            for w, c in Counter([w.lower() for w in words]).most_common(20):
+                if w not in top:
+                    top.append(w)
+                if len(top) >= 10:
+                    break
 
-        ab_map = self.extract_abbrev_map(blob)
-        all_abbr = set(re.findall(r"\b[A-Z0-9]{2,6}\b", blob))
-        return anchors, ab_map, all_abbr
+        self.search_log["anchor_top"] = top[:20]
+        return top[:20], ab_map, all_abbr
 
-    def build_seed_queries(self, anchors: List[str]) -> List[Dict[str, Any]]:
+    def build_anchor_packs(self, anchors: List[str]) -> List[List[str]]:
         packs: List[List[str]] = []
-        for i in range(0, min(len(anchors), 18), 3):
-            chunk = anchors[i:i + 3]
-            if len(chunk) >= 2:
-                packs.append(chunk)
+        idx = 0
+        while idx < len(anchors) and len(packs) < 6:
+            pack = anchors[idx:idx + 3]
+            if len(pack) >= 2:
+                packs.append(pack)
+            idx += 3
+        if len(packs) < 4 and len(anchors) >= 8:
+            packs.append([anchors[0], anchors[3]])
+            packs.append([anchors[1], anchors[4]])
         packs = packs[:6]
+        self.search_log["anchor_packs"] = packs
+        return packs
 
-        out: List[Dict[str, Any]] = []
-        for pack in packs:
-            strict_terms = [f'"{p}"' if len(p) <= 50 and len(p.split()) <= 5 else p for p in pack]
-            out.append({"variant": "strict", "query": " AND ".join(strict_terms), "anchors": pack})
-        for pack in packs[:3]:
-            out.append({"variant": "loose", "query": " ".join(pack[:2]), "anchors": pack[:2]})
-        return out
+    def pack_query(self, pack: List[str], loose: bool = False) -> str:
+        if loose:
+            return f"({pack[0]}) OR ({pack[1]})" if len(pack) >= 2 else pack[0]
+        return " AND ".join([f'"{x}"' if len(x) > 10 else x for x in pack])
 
-    def openalex_search(self, query: str, variant: str) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"search": query, "per-page": 50, "page": 1}
+    def openalex_search_pack(self, pack: List[str], loose: bool = False) -> List[Dict[str, Any]]:
+        query = self.pack_query(pack, loose=loose)
+        params = {"search": query, "per-page": 50}
         if self.mailto:
             params["mailto"] = self.mailto
-        t0 = time.time()
-        obj, meta = self.request_json("GET", "https://api.openalex.org/works", source="openalex", params=params)
-        results = obj.get("results", [])
-        self.search_log["queries"].append({
-            "query": query,
-            "variant": variant,
-            "engine": "openalex",
-            "results": len(results),
-            "http_status": meta.get("status", -1),
-            "retries": meta.get("retries", 0),
-            "cached": meta.get("cached", False),
-        })
-        self.search_log["timings_ms"][query] = int((time.time() - t0) * 1000)
-        return results
+        obj, _, _ = self.request_json("GET", "https://api.openalex.org/works", "openalex", params=params)
+        self.search_log["service_status"]["openalex"] = "success"
+        return obj.get("results", [])
 
-    def _paper_from_openalex(self, w: Dict[str, Any], source: str) -> Dict[str, Any]:
-        doi = (w.get("doi") or "").replace("https://doi.org/", "")
-        concepts = [c.get("display_name", "") for c in (w.get("concepts") or [])[:5] if c.get("display_name")]
-        topics = [t.get("display_name", "") for t in (w.get("topics") or [])[:3] if t.get("display_name")]
+    def paper_openalex(self, w: Dict[str, Any], tag: str) -> Dict[str, Any]:
         return {
             "title": w.get("title", ""),
-            "year": w.get("publication_year", ""),
-            "doi": doi,
+            "year": w.get("publication_year") or "",
+            "doi": normalize_doi(w.get("doi", "")),
             "openalex_id": w.get("id", ""),
-            "venue": (w.get("host_venue") or {}).get("display_name", "") or (w.get("primary_location", {}).get("source") or {}).get("display_name", ""),
+            "venue": ((w.get("primary_location", {}).get("source") or {}).get("display_name") or ""),
             "authors_short": ", ".join([(a.get("author", {}) or {}).get("display_name", "") for a in (w.get("authorships") or [])[:4]]),
             "cited_by_count": w.get("cited_by_count", 0) or 0,
-            "source_tags": {source},
+            "source_tags": {tag},
             "url": w.get("primary_location", {}).get("landing_page_url") or w.get("id", ""),
-            "concepts": concepts,
-            "topics": topics,
+            "type": w.get("type", ""),
+            "concepts": [c.get("display_name", "") for c in (w.get("concepts") or [])[:5]],
             "referenced_works": w.get("referenced_works", [])[:15],
             "related_works": w.get("related_works", [])[:15],
         }
 
-    def apply_abbreviation_policy(self, all_abbr: Set[str], ab_map: Dict[str, str], seed_papers: List[Dict[str, Any]], anchors: List[str]) -> List[str]:
-        allowed: List[str] = []
-        seed_titles = [p.get("title", "") for p in seed_papers]
-        for ab in sorted(all_abbr):
-            reason = "blocked_default"
-            ok = False
-            if ab in ab_map:
-                ok = True
-                reason = "explicit_expansion"
-            else:
-                hit = sum(1 for t in seed_titles if re.search(rf"\b{re.escape(ab)}\b", t))
-                co = sum(1 for t in seed_titles if re.search(rf"\b{re.escape(ab)}\b", t) and any(a.lower() in t.lower() for a in anchors[:8]))
-                if hit >= 2 and co >= 1:
-                    ok = True
-                    reason = "seed_self_validated"
-            self.search_log["abbreviation_decisions"].append({"abbr": ab, "allowed": ok, "reason": reason})
-            if ok:
-                allowed.append(ab)
-        return allowed
-
-    def subject_gate(self, papers: List[Dict[str, Any]]) -> Dict[str, List[str]]:
-        cc, tc, vc = Counter(), Counter(), Counter()
-        for p in papers:
-            for c in p.get("concepts", [])[:3]:
-                cc[c] += 1
-            for t in p.get("topics", [])[:2]:
-                tc[t] += 1
-            if p.get("venue"):
-                vc[p["venue"]] += 1
-        topc = [x for x, _ in cc.most_common(3)]
-        topt = [x for x, _ in tc.most_common(3)]
-        topv = [x for x, _ in vc.most_common(3)]
-        if self.mode == "FOCUSED":
-            k = 1
-            explore_budget = 0
-        elif self.mode == "BALANCED":
-            k = 2
-            explore_budget = 2
-        else:
-            k = 3
-            explore_budget = 4
-        gating = {
-            "allowed_concepts": topc[:k],
-            "allowed_topics": topt[:k],
-            "allowed_venues": topv[:k],
-            "explore_budget": explore_budget,
-            "why": f"mode={self.mode}; seed-profile top concepts/topics/venues",
-        }
-        self.search_log["gating"] = gating
-        return gating
-
-    def _passes_gate(self, p: Dict[str, Any], gating: Dict[str, List[str]]) -> bool:
-        c_ok = not gating.get("allowed_concepts") or any(c in gating["allowed_concepts"] for c in p.get("concepts", []))
-        t_ok = not gating.get("allowed_topics") or any(t in gating["allowed_topics"] for t in p.get("topics", []))
-        v_ok = not gating.get("allowed_venues") or p.get("venue") in gating.get("allowed_venues", [])
-        return c_ok or t_ok or v_ok
-
-    def expand_openalex(self, seed: List[Dict[str, Any]], gating: Dict[str, List[str]]) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        budget = 14 if self.mode == "WIDE" else 10 if self.mode == "BALANCED" else 6
-        for p in seed[:budget]:
-            wid = p.get("openalex_id", "").split("/")[-1]
-            if not wid:
-                continue
-            queries = [
-                {"filter": f"cites:{wid}", "tag": "forward"},
-            ]
-            for ref in p.get("referenced_works", [])[:5]:
-                rid = ref.split("/")[-1]
-                if rid:
-                    queries.append({"filter": f"openalex:{rid}", "tag": "backward"})
-            for rel in p.get("related_works", [])[:5]:
-                rid = rel.split("/")[-1]
-                if rid:
-                    queries.append({"filter": f"openalex:{rid}", "tag": "related"})
-
-            for q in queries[:8]:
-                params = {"filter": q["filter"], "per-page": 10}
-                if self.mailto:
-                    params["mailto"] = self.mailto
-                try:
-                    obj, _ = self.request_json("GET", "https://api.openalex.org/works", source="openalex", params=params)
-                    for w in obj.get("results", []):
-                        pw = self._paper_from_openalex(w, "citation")
-                        if self._passes_gate(pw, gating):
-                            out.append(pw)
-                except Exception as e:
-                    self.search_log["errors"].append(f"expand {q['tag']} {wid}: {e}")
-        return out
-
-    def s2_recommend(self, seed: List[Dict[str, Any]], negatives: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        positive = [f"DOI:{p['doi']}" for p in seed if p.get("doi")][:10]
-        negative = [f"DOI:{p['doi']}" for p in negatives if p.get("doi")][:10]
-        if not positive:
-            return []
-        payload = {"positive_paper_ids": positive, "negative_paper_ids": negative}
+    def semantic_scholar_search(self, pack: List[str]) -> List[Dict[str, Any]]:
+        q = " ".join(pack[:3])
+        params = {"query": q, "limit": 25, "fields": "title,year,venue,authors,citationCount,externalIds,url"}
         try:
-            obj, _ = self.request_json("POST", "https://api.semanticscholar.org/recommendations/v1/papers", source="s2", payload=payload)
+            obj, _, _ = self.request_json("GET", "https://api.semanticscholar.org/graph/v1/paper/search", "semantic_scholar", params=params)
+            self.search_log["service_status"]["semantic_scholar"] = "success"
             out = []
-            for p in obj.get("recommendedPapers", []):
+            for p in obj.get("data", []):
                 out.append({
-                    "title": p.get("title", ""),
-                    "year": p.get("year", ""),
-                    "doi": (p.get("externalIds", {}) or {}).get("DOI", ""),
-                    "openalex_id": "",
-                    "venue": p.get("venue", ""),
+                    "title": p.get("title", ""), "year": p.get("year") or "", "doi": normalize_doi((p.get("externalIds") or {}).get("DOI", "")),
+                    "openalex_id": "", "venue": p.get("venue", ""),
                     "authors_short": ", ".join([a.get("name", "") for a in p.get("authors", [])[:4]]),
                     "cited_by_count": p.get("citationCount", 0) or 0,
-                    "source_tags": {"s2_reco"},
-                    "url": f"https://www.semanticscholar.org/paper/{p.get('paperId','')}",
-                    "concepts": [],
-                    "topics": [],
-                    "referenced_works": [],
-                    "related_works": [],
+                    "source_tags": {"semanticscholar_search"}, "url": p.get("url", ""), "type": "",
+                    "concepts": [], "referenced_works": [], "related_works": [],
                 })
             return out
         except Exception as e:
-            self.search_log["errors"].append(f"s2 recommend failed: {e}")
+            self.search_log["service_status"]["semantic_scholar"] = "degraded"
+            self.search_log["errors"].append(f"semantic_search_error: {e}")
             return []
 
-    def write_rr_import(self, seeds: List[Dict[str, Any]]) -> None:
-        rr_dir = self.out_dir / "researchrabbit"
-        rr_dir.mkdir(parents=True, exist_ok=True)
-        lines: List[str] = []
-        for p in seeds[:50]:
-            lines.extend(["TY  - JOUR", f"TI  - {p.get('title','')}"])
-            if p.get("year"):
-                lines.append(f"PY  - {p.get('year')}")
-            if p.get("doi"):
-                lines.append(f"DO  - {p.get('doi')}")
-            lines.append("ER  -")
-        write_text(rr_dir / "RR_IMPORT.ris", "\n".join(lines) + "\n")
+    def semantic_recommend(self, seeds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        positive = [f"DOI:{p['doi']}" for p in seeds if p.get("doi")][:10]
+        if not positive:
+            return []
+        payload = {"positive_paper_ids": positive, "negative_paper_ids": []}
+        try:
+            obj, _, _ = self.request_json("POST", "https://api.semanticscholar.org/recommendations/v1/papers", "semantic_scholar", payload=payload)
+            self.search_log["service_status"]["semantic_scholar"] = "success"
+            out: List[Dict[str, Any]] = []
+            for p in obj.get("recommendedPapers", []):
+                out.append({
+                    "title": p.get("title", ""), "year": p.get("year") or "", "doi": normalize_doi((p.get("externalIds") or {}).get("DOI", "")),
+                    "openalex_id": "", "venue": p.get("venue", ""),
+                    "authors_short": ", ".join([a.get("name", "") for a in p.get("authors", [])[:4]]),
+                    "cited_by_count": p.get("citationCount", 0) or 0,
+                    "source_tags": {"semanticscholar_recommendations"}, "url": f"https://www.semanticscholar.org/paper/{p.get('paperId', '')}",
+                    "type": "", "concepts": [], "referenced_works": [], "related_works": [],
+                })
+            return out
+        except Exception as e:
+            self.search_log["service_status"]["semantic_scholar"] = "degraded"
+            self.search_log["errors"].append(f"semantic_recommendations_error: {e}")
+            return []
 
-    def parse_rr_export(self) -> List[Dict[str, str]]:
-        rr_dir = self.out_dir / "researchrabbit"
-        for name in ("RR_EXPORT.ris", "RR_EXPORT.bib", "RR_EXPORT.csv"):
-            p = rr_dir / name
-            if p.exists() and p.suffix.lower() == ".ris":
-                out = []
-                chunks = [c for c in read_text(p).split("ER  -") if c.strip()]
-                for ch in chunks:
-                    item = {"title": "", "doi": "", "year": ""}
-                    for line in ch.splitlines():
-                        if line.startswith("TI  -"):
-                            item["title"] = line.split("-", 1)[1].strip()
-                        elif line.startswith("DO  -"):
-                            item["doi"] = line.split("-", 1)[1].strip()
-                        elif line.startswith("PY  -"):
-                            item["year"] = line.split("-", 1)[1].strip()
-                    out.append(item)
-                return out
-        return []
-
-    def enrich_rr(self, rr_items: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        for it in rr_items[:100]:
-            doi = it.get("doi", "")
-            if not doi:
+    def crossref_enrich(self, papers: List[Dict[str, Any]]) -> int:
+        count = 0
+        for p in papers[:120]:
+            if p.get("doi") or not p.get("title"):
                 continue
-            params = {"filter": f"doi:{doi}", "per-page": 1}
-            if self.mailto:
-                params["mailto"] = self.mailto
             try:
-                obj, _ = self.request_json("GET", "https://api.openalex.org/works", source="openalex", params=params)
-                if obj.get("results"):
-                    out.append(self._paper_from_openalex(obj["results"][0], "researchrabbit"))
+                params = {"query.title": p["title"], "rows": 1}
+                obj, _, _ = self.request_json("GET", "https://api.crossref.org/works", "crossref", params=params)
+                items = (obj.get("message") or {}).get("items") or []
+                if items:
+                    doi = normalize_doi(items[0].get("DOI", ""))
+                    if doi:
+                        p["doi"] = doi
+                        p["source_tags"].add("crossref")
+                        count += 1
+                self.search_log["service_status"]["crossref"] = "success"
             except Exception as e:
-                self.search_log["errors"].append(f"rr enrich {doi}: {e}")
+                self.search_log["service_status"]["crossref"] = "degraded"
+                self.search_log["errors"].append(f"crossref_error: {e}")
+                break
+        return count
+
+    def expand_openalex(self, seeds: List[Dict[str, Any]], anchor_packs: List[List[str]], max_seed: int = 30) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        ids: List[str] = []
+        for p in seeds[:max_seed]:
+            ids.extend(p.get("referenced_works", [])[:5])
+            ids.extend(p.get("related_works", [])[:5])
+        for wid in ids[:120]:
+            try:
+                obj, _, _ = self.request_json("GET", f"https://api.openalex.org/works/{wid.split('/')[-1]}", "openalex")
+                cand = self.paper_openalex(obj, "openalex_related")
+                text = (cand.get("title", "") + " " + cand.get("venue", "")).lower()
+                pack_match = any(sum(1 for a in pack if a.lower() in text) >= 1 for pack in anchor_packs)
+                strong = cand.get("cited_by_count", 0) >= 100 and sum(1 for a in self.search_log["anchor_top"][:8] if a.lower() in text) >= 2
+                if pack_match or strong:
+                    out.append(cand)
+            except Exception:
+                continue
         return out
 
-    def dedup_merge(self, groups: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-        by_key: Dict[str, Dict[str, Any]] = {}
-        for g in groups:
-            for p in g:
-                key = p.get("doi") or p.get("openalex_id") or p.get("title", "").strip().lower()
-                if not key:
-                    continue
-                if key not in by_key:
-                    by_key[key] = p
-                else:
-                    by_key[key]["source_tags"] = set(by_key[key].get("source_tags", set())) | set(p.get("source_tags", set()))
-                    by_key[key]["cited_by_count"] = max(by_key[key].get("cited_by_count", 0), p.get("cited_by_count", 0))
-        return list(by_key.values())
+    def dedup(self, papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        keep: Dict[str, Dict[str, Any]] = {}
+        for p in papers:
+            key = p.get("doi") or f"{norm_title(p.get('title', ''))}::{p.get('year', '')}"
+            if key == "::":
+                continue
+            old = keep.get(key)
+            if not old:
+                keep[key] = p
+                continue
+            old["source_tags"] = set(old.get("source_tags", set())) | set(p.get("source_tags", set()))
+            old["cited_by_count"] = max(old.get("cited_by_count", 0), p.get("cited_by_count", 0))
+            if old.get("type") == "preprint" and p.get("type") != "preprint":
+                keep[key] = p
+        return list(keep.values())
 
-    def score(self, papers: List[Dict[str, Any]], anchors: List[str], negatives: List[str], gating: Dict[str, List[str]]) -> List[Dict[str, Any]]:
-        ranked = []
+    def score(self, papers: List[Dict[str, Any]], anchors: List[str], anchor_packs: List[List[str]]) -> List[Dict[str, Any]]:
+        out = []
         for p in papers:
             text = (p.get("title", "") + " " + p.get("venue", "")).lower()
-            hits = sum(1 for a in anchors[:15] if a.lower() in text)
-            neg_hits = sum(1 for n in negatives if n.lower() in text)
-            gate_bonus = 1.0 if self._passes_gate(p, gating) else -2.0
-            source_bonus = 1.2 if "seed" in p.get("source_tags", set()) else 0.7
-            score = hits * 2.0 + source_bonus + (p.get("cited_by_count", 0) or 0) * 0.015 + gate_bonus - neg_hits * 1.5
-            p["score"] = round(score, 3)
-            p["source_tags"] = ",".join(sorted(list(p.get("source_tags", set()))))
-            ranked.append(p)
-        ranked.sort(key=lambda x: (-x["score"], -(x.get("cited_by_count", 0) or 0)))
-        return ranked
+            hits = sum(1 for a in anchors[:12] if a.lower() in text)
+            pack_hits = sum(1 for pack in anchor_packs if sum(1 for a in pack if a.lower() in text) >= 2)
+            s = hits * 1.6 + pack_hits * 2.5 + (p.get("cited_by_count", 0) or 0) * 0.01
+            p["score"] = round(s, 4)
+            out.append(p)
+        out.sort(key=lambda x: (-x["score"], -(x.get("cited_by_count", 0) or 0), x.get("title", "")))
+        return out
 
     def write_corpus(self, papers: List[Dict[str, Any]]) -> None:
-        fields = ["title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "score", "url"]
+        fields = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
         for name, rows in (("corpus_all.csv", papers), ("corpus.csv", papers[:300])):
             with (self.out_dir / name).open("w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fields)
                 w.writeheader()
-                for p in rows:
-                    w.writerow({k: p.get(k, "") for k in fields})
+                for idx, p in enumerate(rows, 1):
+                    w.writerow({
+                        "rank": idx,
+                        "score": p.get("score", 0),
+                        "title": p.get("title", ""),
+                        "year": p.get("year", ""),
+                        "doi": p.get("doi", ""),
+                        "openalex_id": p.get("openalex_id", ""),
+                        "venue": p.get("venue", ""),
+                        "authors_short": p.get("authors_short", ""),
+                        "cited_by_count": p.get("cited_by_count", 0),
+                        "source_tags": ",".join(sorted(list(p.get("source_tags", set())))),
+                        "url": p.get("url", ""),
+                    })
 
     def write_prisma(self, stats: Dict[str, Any]) -> None:
-        txt = (
-            "# PRISMA-lite Stage B\n\n"
-            f"- Seed queries: {stats.get('seed_queries', 0)}\n"
-            f"- Seed found: {stats.get('seed_count', 0)}\n"
-            f"- Expansion found: {stats.get('expanded_count', 0)}\n"
-            f"- S2 recommendations: {stats.get('s2_count', 0)}\n"
-            f"- RR merged: {stats.get('rr_count', 0)}\n"
-            f"- Final corpus size: {stats.get('final_count', 0)}\n"
-        )
+        txt = "\n".join([
+            "# PRISMA-lite Stage B",
+            "",
+            f"- Seed queries: {stats.get('seed_queries', 0)}",
+            f"- Seed count: {stats.get('seed_count', 0)}",
+            f"- Expanded count: {stats.get('expanded_count', 0)}",
+            f"- Semantic Scholar count: {stats.get('semanticscholar_count', 0)}",
+            f"- Crossref count: {stats.get('crossref_count', 0)}",
+            f"- Dedup count: {stats.get('dedup_count', 0)}",
+            f"- Final count: {stats.get('final_count', 0)}",
+        ]) + "\n"
         write_text(self.out_dir / "prisma_lite_B.md", txt)
 
-    def write_wait_files(self, anchors: List[str]) -> None:
-        prompt = (
-            "Ты помогаешь Stage B научного поиска. Верни ТОЛЬКО валидный JSON:\n"
+    def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]]) -> None:
+        txt = (
+            "Провал первичного поиска. Верни только JSON:\n"
             "{\n"
-            "  \"keywords_en\": [\"...\"],\n"
-            "  \"openalex_queries\": [\"...\"],\n"
-            "  \"negative_terms\": [\"...\"],\n"
-            "  \"abbrev_expansions\": {\"ABBR\": \"full term\"}\n"
+            "  \"cleaned_anchors\": [\"...\"],\n"
+            "  \"anchor_packs\": [[\"...\",\"...\"],[\"...\",\"...\",\"...\"]],\n"
+            "  \"drift_blacklist\": [\"...\"],\n"
+            "  \"abbreviation_map\": {\"ABBR\": \"Full expansion\"}\n"
             "}\n"
-            "Ограничения: openalex_queries максимум 8, короткие (2-6 терминов), без длинных предложений и без длинных цитат.\n"
-            f"Текущие якоря Stage B: {', '.join(anchors[:20])}\n"
+            "Ограничения: 10-20 cleaned_anchors, 4-6 anchor_packs, только по теме идеи.\n"
+            f"Текущие anchors: {anchors}\n"
+            f"Текущие packs: {packs}\n"
         )
-        write_text(self.out_dir / "llm_prompt_B_keywords.txt", prompt)
-        template = {
-            "_instruction": "Вставьте сюда ответ ChatGPT (только JSON объект без markdown).",
-            "keywords_en": [],
-            "openalex_queries": [],
-            "negative_terms": [],
-            "abbrev_expansions": {},
-        }
-        write_text(self.in_dir / "llm_response_B.json", json.dumps(template, ensure_ascii=False, indent=2))
+        write_text(self.out_dir / "llm_prompt_B_anchors.txt", txt)
 
-    def write_summary(self, stats: Dict[str, Any], wait_mode: bool = False) -> None:
-        if wait_mode:
-            lines = [
-                "Stage B: нужен 1 ручной шаг через ChatGPT.",
-                f"Идея: {self.idea_dir.name}",
-                f"Seed-статистика: найдено {stats.get('seed_count', 0)} работ (минимум 5).",
-                "Что делать:",
-                f"1) Откройте: {self.out_dir / 'llm_prompt_B_keywords.txt'}",
-                "2) Вставьте prompt в ChatGPT.",
-                "3) Скопируйте JSON-ответ без markdown.",
-                f"4) Вставьте JSON в: {self.in_dir / 'llm_response_B.json'}",
-                "5) Сохраните файл и снова запустите RUN_B.bat.",
-                f"Логи: {self.out_dir / 'runB.log'} и {self.out_dir / 'search_log_B.json'}",
-            ]
-        else:
-            lines = [
-                "Stage B завершена.",
-                f"Идея: {self.idea_dir.name}",
-                f"Seed-запросов: {stats.get('seed_queries', 0)}",
-                f"Seed-работ: {stats.get('seed_count', 0)}",
-                f"Expansion: {stats.get('expanded_count', 0)}",
-                f"S2 recommendations: {stats.get('s2_count', 0)}",
-                f"ResearchRabbit merged: {stats.get('rr_count', 0)}",
-                f"Итоговый корпус: {stats.get('final_count', 0)}",
-                f"Файлы: {self.out_dir / 'corpus.csv'}",
-                f"Файлы: {self.out_dir / 'corpus_all.csv'}",
-                f"Файлы: {self.out_dir / 'prisma_lite_B.md'}",
-                f"Логи: {self.out_dir / 'runB.log'}",
-                f"Логи: {self.out_dir / 'search_log_B.json'}",
-            ]
-        write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines) + "\n")
-
-    def load_offline_fixture(self) -> List[Dict[str, Any]]:
-        if not self.offline_fixtures:
-            return []
-        fp = self.offline_fixtures / "openalex_seed.json"
-        if not fp.exists():
-            return []
-        obj = json.loads(read_text(fp))
-        return [self._paper_from_openalex(w, "seed") for w in obj.get("results", [])]
-
-    def _load_llm_response(self) -> Dict[str, Any]:
-        p = self.in_dir / "llm_response_B.json"
+    def load_llm_anchor_response(self) -> Dict[str, Any]:
+        p = self.in_dir / "llm_response_B_anchors.json"
         if not p.exists():
             return {}
         try:
@@ -614,109 +456,161 @@ class StageB:
         except Exception:
             return {}
 
-    def run(self) -> int:
-        t_start = time.time()
-        self.log("Stage B started")
-        self.log(f"Mode={self.mode}")
-        self.log(f"Secrets: OPENALEX_API_KEY={'***' if self.secrets.get('OPENALEX_API_KEY') else '(missing)'}, OPENALEX_MAILTO={'***' if self.mailto else '(missing)'}")
+    def write_summary(self, stats: Dict[str, Any], used_europe: bool, wait_llm: bool) -> None:
+        lines = [
+            "Stage B: сбор корпуса литературы завершен." if not wait_llm else "Stage B: требуется дополнительная очистка якорей.",
+            f"Идея: {self.idea_dir.name}",
+            f"Режим: {self.mode}",
+            f"Количество seed запросов: {stats.get('seed_queries', 0)}",
+            f"Количество seed работ: {stats.get('seed_count', 0)}",
+            f"Количество работ после расширения: {stats.get('expanded_count', 0)}",
+            f"Количество работ из Semantic Scholar: {stats.get('semanticscholar_count', 0)}",
+            f"Количество нормализованных через Crossref: {stats.get('crossref_count', 0)}",
+            f"Количество после дедупликации: {stats.get('dedup_count', 0)}",
+            f"Итоговый размер корпуса: {stats.get('final_count', 0)}",
+            "Europe PMC не использовался: тема не определена как биомедицинская по быстрому признаку." if not used_europe else "Europe PMC использован из-за биомедицинского профиля.",
+            f"Статус OpenAlex: {self.search_log['service_status']['openalex']}",
+            f"Статус Semantic Scholar: {self.search_log['service_status']['semantic_scholar']}",
+            f"Статус Crossref: {self.search_log['service_status']['crossref']}",
+            f"Файл корпуса: {self.out_dir / 'corpus.csv'}",
+            f"Полный корпус: {self.out_dir / 'corpus_all.csv'}",
+            f"Диагностика: {self.out_dir / 'search_log_B.json'}",
+            f"Текстовый лог: {self.out_dir / 'runB.log'}",
+        ]
+        if wait_llm:
+            lines += [
+                f"Создан prompt: {self.out_dir / 'llm_prompt_B_anchors.txt'}",
+                f"Ожидаемый ответ: {self.in_dir / 'llm_response_B_anchors.json'}",
+            ]
+        write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines[:25]) + "\n")
 
-        ok, idea_or_msg = self.ensure_idea_text()
+    def load_fixture(self) -> List[Dict[str, Any]]:
+        fp = self.offline_fixtures / "openalex_seed.json" if self.offline_fixtures else None
+        if not fp or not fp.exists():
+            return []
+        obj = json.loads(read_text(fp))
+        self.search_log["service_status"]["openalex"] = "offline"
+        return [self.paper_openalex(w, "openalex_seed") for w in obj.get("results", [])]
+
+    def run(self) -> int:
+        t0 = time.time()
+        self.log("Stage B start")
+        self.log(f"Secrets: OPENALEX_MAILTO={'***' if self.mailto else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
+
+        ok, idea_text = self.ensure_idea_text()
         if not ok:
-            self.search_log["errors"].append(idea_or_msg)
+            self.search_log["errors"].append(idea_text)
             self.write_corpus([])
             self.write_prisma({})
-            self.write_summary({"seed_count": 0, "final_count": 0}, wait_mode=False)
+            self.write_summary({}, used_europe=False, wait_llm=False)
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
-            self.log(idea_or_msg)
             return 0
 
         structured = self.load_structured()
-        anchors, ab_map, all_abbr = self.extract_anchors(idea_or_msg, structured)
-        llm_data = self._load_llm_response()
-        if llm_data.get("keywords_en"):
-            for kw in llm_data.get("keywords_en", [])[:12]:
-                if isinstance(kw, str) and kw.strip():
-                    anchors.append(kw.strip())
+        anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
+        packs = self.build_anchor_packs(anchors)
 
-        queries = self.build_seed_queries(anchors)
-        if llm_data.get("openalex_queries"):
-            priority = [{"variant": "llm_priority", "query": q, "anchors": []} for q in llm_data.get("openalex_queries", []) if isinstance(q, str) and q.strip()][:8]
-            queries = priority + queries
+        llm = self.load_llm_anchor_response()
+        if llm.get("cleaned_anchors") and llm.get("anchor_packs"):
+            anchors = [a for a in llm.get("cleaned_anchors", []) if isinstance(a, str)][:20]
+            packs = [p for p in llm.get("anchor_packs", []) if isinstance(p, list) and len(p) >= 2][:6]
+            ab_map.update({k: v for k, v in (llm.get("abbreviation_map", {}) or {}).items() if isinstance(k, str) and isinstance(v, str)})
+            self.search_log["abbreviation_map"] = ab_map
 
-        seed_papers: List[Dict[str, Any]] = []
+        seed_rows: List[Dict[str, Any]] = []
+        used_queries = 0
+
         if self.offline_fixtures:
-            seed_papers = self.load_offline_fixture()
+            seed_rows = self.load_fixture()
         else:
-            strict_queries = [q for q in queries if q["variant"] != "loose"][:6]
-            loose_queries = [q for q in queries if q["variant"] == "loose"][:3]
-            for q in strict_queries:
+            for p in packs[:6]:
                 try:
-                    seed_papers.extend([self._paper_from_openalex(w, "seed") for w in self.openalex_search(q["query"], q["variant"])])
+                    rows = self.openalex_search_pack(p, loose=False)
+                    seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
+                    used_queries += 1
                 except Exception as e:
-                    self.search_log["errors"].append(f"seed strict query failed: {q['query']} | {e}")
-            if len(seed_papers) < 5:
-                for q in loose_queries:
+                    self.search_log["service_status"]["openalex"] = "degraded"
+                    self.search_log["errors"].append(f"openalex_seed_error: {e}")
+            if len(seed_rows) < 20:
+                for p in packs[:2]:
                     try:
-                        seed_papers.extend([self._paper_from_openalex(w, "seed") for w in self.openalex_search(q["query"], q["variant"])])
+                        rows = self.openalex_search_pack(p[:2], loose=True)
+                        seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
+                        used_queries += 1
                     except Exception as e:
-                        self.search_log["errors"].append(f"seed loose query failed: {q['query']} | {e}")
+                        self.search_log["errors"].append(f"openalex_fallback_error: {e}")
 
-        allowed_abbr = self.apply_abbreviation_policy(all_abbr, ab_map, seed_papers, anchors)
-        if (not self.offline_fixtures) and seed_papers and allowed_abbr:
-            for ab in allowed_abbr[:3]:
-                for anchor in anchors[:5]:
-                    q = f"{ab} AND {anchor}"
-                    try:
-                        seed_papers.extend([self._paper_from_openalex(w, "seed") for w in self.openalex_search(q, "abbr_pair")])
-                    except Exception as e:
-                        self.search_log["errors"].append(f"abbr query failed: {q} | {e}")
+        # abbreviation policy: only after strong seed and explicit expansion
+        if len(seed_rows) >= 30:
+            for ab in list(all_abbr):
+                if ab in ab_map:
+                    anchors.append(f"{ab_map[ab]} ({ab})")
 
-        if len(seed_papers) < 5 and not self.offline_fixtures:
-            self.write_wait_files(anchors)
-            stats = {"seed_queries": len(self.search_log["queries"]), "seed_count": len(seed_papers), "final_count": 0}
+        need_llm = len(seed_rows) < 20
+        if self.offline_fixtures:
+            need_llm = False
+        filtered_drift_share = 0.0
+
+        semantic_rows: List[Dict[str, Any]] = []
+        recommend_rows: List[Dict[str, Any]] = []
+        expanded: List[Dict[str, Any]] = []
+        crossref_count = 0
+
+        if not need_llm and not self.offline_fixtures:
+            for p in packs[:2]:
+                semantic_rows.extend(self.semantic_scholar_search(p))
+            recommend_rows = self.semantic_recommend(seed_rows)
+            expanded = self.expand_openalex(seed_rows, packs)
+
+        merged = self.dedup(seed_rows + semantic_rows + recommend_rows + expanded)
+        crossref_count = self.crossref_enrich(merged) if not self.offline_fixtures else 0
+        ranked = self.score(merged, anchors, packs)
+
+        # drift estimation: rows with zero anchor hits
+        if ranked:
+            drifted = 0
+            for p in ranked:
+                txt = (p.get("title", "") + " " + p.get("venue", "")).lower()
+                if sum(1 for a in anchors[:10] if a.lower() in txt) == 0:
+                    drifted += 1
+            filtered_drift_share = drifted / len(ranked)
+
+        if (need_llm or filtered_drift_share > 0.4) and not llm and not self.offline_fixtures:
+            self.write_llm_anchor_prompt(anchors[:20], packs[:6])
+            stats = {
+                "seed_queries": min(used_queries, 8),
+                "seed_count": len(seed_rows),
+                "expanded_count": len(expanded),
+                "semanticscholar_count": len(semantic_rows) + len(recommend_rows),
+                "crossref_count": crossref_count,
+                "dedup_count": len(merged),
+                "final_count": len(ranked),
+                "elapsed_ms": int((time.time() - t0) * 1000),
+            }
             self.search_log["stats"] = stats
-            self.search_log["finished_at"] = now_iso()
-            self.write_summary(stats, wait_mode=True)
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
-            self.log("Seed count <5 after strict+loose, entering WAIT mode")
+            self.write_corpus(ranked)
+            self.write_prisma(stats)
+            self.write_summary(stats, used_europe=False, wait_llm=True)
             return 2
 
-        gating = self.subject_gate(seed_papers)
-        negatives = [p for p in seed_papers if not self._passes_gate(p, gating)]
-        negative_terms = [x for x in llm_data.get("negative_terms", []) if isinstance(x, str)] if llm_data else []
-
-        expanded: List[Dict[str, Any]] = []
-        s2: List[Dict[str, Any]] = []
-        rr: List[Dict[str, Any]] = []
-        if not self.offline_fixtures:
-            expanded = self.expand_openalex(seed_papers, gating)
-            s2 = self.s2_recommend(seed_papers, negatives)
-
-        self.write_rr_import(seed_papers)
-        rr_items = self.parse_rr_export()
-        if rr_items and not self.offline_fixtures:
-            rr = self.enrich_rr(rr_items)
-
-        merged = self.dedup_merge([seed_papers, expanded, s2, rr])
-        ranked = self.score(merged, anchors, negative_terms, gating)
         self.write_corpus(ranked)
-
         stats = {
-            "seed_queries": len(self.search_log["queries"]),
-            "seed_count": len(seed_papers),
+            "seed_queries": min(used_queries, 8),
+            "seed_count": len(seed_rows),
             "expanded_count": len(expanded),
-            "s2_count": len(s2),
-            "rr_count": len(rr),
+            "semanticscholar_count": len(semantic_rows) + len(recommend_rows),
+            "crossref_count": crossref_count,
             "dedup_count": len(merged),
             "final_count": len(ranked),
-            "elapsed_ms": int((time.time() - t_start) * 1000),
+            "elapsed_ms": int((time.time() - t0) * 1000),
         }
         self.search_log["stats"] = stats
         self.search_log["finished_at"] = now_iso()
         self.write_prisma(stats)
-        self.write_summary(stats, wait_mode=False)
+        self.write_summary(stats, used_europe=False, wait_llm=False)
         write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
-        self.log("Stage B finished")
+        self.log("Stage B done")
         return 0
 
 
@@ -726,7 +620,6 @@ def main() -> int:
     ap.add_argument("--mode", default="BALANCED", choices=["BALANCED", "FOCUSED", "WIDE"])
     ap.add_argument("--offline-fixtures", default="")
     args = ap.parse_args()
-
     offline = Path(args.offline_fixtures) if args.offline_fixtures else None
     return StageB(Path(args.idea), args.mode, offline).run()
 
