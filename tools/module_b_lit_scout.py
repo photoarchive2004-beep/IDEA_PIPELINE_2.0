@@ -82,9 +82,23 @@ PROBE_BROAD = 3000
 PROBE_OK = 50
 PROBE_NARROW = 2
 
-LLM_BUDGET_PER_RUN = 1
+SEED_QUERIES_MAX = 8
+SEED_QUERIES_MIN_ALIVE = 3
+MAX_PER_QUERY = 40
+MAX_SEED_ITEMS_TOTAL = 300
 AUTO_FIX_ROUNDS = 2
-DRIFT_TARGET_DEFAULT = 0.30
+DRIFT_TARGET = 0.30
+DRIFT_HARD_STOP = 0.60
+PRIMARY_SIGNAL_MIN = 0.20
+TOPN_FOR_METRICS = 50
+LLM_BUDGET_PER_RUN = 1
+CITATION_CHASE_ENABLE = True
+CITATION_TOPK = 20
+CITATION_MAX_ADD = 120
+CITATION_PER_SEED_CAP = 10
+STOPWORD_LIST_EN_RU = sorted(CORE_STOPWORDS | EN_STOP | RU_STOP)
+
+DRIFT_TARGET_DEFAULT = DRIFT_TARGET
 
 GENERIC_TOKEN_BLACKLIST = GENERIC_TOKEN_BLACKLIST | {
     "technology", "application", "applications", "performance", "framework", "evaluation", "problem",
@@ -220,6 +234,21 @@ class StageB:
             "llm_used": False,
             "auto_fix_rounds_used": 0,
             "drift_target": self.drift_target,
+            "config_seed_queries_max": SEED_QUERIES_MAX,
+            "config_seed_queries_min_alive": SEED_QUERIES_MIN_ALIVE,
+            "config_max_per_query": MAX_PER_QUERY,
+            "config_max_seed_items_total": MAX_SEED_ITEMS_TOTAL,
+            "config_auto_fix_rounds": AUTO_FIX_ROUNDS,
+            "config_drift_target": DRIFT_TARGET,
+            "config_drift_hard_stop": DRIFT_HARD_STOP,
+            "config_primary_signal_min": PRIMARY_SIGNAL_MIN,
+            "config_topn_for_metrics": TOPN_FOR_METRICS,
+            "config_llm_budget_per_run": LLM_BUDGET_PER_RUN,
+            "config_citation_chase_enable": CITATION_CHASE_ENABLE,
+            "config_citation_topk": CITATION_TOPK,
+            "config_citation_max_add": CITATION_MAX_ADD,
+            "config_citation_per_seed_cap": CITATION_PER_SEED_CAP,
+            "config_stopword_list_en_ru_size": len(STOPWORD_LIST_EN_RU),
         }
 
     def archive_previous_outputs(self) -> None:
@@ -232,9 +261,9 @@ class StageB:
         for item in self.out_dir.iterdir():
             if item.name == "_runs":
                 continue
-            is_strategy = item.is_file() and re.fullmatch(r"search_strategy.*\.md", item.name)
+            is_stageb_md = item.is_file() and item.name.endswith(".md") and "B" in item.name
             is_cache = item.name in {"cache_openalex", "cache_semanticscholar"}
-            if item.name in move_targets or is_strategy or is_cache:
+            if item.name in move_targets or is_stageb_md or is_cache:
                 prev_dir.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(item), str(prev_dir / item.name))
 
@@ -866,7 +895,7 @@ class StageB:
                 continue
             ok.append(query)
         ok = self.dedup_planned_queries(ok)
-        return ok[:8], bad
+        return ok[:SEED_QUERIES_MAX], bad
 
     def classify_query_blocks(self, tokens: List[str]) -> Dict[str, List[str]]:
         primary = []
@@ -929,17 +958,17 @@ class StageB:
             add_query([x.lower() for x in pack], "anchor_pack")
 
         raw_queries = [q["query_text"] for q in queries]
-        good, bad = self.preflight_queries(raw_queries[:8], primary_token, method_terms, probe_map)
+        good, bad = self.preflight_queries(raw_queries[:SEED_QUERIES_MAX], primary_token, method_terms, probe_map)
         for item in bad:
             self.search_log["errors"].append(f"query_preflight: {item}")
         self.search_log["planner"] = {
-            "planned_queries": [q for q in queries if q["query_text"] in good][:8],
+            "planned_queries": [q for q in queries if q["query_text"] in good][:SEED_QUERIES_MAX],
             "rejected_queries": self.search_log.get("rejected_queries", []),
             "removed_duplicates": self.search_log.get("removed_duplicate_queries_count", 0),
         }
-        self.search_log["planned_queries"] = good[:8]
-        self.search_log["planned_queries_detail"] = [q for q in queries if q["query_text"] in good][:8]
-        return good[:8]
+        self.search_log["planned_queries"] = good[:SEED_QUERIES_MAX]
+        self.search_log["planned_queries_detail"] = [q for q in queries if q["query_text"] in good][:SEED_QUERIES_MAX]
+        return good[:SEED_QUERIES_MAX]
 
     def validate_seed_queries(self, queries: List[str], probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
         alive: List[str] = []
@@ -969,15 +998,15 @@ class StageB:
                     current = self.build_boolean_query(rebuilt[:3])
                 else:
                     break
-            if len(alive) >= 8:
+            if len(alive) >= SEED_QUERIES_MAX:
                 break
-        alive = self.dedup_planned_queries(alive)[:8]
+        alive = self.dedup_planned_queries(alive)[:SEED_QUERIES_MAX]
         self.search_log["planned_queries"] = alive
         self.search_log.setdefault("planner", {})["removed_duplicates"] = self.search_log.get("removed_duplicate_queries_count", 0)
         return alive
 
     def openalex_search_pack(self, query: str) -> Tuple[List[Dict[str, Any]], int]:
-        params = {"search": query, "per-page": 50}
+        params = {"search": query, "per-page": MAX_PER_QUERY}
         if self.mailto:
             params["mailto"] = self.mailto
         endpoint = "https://api.openalex.org/works"
@@ -1463,6 +1492,121 @@ class StageB:
             elif tmp.exists():
                 tmp.unlink()
 
+
+    def compute_go_metrics(self, ranked_rows: List[Dict[str, Any]], alive_seed_queries: int) -> Dict[str, Any]:
+        top = ranked_rows[:TOPN_FOR_METRICS]
+        n = len(top) or 1
+        primary_hits = sum(1 for r in top if bool(r.get("hit_primary")) or int(r.get("hits_packs", 0)) >= 1)
+        pass_hits = sum(1 for r in top if str(r.get("relevance_flag", "")).startswith("PASS_"))
+        pass_ratio = pass_hits / n
+        primary_signal = primary_hits / n
+        drift = 1.0 - pass_ratio
+        reasons: List[str] = []
+        if alive_seed_queries < SEED_QUERIES_MIN_ALIVE:
+            reasons.append("too_few_alive_queries")
+        if pass_ratio < (1.0 - self.drift_target):
+            reasons.append("drift_high")
+        if primary_signal < PRIMARY_SIGNAL_MIN:
+            reasons.append("low_primary_signal")
+        if drift >= DRIFT_HARD_STOP and "drift_high" not in reasons:
+            reasons.append("drift_hard_stop")
+        go = len(reasons) == 0
+        return {
+            "go_nogo": "GO" if go else "NO-GO",
+            "go": go,
+            "pass_ratio": round(pass_ratio, 4),
+            "primary_signal": round(primary_signal, 4),
+            "drift": round(drift, 4),
+            "alive_seed_queries": alive_seed_queries,
+            "reasons": reasons,
+        }
+
+    def maybe_add_citation_chasing(self, main_rows: List[Dict[str, Any]], ranked_all: List[Dict[str, Any]],
+                                   primary_token: str, keywords_tokens: List[str], must_have_tokens: List[str],
+                                   packs: List[List[str]], drift_blacklist: List[str], support_tokens: List[str],
+                                   baseline_drift: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], float, bool]:
+        if (not CITATION_CHASE_ENABLE) or self.offline_fixtures:
+            return main_rows, [], ranked_all, baseline_drift, False
+        seeds = sorted(main_rows, key=lambda r: float(r.get("score_main", 0)), reverse=True)[:CITATION_TOPK]
+        added: List[Dict[str, Any]] = []
+        for seed in seeds:
+            if len(added) >= CITATION_MAX_ADD:
+                break
+            sid = (seed.get("openalex_id") or "").strip()
+            if not sid:
+                continue
+            wid = sid.split("/")[-1]
+            for rid in (seed.get("referenced_works") or [])[:CITATION_PER_SEED_CAP]:
+                try:
+                    obj, _, _ = self.request_json("GET", f"https://api.openalex.org/works/{rid.split('/')[-1]}", "openalex", query_kind="citation")
+                    added.append(self.paper_openalex(obj, "openalex_backward"))
+                except Exception:
+                    continue
+            try:
+                params = {"filter": f"cites:{wid}", "per-page": CITATION_PER_SEED_CAP}
+                if self.mailto:
+                    params["mailto"] = self.mailto
+                obj, _, _ = self.request_json("GET", "https://api.openalex.org/works", "openalex", params=params, query_kind="citation")
+                for w in (obj.get("results") or [])[:CITATION_PER_SEED_CAP]:
+                    added.append(self.paper_openalex(w, "openalex_forward"))
+            except Exception:
+                pass
+        added = self.dedup(added)[:CITATION_MAX_ADD]
+        if not added:
+            return main_rows, [], ranked_all, baseline_drift, False
+        passed, support, ranked, drift_after, _, _ = self.apply_relevance_and_score(
+            self.dedup(ranked_all + added), primary_token, keywords_tokens, must_have_tokens, packs, drift_blacklist, support_tokens
+        )
+        if drift_after > self.drift_target and drift_after > baseline_drift:
+            self.search_log["citation_addition_rolled_back"] = True
+            return main_rows, [], ranked_all, baseline_drift, True
+        self.search_log["citation_addition_rolled_back"] = False
+        self.search_log["citation_added_count"] = len(added)
+        return passed, support, ranked, drift_after, True
+
+    def write_search_strategy(self, stats: Dict[str, Any]) -> None:
+        rows = self.search_log.get("executed_queries", [])
+        lines = [
+            "# Search strategy for Stage B",
+            "",
+            f"- run_id: {self.run_id}",
+            f"- started_at: {self.search_log.get('started_at', '')}",
+            f"- finished_at: {self.search_log.get('finished_at', now_iso())}",
+            "",
+            "## Sources status",
+            f"- OpenAlex: {self.search_log.get('service_status', {}).get('openalex', 'offline')}",
+            f"- Semantic Scholar: {self.search_log.get('service_status', {}).get('semantic_scholar', 'offline')}",
+            f"- Crossref: {self.search_log.get('service_status', {}).get('crossref', 'offline')}",
+            "",
+            "## Queries",
+            "| query_text | result_total | cap_used | items_added |",
+            "|---|---:|---:|---:|",
+        ]
+        for q in rows:
+            lines.append(f"| {q.get('query_text','')} | {q.get('result_total',0)} | {MAX_PER_QUERY} | {q.get('items_added',0)} |")
+        lines += [
+            "",
+            "## Token probe",
+            "| token | result_total | category | decision |",
+            "|---|---:|---|---|",
+        ]
+        for t in self.search_log.get("token_probe", []):
+            lines.append(f"| {t.get('token','')} | {t.get('result_total',0)} | {t.get('category','')} | {t.get('decision','')} |")
+        lines += [
+            "",
+            "## Final counts",
+            f"- seed_candidates: {stats.get('seed_count', 0)}",
+            f"- dedup_after: {self.search_log.get('stats', {}).get('dedup_after', 0)}",
+            f"- main_count: {stats.get('main_count', 0)}",
+            f"- support_count: {stats.get('support_count', 0)}",
+            f"- low_count: {stats.get('low_count', 0)}",
+            f"- drift_round0: {stats.get('drift_round0', '')}",
+            f"- drift_round1: {stats.get('drift_round1', '')}",
+            f"- drift_round2: {stats.get('drift_round2', '')}",
+            f"- go_nogo: {stats.get('go_nogo', '')}",
+        ]
+        write_text(self.out_dir / "search_strategy_B.md", "\n".join(lines) + "\n")
+
     def write_prisma(self, stats: Dict[str, Any]) -> None:
         openalex_q = [q for q in self.search_log.get("queries", []) if q.get("source") == "openalex"]
         s2_q = [q for q in self.search_log.get("queries", []) if q.get("source") == "semantic_scholar"]
@@ -1500,7 +1644,7 @@ class StageB:
         if unresolved:
             lines += ["", "## Нераскрытые аббревиатуры", *[f"- {ab}" for ab in unresolved]]
         write_text(self.out_dir / "prisma_lite_B.md", "\n".join(lines) + "\n")
-        write_text(self.out_dir / "search_strategy.md", "\n".join(lines) + "\n")
+        self.write_search_strategy(stats)
     def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> bool:
         prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
         if self.llm_prompt_created or prompt_path.exists() or self.llm_prompts_created >= self.llm_budget:
@@ -1653,6 +1797,11 @@ class StageB:
             f"drift_round0 = {stats.get('drift_round0', '')}",
             f"drift_round1 = {stats.get('drift_round1', '')}",
             f"drift_round2 = {stats.get('drift_round2', '')}",
+            f"go_nogo = {stats.get('go_nogo', '')}",
+            f"go_reasons = {', '.join(stats.get('go_reasons', []))}",
+            f"pass_ratio = {stats.get('pass_ratio', 0)}",
+            f"primary_signal = {stats.get('primary_signal', 0)}",
+            f"alive_seed_queries = {stats.get('alive_seed_queries', 0)}",
             f"auto-fix rounds: {stats.get('auto_fix_rounds_used', 0)}; drift before/after = {stats.get('drift_round0', '')} -> {stats.get('drift_score', '')}",
             f"dedup_merged_count = {stats.get('dedup_merged_count', 0)}",
             f"elapsed: {stats.get('elapsed_ms', 0)} ms",
@@ -1866,8 +2015,12 @@ class StageB:
                 used_queries += 1
                 try:
                     rows, total = self.openalex_search_pack(q)
-                    self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "round": 0})
+                    rows = rows[:MAX_PER_QUERY]
+                    self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "cap_used": MAX_PER_QUERY, "items_added": len(rows), "round": 0})
                     seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
+                    if len(seed_rows) >= MAX_SEED_ITEMS_TOTAL:
+                        seed_rows = seed_rows[:MAX_SEED_ITEMS_TOTAL]
+                        break
                 except Exception as e:
                     self.search_log["service_status"]["openalex"] = "degraded"
                     self.search_log["errors"].append(f"openalex_seed_error: {e}")
@@ -1925,8 +2078,12 @@ class StageB:
                     for q in seed_query_round:
                         try:
                             rows, total = self.openalex_search_pack(q)
-                            self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "round": round_id})
+                            rows = rows[:MAX_PER_QUERY]
+                            self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "cap_used": MAX_PER_QUERY, "items_added": len(rows), "round": round_id})
                             seed_rows_round.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
+                            if len(seed_rows_round) >= MAX_SEED_ITEMS_TOTAL:
+                                seed_rows_round = seed_rows_round[:MAX_SEED_ITEMS_TOTAL]
+                                break
                         except Exception as e:
                             self.search_log["errors"].append(f"openalex_seed_error_round{round_id}: {e}")
                 merged_round = self.dedup(seed_rows_round)
@@ -1953,15 +2110,28 @@ class StageB:
         self.search_log["stats"]["dedup_before"] = self.dedup_before
         self.search_log["stats"]["dedup_after"] = self.dedup_after
 
+        alive_seed_queries = sum(1 for q in self.search_log.get("executed_queries", []) if int(q.get("result_total", 0)) > 0 and int(q.get("round", 0)) == 0)
+        if self.offline_fixtures:
+            alive_seed_queries = len(seed_query_list)
+        go_eval = self.compute_go_metrics(ranked_all, alive_seed_queries)
+        go_nogo = go_eval.get("go_nogo", "NO-GO")
+
         if need_llm:
             stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]]}
             return self.stop_for_llm("seed_zero", "seed=0", search_anchors, packs, stats, t0)
 
-        if drift_score > self.drift_target:
-            stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]]}
-            return self.stop_for_llm("drift_high", f"high drift: {round(drift_score * 100,1)}%", search_anchors, packs, stats, t0)
+        if go_eval.get("go"):
+            passed_rows, support_rows, ranked_all, drift_score, _ = self.maybe_add_citation_chasing(
+                passed_rows, ranked_all, primary_token, keywords_tokens, must_have_tokens, packs, drift_blacklist, support_tokens, drift_score
+            )
+            go_eval = self.compute_go_metrics(ranked_all, alive_seed_queries)
+            go_nogo = go_eval.get("go_nogo", "NO-GO")
 
-        corpus_updated = (len(passed_rows) + len(support_rows)) > 0
+        if (not go_eval.get("go")):
+            stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]], "go_nogo": go_nogo, "go_reasons": go_eval.get("reasons", [])}
+            return self.stop_for_llm("no_go", f"no-go: {', '.join(go_eval.get('reasons', []))}", search_anchors, packs, stats, t0)
+
+        corpus_updated = (len(passed_rows) + len(support_rows)) > 0 and len(passed_rows) >= 30
         self.write_corpus(passed_rows, support_rows, ranked_all, allow_replace=corpus_updated)
         stats = {
             "seed_queries": used_queries,
@@ -1998,6 +2168,11 @@ class StageB:
             "llm_budget": self.llm_budget,
             "llm_prompts_created": self.llm_prompts_created,
             "llm_used": bool(self.llm_info.get("used")),
+            "go_nogo": go_nogo,
+            "go_reasons": go_eval.get("reasons", []),
+            "pass_ratio": go_eval.get("pass_ratio", 0),
+            "primary_signal": go_eval.get("primary_signal", 0),
+            "alive_seed_queries": alive_seed_queries,
         }
         self.search_log["stats"] = {**stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after, "llm_budget": self.llm_budget, "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
         self.search_log["finished_at"] = now_iso()
