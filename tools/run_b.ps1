@@ -67,17 +67,6 @@ function Ensure-IdeaLayout([string]$ideaDir){
   return $true
 }
 
-function Find-Prompt([string]$outDir){
-  $p = Join-Path $outDir "llm_prompt_B_anchors.txt"
-  if (Test-Path $p) { return $p }
-  $cand = Get-ChildItem -LiteralPath $outDir -File -ErrorAction SilentlyContinue |
-          Where-Object { $_.Name -match '(?i)prompt' } |
-          Sort-Object LastWriteTime -Descending |
-          Select-Object -First 1
-  if ($cand) { return $cand.FullName }
-  return $null
-}
-
 try {
   $IdeaDir = Resolve-IdeaDir $IdeaDir
   $IdeaDir = (Resolve-Path $IdeaDir).Path
@@ -114,9 +103,10 @@ try {
   }
 
   if ($rc -eq 2) {
-    $prompt = Find-Prompt (Join-Path $IdeaDir "out")
+    $outDir = Join-Path $IdeaDir "out"
+    $prompt = Join-Path $outDir "llm_prompt_B_anchors.txt"
     $resp = Join-Path $IdeaDir "in\llm_response_B_anchors.json"
-    $summary = Join-Path $IdeaDir "out\stageB_summary.txt"
+    $summary = Join-Path $outDir "stageB_summary.txt"
     $stopReason = ""
     if (Test-Path $summary) {
       $match = Select-String -LiteralPath $summary -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
@@ -125,22 +115,25 @@ try {
     if (-not (Test-Path $resp)) { New-Item -ItemType File -Force -Path $resp | Out-Null }
 
     Say ""
-    if ($stopReason -eq "llm_already_used_need_edit") {
-      Say "Второй запрос в ChatGPT не делаем."
-      Say "Отредактируй in\llm_response_B_anchors.json и запусти RUN_B.bat снова."
+    Say "Открылся файл ответа: in\llm_response_B_anchors.json"
+    Say "Заполни JSON и запусти RUN_B.bat снова."
+
+    if (($stopReason -eq "llm_budget_exhausted")) {
+      Say "Лимит 3 обращения исчерпан — новый prompt не будет открыт."
+      Say "Отредактируй response вручную или удали out\llm_budget_B.json чтобы сбросить бюджет."
+      if (Test-Path $summary) {
+        Start-Process notepad.exe -ArgumentList $summary | Out-Null
+      }
     } else {
-      Say "Нужен ChatGPT (1 раз) для Stage B:"
-      Say "1) Откроются prompt и файл ответа."
-      Say "2) Prompt уже в буфере обмена (Ctrl+V в ChatGPT)."
-      Say "3) Скопируй только JSON-ответ."
-      Say "4) Вставь JSON в in\llm_response_B_anchors.json и сохрани."
-      Say "5) Запусти RUN_B.bat ещё раз."
+      Say "Скопируй prompt из out\llm_prompt_B_anchors.txt в ChatGPT, получи JSON, вставь в response файл."
+      if (Test-Path $prompt) {
+        Set-Clipboard -Value (Get-Content -Raw -LiteralPath $prompt)
+        Start-Process notepad.exe -ArgumentList $prompt | Out-Null
+      } else {
+        Say "⚠️ Prompt не найден: out\llm_prompt_B_anchors.txt"
+      }
     }
 
-    if ($prompt -and $stopReason -ne "llm_already_used_need_edit") {
-      Set-Clipboard -Value (Get-Content -Raw -LiteralPath $prompt)
-      Start-Process notepad.exe -ArgumentList $prompt | Out-Null
-    }
     Start-Process notepad.exe -ArgumentList $resp | Out-Null
     exit 2
   }
