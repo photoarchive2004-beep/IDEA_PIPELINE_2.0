@@ -107,7 +107,7 @@ if ($searchLog.stats -and ($searchLog.stats.PSObject.Properties.Name -contains "
     $hasPrompt = Test-Path (Join-Path $idea "out\llm_prompt_B_anchors.txt")
     $stopReason = ""
     if ($searchLog.stats.PSObject.Properties.Name -contains "stop_reason") { $stopReason = [string]$searchLog.stats.stop_reason }
-    if ((-not $hasPrompt) -and ($stopReason -ne "llm_budget_exhausted")) { Fail "NO-GO must create prompt or set stop_reason=llm_budget_exhausted" }
+    if ((-not $hasPrompt) -and ($stopReason -ne "llm_limit_reached_edit_json")) { Fail "NO-GO must create prompt or set stop_reason=llm_limit_reached_edit_json" }
     Ok "NO-GO stop behavior validated"
   }
 }
@@ -133,11 +133,11 @@ if ($runBScript -match "Find-Prompt") { Fail "run_b.ps1 must not use wildcard pr
 if ($runBScript -notmatch "llm_prompt_B_anchors\.txt") { Fail "run_b.ps1 must use llm_prompt_B_anchors.txt" }
 Ok "run_b.ps1 references only Stage B prompt path"
 
-# Persistent budget check: 3 STOPs allowed, 4th returns llm_budget_exhausted without prompt refresh
+# Persistent budget check: 3 STOPs allowed, 4th returns llm_limit_reached_edit_json without prompt refresh
 $budgetIdea = Join-Path $Root "ideas\IDEA-SELFTEST-B-BUDGET"
 New-Item -ItemType Directory -Force -Path (Join-Path $budgetIdea "in"),(Join-Path $budgetIdea "out"),(Join-Path $budgetIdea "logs") | Out-Null
 Set-Content -LiteralPath (Join-Path $budgetIdea "idea.txt") -Value "и или но это как что для между если" -Encoding UTF8
-$budgetPath = Join-Path $budgetIdea "out\llm_budget_B.json"
+$budgetPath = Join-Path $budgetIdea "out\llm_requests_B.json"
 $promptPath = Join-Path $budgetIdea "out\llm_prompt_B_anchors.txt"
 $summaryPath = Join-Path $budgetIdea "out\stageB_summary.txt"
 if (Test-Path $budgetPath) { Remove-Item -LiteralPath $budgetPath -Force }
@@ -156,7 +156,7 @@ Start-Sleep -Milliseconds 1200
 & $py $module --idea $budgetIdea --mode BALANCED
 if ($LASTEXITCODE -ne 2) { Fail "Budget run #4 must return rc=2" }
 $summary4 = Get-Content -LiteralPath $summaryPath -Raw
-if ($summary4 -notmatch "STOP_REASON\s*=\s*llm_budget_exhausted") { Fail "4th run must set STOP_REASON=llm_budget_exhausted" }
+if ($summary4 -notmatch "STOP_REASON\s*=\s*llm_limit_reached_edit_json") { Fail "4th run must set STOP_REASON=llm_limit_reached_edit_json" }
 $budget4 = Get-Content -LiteralPath $budgetPath -Raw | ConvertFrom-Json
 if ([int]$budget4.used -ne 3) { Fail "Budget used must remain 3 on exhausted run, got $($budget4.used)" }
 if (Test-Path $promptPath) {
