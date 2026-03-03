@@ -75,6 +75,18 @@ foreach($q in $planned){
 }
 Ok "no too_broad solo queries"
 
+$geoLike = @{}
+foreach($tp in @($searchLog.token_probe)){
+  if (($tp.PSObject.Properties.Name -contains "geo_like") -and [bool]$tp.geo_like) {
+    $geoLike[[string]$tp.token.ToLower()] = $true
+  }
+}
+foreach($q in $planned){
+  $tokens = [regex]::Matches($q, "[A-Za-z0-9\-]+") | ForEach-Object { $_.Value.ToLower() }
+  if ($tokens.Count -eq 1 -and $geoLike.ContainsKey($tokens[0])) { Fail "Geo-only single-token query found: $q" }
+}
+Ok "no geo-only planned queries"
+
 if (-not ($searchLog.PSObject.Properties.Name -contains "rejected_queries")) { Fail "rejected_queries field missing" }
 Ok "rejected_queries logging exists"
 
@@ -165,6 +177,33 @@ if ($log2.support_tokens.Count -gt 0) {
   Ok "support corpus populated on abstract fixture"
 }
 Remove-Item -LiteralPath $tempFixture -Recurse -Force
+
+# Non-biology fixture: universal behavior and strategy report generation
+$ideaNonBio = Join-Path $Root "ideas\IDEA-SELFTEST-B-NONBIO"
+New-Item -ItemType Directory -Force -Path (Join-Path $ideaNonBio "in"),(Join-Path $ideaNonBio "out"),(Join-Path $ideaNonBio "logs") | Out-Null
+Set-Content -LiteralPath (Join-Path $ideaNonBio "idea.txt") -Value "Predictive maintenance for industrial pumps using vibration telemetry and anomaly detection." -Encoding UTF8
+$structuredNonBio = @'
+{
+  "keywords_for_search": [
+    "predictive maintenance",
+    "industrial pumps",
+    "vibration telemetry",
+    "anomaly detection",
+    "failure forecasting"
+  ]
+}
+'@
+Set-Content -LiteralPath (Join-Path $ideaNonBio "out\structured_idea.json") -Value $structuredNonBio -Encoding UTF8
+& $py $module --idea $ideaNonBio --mode BALANCED --offline-fixtures $fixture
+$rcNonBio = $LASTEXITCODE
+if ($rcNonBio -ne 0 -and $rcNonBio -ne 2) { Fail "Non-bio fixture run failed" }
+if (-not (Test-Path (Join-Path $ideaNonBio "out\search_log_B.json"))) { Fail "Non-bio run missing search_log_B.json" }
+$logNonBio = Get-Content -LiteralPath (Join-Path $ideaNonBio "out\search_log_B.json") -Raw | ConvertFrom-Json
+if (-not $logNonBio.planned_queries -or $logNonBio.planned_queries.Count -lt 1) { Fail "Non-bio run has no planned queries" }
+if (($logNonBio.PSObject.Properties.Name -contains "stats") -and ([string]$logNonBio.stats.go_nogo -eq "GO")) {
+  if (-not (Test-Path (Join-Path $ideaNonBio "out\search_strategy_B.md"))) { Fail "Non-bio GO run missing search_strategy_B.md" }
+}
+Ok "non-bio fixture validated"
 
 $summary = Get-Content -LiteralPath (Join-Path $idea "out\stageB_summary.txt") -Raw
 foreach($required in @("probe_tokens_tested", "too_broad_count", "broad_count", "ok_count", "narrow_count", "zero_count")){
