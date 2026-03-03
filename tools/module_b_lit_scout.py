@@ -82,6 +82,10 @@ PROBE_BROAD = 3000
 PROBE_OK = 50
 PROBE_NARROW = 2
 
+LLM_BUDGET_PER_RUN = 1
+AUTO_FIX_ROUNDS = 2
+DRIFT_TARGET_DEFAULT = 0.30
+
 GENERIC_TOKEN_BLACKLIST = GENERIC_TOKEN_BLACKLIST | {
     "technology", "application", "applications", "performance", "framework", "evaluation", "problem",
     "objective", "discussion", "conclusion", "findings", "paper", "work", "works", "experiment",
@@ -195,6 +199,8 @@ class StageB:
         self.search_log["planned_queries"] = []
         self.search_log["token_probe"] = []
         self.search_log["llm_effect"] = {}
+        self.search_log["executed_queries"] = []
+        self.search_log["rounds"] = []
         self.search_log["token_sanitation"] = {
             "stopwords_removed_count": 0,
             "examples_removed": [],
@@ -204,6 +210,17 @@ class StageB:
             "examples_punct": [],
         }
         self.search_log["sanitation"] = {"stopwords_removed": 0, "examples": []}
+        self.llm_budget = LLM_BUDGET_PER_RUN
+        self.llm_prompts_created = 0
+        self.llm_prompt_created = False
+        self.drift_target = DRIFT_TARGET_DEFAULT
+        self.search_log["stats"] = {
+            "llm_budget": self.llm_budget,
+            "llm_prompts_created": 0,
+            "llm_used": False,
+            "auto_fix_rounds_used": 0,
+            "drift_target": self.drift_target,
+        }
 
     def archive_previous_outputs(self) -> None:
         run_dir = self.out_dir / "_runs" / self.run_id
@@ -881,6 +898,9 @@ class StageB:
 
         def add_query(parts: List[str], reason: str) -> None:
             parts = [p for p in self.sanitize_tokens(parts, context="planned_query_parts") if p]
+            if len(parts) < 1:
+                self.search_log["rejected_queries"].append({"query_text": " ".join(parts), "reason": "empty_after_sanitize"})
+                return
             if len(parts) >= 2 and primary_token in [x.lower() for x in parts]:
                 second = next((x for x in parts if x.lower() != primary_token.lower()), "")
                 if second and not self.is_selective_term(second, probe_map):
@@ -890,7 +910,7 @@ class StageB:
             nq = self.normalize_query_text(q).lower()
             if q and nq and nq not in seen:
                 seen.add(nq)
-                queries.append({"query_text": self.normalize_query_text(q), "terms": parts[:3], "reason": reason})
+                queries.append({"query_text": self.normalize_query_text(q), "terms": parts[:3], "reason": reason, "round": 0})
 
         pcat = probe_map.get(primary_token, {}).get("category", "OK")
         if primary_token and pcat != "ZERO":
@@ -918,6 +938,7 @@ class StageB:
             "removed_duplicates": self.search_log.get("removed_duplicate_queries_count", 0),
         }
         self.search_log["planned_queries"] = good[:8]
+        self.search_log["planned_queries_detail"] = [q for q in queries if q["query_text"] in good][:8]
         return good[:8]
 
     def validate_seed_queries(self, queries: List[str], probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
@@ -1347,11 +1368,14 @@ class StageB:
                 "reason": reason,
                 "reason_detail": black_term if reason == "low_drift_blacklist" else ("matched_tokens: " + "; ".join(matched_support[:4]) if reason == "pass_support" else ""),
                 "hits_support": hits_support,
+                "hits_kw": hits_kw,
+                "hits_must": hits_must,
+                "hit_primary": hit_primary,
                 "support_reason": "; ".join(matched_support[:4]),
                 "score_components": f"main={round(score_main,3)}; support={round(score_support,3)}; primary={int(hit_primary)}; packs={hits_packs}; kw={hits_kw}; must={hits_must}; support_hits={hits_support}; cit={round(citation_score,3)}; fresh={round(freshness_score,3)}",
             })
             rows.append(row)
-            drift_pass = hit_primary or hits_packs >= 1 or (hits_kw >= 3 and hits_support >= 1)
+            drift_pass = hit_primary or hits_packs >= 1 or (hits_kw >= 3 and hits_must >= 1)
             eval_flags.append(drift_pass)
 
         n = min(50, len(eval_flags))
@@ -1372,6 +1396,32 @@ class StageB:
             "applied_matches_count": blacklist_matches,
         }
         return passed_main, passed_support, rows, round(drift_score, 4), metrics, blacklist_stats
+
+    def select_auto_must_have_tokens(self, ranked_all: List[Dict[str, Any]], candidate_tokens: List[str], probe_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        top_k = ranked_all[: min(120, len(ranked_all))]
+        if not top_k:
+            return []
+        selected: List[Dict[str, Any]] = []
+        for tok in candidate_tokens:
+            t = (tok or "").lower().strip()
+            if not t:
+                continue
+            meta = probe_map.get(t, {})
+            cat = meta.get("category", "")
+            if cat not in {"OK", "NARROW"}:
+                continue
+            if meta.get("geo_like") or self.is_geography_token(t):
+                continue
+            freq_hit = 0
+            for row in top_k:
+                normalized = self.normalize_text_for_match(f"{row.get('title', '')} {row.get('abstract', '')}")
+                if self.token_match(t, normalized):
+                    freq_hit += 1
+            freq = freq_hit / max(len(top_k), 1)
+            if 0.10 <= freq <= 0.70:
+                selected.append({"token": t, "freq": round(freq, 4), "category": cat})
+        selected.sort(key=lambda x: (abs(0.4 - float(x.get("freq", 0))), -len(str(x.get("token", "")))), reverse=False)
+        return selected[:6]
 
     def write_corpus(self, passed_papers: List[Dict[str, Any]], support_papers: List[Dict[str, Any]], all_papers: List[Dict[str, Any]], allow_replace: bool) -> None:
         common_fields = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
@@ -1451,7 +1501,10 @@ class StageB:
             lines += ["", "## Нераскрытые аббревиатуры", *[f"- {ab}" for ab in unresolved]]
         write_text(self.out_dir / "prisma_lite_B.md", "\n".join(lines) + "\n")
         write_text(self.out_dir / "search_strategy.md", "\n".join(lines) + "\n")
-    def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> None:
+    def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> bool:
+        prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
+        if self.llm_prompt_created or prompt_path.exists() or self.llm_prompts_created >= self.llm_budget:
+            return False
         txt = f"""Этап B остановлен: {reason}.
 Нужен ответ для OpenAlex в виде КОРОТКИХ английских токенов/фраз (латиница), а не предложений.
 Примеры корректных токенов: Phoxinus, HydroRIVERS, genotype-environment association, BayPass.
@@ -1472,7 +1525,10 @@ class StageB:
 Текущие anchors: {anchors}
 Текущие packs: {packs}
 """
-        write_text(self.out_dir / "llm_prompt_B_anchors.txt", txt)
+        write_text(prompt_path, txt)
+        self.llm_prompt_created = True
+        self.llm_prompts_created += 1
+        return True
 
     def ensure_llm_response_template(self, force: bool = False) -> Path:
         p = self.in_dir / "llm_response_B_anchors.json"
@@ -1593,6 +1649,11 @@ class StageB:
             f"drift_blacklist_low_count = {stats.get('drift_blacklist_low_count', 0)}",
             f"main_count / support_count / low_count = {stats.get('main_count', 0)} / {stats.get('support_count', 0)} / {stats.get('low_count', 0)}",
             f"drift_score = {stats.get('drift_score', 0)}",
+            f"drift_target = {self.drift_target}",
+            f"drift_round0 = {stats.get('drift_round0', '')}",
+            f"drift_round1 = {stats.get('drift_round1', '')}",
+            f"drift_round2 = {stats.get('drift_round2', '')}",
+            f"auto-fix rounds: {stats.get('auto_fix_rounds_used', 0)}; drift before/after = {stats.get('drift_round0', '')} -> {stats.get('drift_score', '')}",
             f"dedup_merged_count = {stats.get('dedup_merged_count', 0)}",
             f"elapsed: {stats.get('elapsed_ms', 0)} ms",
             f"llm_response_found = {'YES' if self.llm_info.get('found') else 'NO'}",
@@ -1600,6 +1661,17 @@ class StageB:
             f"llm_response_path = {llm_path}",
             f"llm_response_reason = {self.llm_info.get('reason', '')}",
             f"llm_response_schema = {self.llm_info.get('schema', 'invalid')}",
+            f"llm_budget = {self.llm_budget}",
+            f"llm_prompt_created = {'YES' if self.llm_prompt_created else 'NO'}",
+            f"llm_prompts_created = {self.llm_prompts_created}",
+            f"llm_used = {'YES' if self.llm_info.get('used') else 'NO'}",
+            f"planned_queries_round0 = {stats.get('planned_queries_round0', 0)}",
+            f"planned_queries_round1 = {stats.get('planned_queries_round1', 0)}",
+            f"planned_queries_round2 = {stats.get('planned_queries_round2', 0)}",
+            f"pass_main_count = {stats.get('main_count', 0)}",
+            f"pass_support_count = {stats.get('support_count', 0)}",
+            f"must_have_tokens_count = {stats.get('must_have_count', 0)}",
+            f"must_have_selected_preview = {', '.join(stats.get('must_have_selected_preview', []))}",
             f"probe_tokens_tested = {len(self.search_log.get('token_probe', []))}",
             f"too_broad_count = {stats.get('probe_counts', {}).get('TOO_BROAD', 0)}",
             f"broad_count = {stats.get('probe_counts', {}).get('BROAD', 0)}",
@@ -1623,7 +1695,36 @@ class StageB:
         if wait_llm:
             lines.append(f"STOP_REASON = {stop_reason}")
             lines.append(f"WAIT_FILE = {llm_path}")
+            lines.append(f"LLM budget used: {self.llm_prompts_created}/{self.llm_budget}")
+            if stop_reason == "llm_already_used_need_edit":
+                lines.append("второго запроса в ChatGPT не будет, отредактируй in/llm_response_B_anchors.json")
         write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines[:40]) + "\n")
+
+    def round_metrics(self, round_id: int, drift_score: float, planned_queries_count: int, passed: List[Dict[str, Any]], support: List[Dict[str, Any]], ranked: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "round": round_id,
+            "drift_score": round(drift_score, 4),
+            "planned_queries_count": planned_queries_count,
+            "pass_count": len(passed) + len(support),
+            "low_count": max(len(ranked) - len(passed) - len(support), 0),
+        }
+
+    def stop_for_llm(self, stop_reason: str, reason_text: str, search_anchors: List[str], packs: List[List[str]], stats: Dict[str, Any], t0: float) -> int:
+        response_path = self.ensure_llm_response_template(force=not self.llm_info.get("used"))
+        if self.llm_info.get("used"):
+            stop_reason = "llm_already_used_need_edit"
+        elif self.llm_prompts_created < self.llm_budget:
+            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
+        stats["stop_reason"] = stop_reason
+        stats["elapsed_ms"] = int((time.time() - t0) * 1000)
+        self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(response_path)]
+        self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats, "llm_budget": self.llm_budget, "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
+        self.search_log["finished_at"] = now_iso()
+        write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+        self.write_prisma(stats)
+        self.write_summary(stats, wait_llm=True, stop_reason=stop_reason)
+        print(f"Этап B остановлен ({stop_reason}) и ждёт файл: {response_path}")
+        return 2
 
     def load_fixture(self) -> List[Dict[str, Any]]:
         fp = self.offline_fixtures / "openalex_seed.json" if self.offline_fixtures else None
@@ -1682,28 +1783,26 @@ class StageB:
             self.llm_info["schema"] = parsed_llm.get("schema", "invalid")
             self.llm_info["reason"] = parsed_llm.get("reason", "invalid_missing_required_keys")
             if parsed_llm.get("schema") == "invalid":
-                self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], parsed_llm.get("reason", "llm_invalid"))
-                response_path = self.ensure_llm_response_template(force=True)
                 self.llm_info["used"] = False
                 self.llm_info["reason"] = parsed_llm.get("reason", "llm_invalid")
                 self.search_log["llm"] = dict(self.llm_info)
                 stats = {
-                    "seed_queries": 0, "seed_count": 0, "total_candidates": 0, "pass_count": 0,
-                    "low_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000),
+                    "seed_queries": 0, "seed_count": 0, "total_candidates": 0, "main_count": 0,
+                    "support_count": 0, "low_count": 0, "drift_score": 1.0,
                     "stop_reason": "llm_invalid", "primary_token": primary_token, "packs_count": len(packs),
                     "must_have_count": len(must_have_tokens),
                     "support_tokens_count": len(support_tokens),
                     "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0),
                     "probe_counts": {},
+                    "planned_queries_round0": 0,
+                    "planned_queries_round1": 0,
+                    "planned_queries_round2": 0,
+                    "drift_round0": "",
+                    "drift_round1": "",
+                    "drift_round2": "",
+                    "auto_fix_rounds_used": 0,
                 }
-                self.search_log["stats"] = stats
-                self.search_log["finished_at"] = now_iso()
-                self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(response_path)]
-                self.write_prisma(stats)
-                self.write_summary(stats, wait_llm=True, stop_reason="llm_invalid")
-                write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
-                print(f"Этап B остановлен (llm_invalid) и ждёт файл: {response_path}")
-                return 2
+                return self.stop_for_llm("llm_invalid", parsed_llm.get("reason", "llm_invalid"), search_anchors, packs, stats, t0)
 
             self.llm_info["used"] = True
             self.llm_info["reason"] = "validated_and_applied"
@@ -1757,17 +1856,8 @@ class StageB:
 
         if not seed_query_list and not self.offline_fixtures:
             self.search_log["errors"].append("query_preflight: нет валидных seed-запросов")
-            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "невалидные поисковые строки")
-            response_path = self.ensure_llm_response_template(force=not self.llm_info.get("used"))
-            stats = {"seed_queries": 0, "seed_count": 0, "total_candidates": 0, "pass_count": 0, "low_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000), "stop_reason": "llm_invalid", "primary_token": primary_token, "packs_count": len(packs), "must_have_count": len(must_have_tokens)}
-            self.search_log["stats"] = stats
-            self.search_log["finished_at"] = now_iso()
-            self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(response_path)]
-            self.write_prisma(stats)
-            self.write_summary(stats, wait_llm=True, stop_reason="llm_invalid")
-            write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
-            print(f"Этап B остановлен и ждёт файл: {response_path}")
-            return 2
+            stats = {"seed_queries": 0, "seed_count": 0, "total_candidates": 0, "main_count": 0, "support_count": 0, "low_count": 0, "drift_score": 1.0, "primary_token": primary_token, "packs_count": len(packs), "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": {}, "planned_queries_round0": 0, "planned_queries_round1": 0, "planned_queries_round2": 0, "drift_round0": 1.0, "drift_round1": "", "drift_round2": "", "auto_fix_rounds_used": 0}
+            return self.stop_for_llm("llm_invalid", "невалидные поисковые строки", search_anchors, packs, stats, t0)
 
         if self.offline_fixtures:
             seed_rows = self.load_fixture()
@@ -1775,7 +1865,8 @@ class StageB:
             for q in seed_query_list:
                 used_queries += 1
                 try:
-                    rows, _ = self.openalex_search_pack(q)
+                    rows, total = self.openalex_search_pack(q)
+                    self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "round": 0})
                     seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
                 except Exception as e:
                     self.search_log["service_status"]["openalex"] = "degraded"
@@ -1805,52 +1896,70 @@ class StageB:
         passed_rows, support_rows, ranked_all, drift_score, metrics, blacklist_stats = self.apply_relevance_and_score(
             merged, primary_token, keywords_tokens, must_have_tokens, packs, drift_blacklist, support_tokens
         )
+        round_history: List[Dict[str, Any]] = []
+        round_history.append(self.round_metrics(0, drift_score, len(seed_query_list), passed_rows, support_rows, ranked_all))
+        drift_round0 = drift_score
+
+        auto_selected = self.select_auto_must_have_tokens(ranked_all, candidate_tokens, probe_map)
+        if auto_selected:
+            must_have_tokens = list(dict.fromkeys(([x["token"] for x in auto_selected] + must_have_tokens)))[:10]
+        self.search_log["auto_must_have_tokens"] = auto_selected
+
+        auto_fix_rounds_used = 0
+        planned_round_counts = {0: len(seed_query_list), 1: 0, 2: 0}
+        if (not need_llm) and drift_score > self.drift_target:
+            for round_id in (1, 2):
+                auto_fix_rounds_used = round_id
+                top_queries = [q for q in seed_query_list if any(self.token_match(t, self.normalize_text_for_match(q)) for t in must_have_tokens[:6])]
+                if not top_queries:
+                    top_queries = seed_query_list[:]
+                limit = 6 if round_id == 1 else 5
+                seed_query_round = self.dedup_planned_queries(top_queries)[:limit]
+                planned_round_counts[round_id] = len(seed_query_round)
+                if not seed_query_round:
+                    break
+                seed_rows_round: List[Dict[str, Any]] = []
+                if self.offline_fixtures:
+                    seed_rows_round = self.load_fixture()
+                else:
+                    for q in seed_query_round:
+                        try:
+                            rows, total = self.openalex_search_pack(q)
+                            self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "round": round_id})
+                            seed_rows_round.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
+                        except Exception as e:
+                            self.search_log["errors"].append(f"openalex_seed_error_round{round_id}: {e}")
+                merged_round = self.dedup(seed_rows_round)
+                passed_round, support_round, ranked_round, drift_round, _, _ = self.apply_relevance_and_score(
+                    merged_round, primary_token, keywords_tokens, must_have_tokens, packs, drift_blacklist, support_tokens
+                )
+                # stronger must-have gating in auto-fix rounds
+                filtered_main = [r for r in passed_round if int(r.get("hits_must", 0)) >= 1 or bool(r.get("hit_primary", False))]
+                if round_id == 2:
+                    filtered_support = [r for r in support_round if int(r.get("hits_must", 0)) >= 2]
+                else:
+                    filtered_support = [r for r in support_round if int(r.get("hits_must", 0)) >= 1]
+                passed_round, support_round = filtered_main, filtered_support
+                drift_score = drift_round
+                passed_rows, support_rows, ranked_all = passed_round, support_round, ranked_round
+                round_history.append(self.round_metrics(round_id, drift_score, len(seed_query_round), passed_rows, support_rows, ranked_all))
+                if drift_score <= self.drift_target:
+                    break
+
+        self.search_log["rounds"] = round_history
         self.search_log["blacklist"] = blacklist_stats
         self.search_log["primary_hit_count"] = metrics["primary_hit_count"]
         self.search_log["packs_hit_count"] = metrics["packs_hit_count"]
         self.search_log["stats"]["dedup_before"] = self.dedup_before
         self.search_log["stats"]["dedup_after"] = self.dedup_after
 
-        drift_stop = drift_score >= 0.40
-        if need_llm or drift_stop:
-            reason = "seed_zero" if need_llm else "drift_high"
-            reason_text = "seed=0" if need_llm else f"high drift: {round(drift_score * 100,1)}%"
-            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
-            response_path = self.ensure_llm_response_template()
-            stats = {
-                "seed_queries": used_queries,
-                "seed_count": len(seed_rows),
-                "total_candidates": len(ranked_all),
-                "main_count": len(passed_rows),
-                "support_count": len(support_rows),
-                "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0),
-                "drift_score": round(drift_score, 4),
-                "elapsed_ms": int((time.time() - t0) * 1000),
-                "primary_token": primary_token,
-                "primary_hit_count": metrics["primary_hit_count"],
-                "packs_count": len(packs),
-                "packs_hit_count": metrics["packs_hit_count"],
-                "must_have_count": len(must_have_tokens),
-                "support_tokens_count": len(support_tokens),
-                "support_hit_count": metrics["support_hit_count"],
-                "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0),
-                "probe_counts": dict(probe_stats),
-                "dataset_low_count": metrics["dataset_low_count"],
-                "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0),
-                "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0),
-                "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])),
-                "drift_blacklist_low_count": metrics["blacklist_low_count"],
-                "dedup_merged_count": self.dedup_merged_count,
-                "stop_reason": reason,
-            }
-            self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(response_path)]
-            self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after}
-            self.search_log["finished_at"] = now_iso()
-            write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
-            self.write_prisma(stats)
-            self.write_summary(stats, wait_llm=True, stop_reason=reason)
-            print(f"Этап B остановлен ({reason}) и ждёт файл: {response_path}")
-            return 2
+        if need_llm:
+            stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]]}
+            return self.stop_for_llm("seed_zero", "seed=0", search_anchors, packs, stats, t0)
+
+        if drift_score > self.drift_target:
+            stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]]}
+            return self.stop_for_llm("drift_high", f"high drift: {round(drift_score * 100,1)}%", search_anchors, packs, stats, t0)
 
         corpus_updated = (len(passed_rows) + len(support_rows)) > 0
         self.write_corpus(passed_rows, support_rows, ranked_all, allow_replace=corpus_updated)
@@ -1878,8 +1987,19 @@ class StageB:
             "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])),
             "drift_blacklist_low_count": metrics["blacklist_low_count"],
             "dedup_merged_count": self.dedup_merged_count,
+            "planned_queries_round0": planned_round_counts[0],
+            "planned_queries_round1": planned_round_counts[1],
+            "planned_queries_round2": planned_round_counts[2],
+            "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0,
+            "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "",
+            "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "",
+            "auto_fix_rounds_used": auto_fix_rounds_used,
+            "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]],
+            "llm_budget": self.llm_budget,
+            "llm_prompts_created": self.llm_prompts_created,
+            "llm_used": bool(self.llm_info.get("used")),
         }
-        self.search_log["stats"] = {**stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after}
+        self.search_log["stats"] = {**stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after, "llm_budget": self.llm_budget, "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
         self.search_log["finished_at"] = now_iso()
         self.write_prisma(stats)
         self.write_summary(stats, wait_llm=False)
