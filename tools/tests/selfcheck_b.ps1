@@ -85,6 +85,21 @@ if ($searchLog.stats -and ($searchLog.stats.PSObject.Properties.Name -contains "
 if ($llmPromptsCreated -gt 1) { Fail "llm_prompts_created must be <= 1, got $llmPromptsCreated" }
 Ok "llm prompt budget respected (<=1)"
 
+if ($searchLog.stats -and ($searchLog.stats.PSObject.Properties.Name -contains "go_nogo")) {
+  $go = [string]$searchLog.stats.go_nogo
+  if ($go -eq "GO") {
+    if (-not (Test-Path (Join-Path $idea "out\search_strategy_B.md"))) { Fail "Missing out/search_strategy_B.md for GO run" }
+    Ok "search_strategy_B.md exists for GO run"
+  } else {
+    if ($rc -ne 2) { Fail "NO-GO run must stop with exit code 2" }
+    $hasPrompt = Test-Path (Join-Path $idea "out\llm_prompt_B_anchors.txt")
+    $stopReason = ""
+    if ($searchLog.stats.PSObject.Properties.Name -contains "stop_reason") { $stopReason = [string]$searchLog.stats.stop_reason }
+    if ((-not $hasPrompt) -and ($stopReason -ne "llm_already_used_need_edit")) { Fail "NO-GO must create prompt or set stop_reason=llm_already_used_need_edit" }
+    Ok "NO-GO stop behavior validated"
+  }
+}
+
 # Deterministic stop-check: no valid latin anchors => rc 2 + llm files
 $tempIdea = Join-Path $Root "ideas\IDEA-SELFTEST-B-SEED0"
 New-Item -ItemType Directory -Force -Path (Join-Path $tempIdea "in"),(Join-Path $tempIdea "out"),(Join-Path $tempIdea "logs") | Out-Null
