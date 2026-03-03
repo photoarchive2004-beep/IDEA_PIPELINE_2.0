@@ -52,6 +52,19 @@ $planned = @($searchLog.planned_queries)
 if ($planned.Count -gt 8) { Fail "planned_queries > 8" }
 Ok "planned_queries <= 8"
 
+$stopwords = @("and","or","the","a","an","of","for","in","on","to","from","with","without","by","via","using","use","based","study","studies","result","results","method","methods","analysis","analyses","data","model","models","approach","approaches","review","reviews","и","или","в","на","по","для","от","с","без","как","что","это","эти","тот","та","те","также","метод","методы","анализ","данные","модель","модели","обзор")
+$stopset = @{}
+$stopwords | ForEach-Object { $stopset[$_] = $true }
+$normSeen = @{}
+foreach($q in $planned){
+  $tokens = [regex]::Matches($q, "[A-Za-zА-Яа-я0-9\-]+") | ForEach-Object { $_.Value.ToLower() }
+  foreach($tok in $tokens){ if (($tok -ne "and") -and ($tok -ne "or") -and $stopset.ContainsKey($tok)) { Fail "planned query has stopword token '$tok': $q" } }
+  $nq = ([regex]::Replace($q.ToLower(), "\s+", " ")).Trim()
+  if ($normSeen.ContainsKey($nq)) { Fail "Duplicate planned query detected: $q" }
+  $normSeen[$nq] = $true
+}
+Ok "planned queries have no stopword terms and no duplicates"
+
 $tooBroad = @{}
 foreach($tp in @($searchLog.token_probe)){
   if ($tp.category -eq "TOO_BROAD") { $tooBroad[$tp.token.ToLower()] = $true }
@@ -78,6 +91,58 @@ if ($rcStop -ne 2) { Fail "Expected code 2 for seed stop, got $rcStop" }
 if (-not (Test-Path (Join-Path $tempIdea "out\llm_prompt_B_anchors.txt"))) { Fail "Missing llm_prompt_B_anchors.txt for seed stop" }
 if (-not (Test-Path (Join-Path $tempIdea "in\llm_response_B_anchors.json"))) { Fail "Missing llm_response_B_anchors.json template for seed stop" }
 Ok "seed=0 stop behavior validated"
+
+# Offline fixture with abstracts should produce support hits and support corpus
+$tempFixture = Join-Path $Root "tools\tests\fixtures\tmp_support"
+New-Item -ItemType Directory -Force -Path $tempFixture | Out-Null
+$fixtureJson = @'
+{
+  "results": [
+    {
+      "id": "https://openalex.org/W1",
+      "title": "River network connectivity and gene flow in freshwater fish",
+      "publication_year": 2021,
+      "doi": "https://doi.org/10.1000/test1",
+      "type": "article",
+      "cited_by_count": 11,
+      "primary_location": {"landing_page_url": "https://example.org/1", "source": {"display_name": "Journal A", "type": "journal"}},
+      "authorships": [{"author": {"display_name": "A Author"}}],
+      "concepts": [{"display_name": "Genetics"}],
+      "referenced_works": [],
+      "related_works": [],
+      "abstract_inverted_index": {"river": [0], "network": [1], "connectivity": [2], "gene": [3], "flow": [4], "in": [5], "freshwater": [6], "fish": [7]}
+    },
+    {
+      "id": "https://openalex.org/W2",
+      "title": "HydroRIVERS based genotype-environment association methods",
+      "publication_year": 2020,
+      "doi": "https://doi.org/10.1000/test2",
+      "type": "article",
+      "cited_by_count": 9,
+      "primary_location": {"landing_page_url": "https://example.org/2", "source": {"display_name": "Journal B", "type": "journal"}},
+      "authorships": [{"author": {"display_name": "B Author"}}],
+      "concepts": [{"display_name": "Ecology"}],
+      "referenced_works": [],
+      "related_works": [],
+      "abstract_inverted_index": {"hydrorivers": [0], "based": [1], "genotype-environment": [2], "association": [3], "methods": [4]}
+    }
+  ]
+}
+'@
+Set-Content -LiteralPath (Join-Path $tempFixture "openalex_seed.json") -Value $fixtureJson -Encoding UTF8
+& $py $module --idea $idea --mode BALANCED --offline-fixtures $tempFixture
+if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) { Fail "Support fixture offline run failed" }
+$sum2 = Get-Content -LiteralPath (Join-Path $idea "out\stageB_summary.txt") -Raw
+if ($sum2 -match "support_tokens_count = ([0-9]+)" -and $sum2 -match "support_count = ([0-9]+)") {
+  $st = [int]$matches[1]
+}
+$log2 = Get-Content -LiteralPath (Join-Path $idea "out\search_log_B.json") -Raw | ConvertFrom-Json
+if ($log2.support_tokens.Count -gt 0) {
+  $supportRows = Import-Csv (Join-Path $idea "out\corpus_support.csv")
+  if ($supportRows.Count -le 0) { Fail "Expected support rows for fixture with abstracts" }
+  Ok "support corpus populated on abstract fixture"
+}
+Remove-Item -LiteralPath $tempFixture -Recurse -Force
 
 $summary = Get-Content -LiteralPath (Join-Path $idea "out\stageB_summary.txt") -Raw
 foreach($required in @("probe_tokens_tested", "too_broad_count", "broad_count", "ok_count", "narrow_count", "zero_count")){

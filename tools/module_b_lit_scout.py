@@ -27,6 +27,15 @@ EN_STOP = {
     "the", "and", "or", "for", "with", "without", "this", "that", "from", "into", "about", "stage", "idea",
     "test", "tests", "result", "results", "data", "method", "approach", "research", "study",
 }
+CORE_STOPWORDS = {
+    # EN
+    "and", "or", "the", "a", "an", "of", "for", "in", "on", "to", "from", "with", "without", "by", "via",
+    "using", "use", "based", "study", "studies", "result", "results", "method", "methods", "analysis", "analyses",
+    "data", "model", "models", "approach", "approaches", "review", "reviews",
+    # RU
+    "и", "или", "в", "на", "по", "для", "от", "с", "без", "как", "что", "это", "эти", "тот", "та", "те",
+    "также", "метод", "методы", "анализ", "данные", "модель", "модели", "обзор",
+}
 GENERIC_BLACKLIST = {
     "хиты", "и т.п", "и тп", "по чистым", "чистым деревом", "baseline", "overview", "introduction", "введение",
 }
@@ -186,6 +195,15 @@ class StageB:
         self.search_log["planned_queries"] = []
         self.search_log["token_probe"] = []
         self.search_log["llm_effect"] = {}
+        self.search_log["token_sanitation"] = {
+            "stopwords_removed_count": 0,
+            "examples_removed": [],
+            "short_removed_count": 0,
+            "examples_short": [],
+            "punct_removed_count": 0,
+            "examples_punct": [],
+        }
+        self.search_log["sanitation"] = {"stopwords_removed": 0, "examples": []}
 
     def archive_previous_outputs(self) -> None:
         run_dir = self.out_dir / "_runs" / self.run_id
@@ -354,21 +372,52 @@ class StageB:
     def normalize_token_list(self, items: Any) -> List[str]:
         if not isinstance(items, list):
             return []
+        return self.sanitize_tokens(items, context="normalize_token_list")
+
+    def sanitize_tokens(self, tokens: Any, context: str = "general") -> List[str]:
+        if not isinstance(tokens, list):
+            return []
+
         cleaned: List[str] = []
         seen: Set[str] = set()
-        for item in items:
-            if not isinstance(item, str):
+        san = self.search_log.get("token_sanitation", {})
+        for raw in tokens:
+            if raw is None:
                 continue
-            tok = self.normalize_search_anchor(item)
+            tok = self.normalize_search_anchor(str(raw))
+            tok = re.sub(r"\s+", " ", tok).strip()
             if not tok or len(tok) > 60:
+                continue
+            low = tok.lower()
+            if low in CORE_STOPWORDS or low in EN_STOP or low in RU_STOP:
+                san["stopwords_removed_count"] = int(san.get("stopwords_removed_count", 0)) + 1
+                if len(san.get("examples_removed", [])) < 5 and tok not in san.get("examples_removed", []):
+                    san.setdefault("examples_removed", []).append(tok)
+                continue
+            if re.fullmatch(r"[\W_]+", tok):
+                san["punct_removed_count"] = int(san.get("punct_removed_count", 0)) + 1
+                if len(san.get("examples_punct", [])) < 5 and tok not in san.get("examples_punct", []):
+                    san.setdefault("examples_punct", []).append(tok)
+                continue
+            if len(tok) < 4 and not (re.search(r"\d", tok) or "-" in tok):
+                san["short_removed_count"] = int(san.get("short_removed_count", 0)) + 1
+                if len(san.get("examples_short", [])) < 5 and tok not in san.get("examples_short", []):
+                    san.setdefault("examples_short", []).append(tok)
                 continue
             if not self.has_seed_chars(tok):
                 continue
-            key = tok.lower()
+            key = low
             if key in seen:
                 continue
             seen.add(key)
             cleaned.append(tok)
+
+        self.search_log["token_sanitation"] = san
+        self.search_log["sanitation"] = {
+            "stopwords_removed": san.get("stopwords_removed_count", 0),
+            "examples": san.get("examples_removed", [])[:3],
+            "context": context,
+        }
         return cleaned
 
     def detect_geo_terms(self, idea_text: str, structured: Dict[str, Any]) -> Set[str]:
@@ -421,10 +470,9 @@ class StageB:
     def extract_strong_tokens(self, lines: List[str], limit: int = 40) -> List[str]:
         weighted: Dict[str, int] = {}
         for line in lines:
-            for tok in re.findall(r"[A-Za-z0-9\-]{4,}", self.normalize_search_anchor(line)):
+            toks = self.sanitize_tokens(re.findall(r"[A-Za-z0-9\-]{2,}", self.normalize_search_anchor(line)), context="extract_strong_tokens")
+            for tok in toks:
                 tl = tok.lower()
-                if tl in EN_STOP or tl in RU_STOP:
-                    continue
                 sc = self.token_strength(tok)
                 if tl not in weighted or sc > weighted[tl]:
                     weighted[tl] = sc
@@ -528,8 +576,8 @@ class StageB:
         if user_packs:
             cleaned: List[List[str]] = []
             for pack in user_packs:
-                terms = [self.normalize_search_anchor(t).lower() for t in pack if isinstance(t, str)]
-                terms = [t for t in terms if t and t.lower() not in GENERIC_WORDS]
+                terms = [t.lower() for t in self.sanitize_tokens(pack, context="anchor_packs_user") if t]
+                terms = [t for t in terms if t and t.lower() not in GENERIC_WORDS and t not in CORE_STOPWORDS]
                 if len(terms) >= 2 and not all(self.is_geography_token(t) for t in terms):
                     cleaned.append(terms[:3])
             packs = cleaned[:6]
@@ -537,26 +585,30 @@ class StageB:
             self.search_log["anchor_packs_search"] = packs
             return packs
 
-        candidates = [t for t in keywords_tokens if t and t.lower() not in GENERIC_WORDS]
+        candidates = [t.lower() for t in self.sanitize_tokens(keywords_tokens, context="anchor_packs_candidates") if t and t.lower() not in GENERIC_WORDS]
+        candidates = [t for t in candidates if t not in CORE_STOPWORDS and t != (primary_token or "").lower()]
         method_vocab = {"lfmm2", "baypass", "ddrad", "snp", "hydrorivers", "hydroatlas", "abba-baba", "genotype", "environment"}
-        phenomenon_vocab = {"adaptation", "gene", "flow", "geneflow", "riverscape", "association", "introgression", "selection"}
-        method_token = next((t for t in candidates if t in method_vocab or re.search(r"\d", t) or "-" in t), "")
-        context_token = next((t for t in candidates if t not in {primary_token, method_token} and not self.is_geography_token(t)), "")
-        phenomenon_token = next((t for t in candidates if t in phenomenon_vocab and t not in {primary_token, method_token}), "")
-        if not phenomenon_token:
-            phenomenon_token = next((t for t in candidates if t not in {primary_token, method_token, context_token}), "")
+        phenomenon_vocab = {"adaptation", "gene", "flow", "geneflow", "riverscape", "association", "introgression", "selection", "connectivity", "network"}
+
+        method_candidates = [t for t in candidates if t in method_vocab or re.search(r"\d", t) or "-" in t]
+        phenomenon_candidates = [t for t in candidates if t in phenomenon_vocab or len(t.split()) >= 2]
+        context_candidates = [t for t in candidates if t not in method_candidates and not self.is_geography_token(t)]
+
+        method_token = method_candidates[0] if method_candidates else ""
+        phenomenon_token = next((t for t in phenomenon_candidates if t not in {method_token}), "")
+        context_token = next((t for t in context_candidates if t not in {method_token, phenomenon_token}), "")
 
         packs: List[List[str]] = []
         for proto in [
-            [primary_token, method_token],
-            [primary_token, context_token],
             [primary_token, phenomenon_token],
+            [primary_token, context_token],
+            [phenomenon_token, context_token],
+            [primary_token, method_token],
             [method_token, phenomenon_token],
-            [primary_token, method_token, phenomenon_token],
             [primary_token, context_token, phenomenon_token],
         ]:
-            terms = [t for t in proto if t]
-            terms = [t for t in dict.fromkeys(terms) if t.lower() not in GENERIC_WORDS]
+            terms = [t.lower() for t in proto if t]
+            terms = [t for t in dict.fromkeys(terms) if t.lower() not in GENERIC_WORDS and t not in CORE_STOPWORDS]
             if len(terms) < 2:
                 continue
             if all(self.is_geography_token(t) for t in terms):
@@ -629,13 +681,47 @@ class StageB:
         return out[:10]
 
     def build_boolean_query(self, terms: List[str]) -> str:
-        uniq = [self.normalize_search_anchor(x) for x in terms if self.normalize_search_anchor(x)]
-        uniq = list(dict.fromkeys(uniq))[:3]
+        clean_terms = [x.lower() for x in self.sanitize_tokens(terms, context="query_builder") if x]
+        uniq = list(dict.fromkeys(clean_terms))[:3]
         if len(uniq) <= 1:
             return uniq[0] if uniq else ""
         if len(uniq) == 2:
             return f"({uniq[0]} AND {uniq[1]})"
         return f"({uniq[0]} AND ({uniq[1]} OR {uniq[2]}))"
+
+    def normalize_query_text(self, query: str) -> str:
+        q = re.sub(r"\s+", " ", (query or "").strip())
+        q = re.sub(r"\b(and|or)\b", lambda m: m.group(1).upper(), q, flags=re.IGNORECASE)
+        q = re.sub(r"\s+", " ", q)
+        return q
+
+    def dedup_planned_queries(self, queries: List[str]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        removed = 0
+        for q in queries:
+            nq = self.normalize_query_text(q).lower()
+            if not nq:
+                continue
+            if nq in seen:
+                removed += 1
+                self.search_log.setdefault("rejected_queries", []).append({"query_text": q, "reason": "duplicate_query"})
+                continue
+            seen.add(nq)
+            out.append(self.normalize_query_text(q))
+        self.search_log["removed_duplicate_queries_count"] = removed
+        return out
+
+    def is_selective_term(self, token: str, probe_map: Dict[str, Dict[str, Any]]) -> bool:
+        t = (token or "").lower().strip()
+        if not t or t in CORE_STOPWORDS or t in GENERIC_WORDS:
+            return False
+        cat = probe_map.get(t, {}).get("category")
+        if cat == "TOO_BROAD":
+            return False
+        if cat in {"OK", "NARROW", "BROAD"}:
+            return True
+        return self.is_term_like(token)
 
     def probe_category(self, total: int) -> str:
         if total >= PROBE_TOO_BROAD:
@@ -652,17 +738,15 @@ class StageB:
         tok = self.normalize_search_anchor(token).strip().lower()
         if not tok:
             return False
-        if tok in GENERIC_TOKEN_BLACKLIST:
+        if tok in CORE_STOPWORDS or tok in GENERIC_TOKEN_BLACKLIST:
             return False
-        if len(tok) < 4 and not re.search(r"\d", tok):
-            return False
-        if len(tok) < 3:
+        if len(tok) < 4 and not (re.search(r"\d", tok) or "-" in tok):
             return False
         return bool(re.search(r"[a-z0-9\-]", tok))
 
     def gather_candidate_tokens(self, primary_token: str, keywords_tokens: List[str], search_anchors: List[str], llm_tokens: List[str], llm_used: bool) -> List[str]:
         source = llm_tokens if llm_used else (keywords_tokens if keywords_tokens else search_anchors)
-        merged = [primary_token] + source + keywords_tokens + search_anchors
+        merged = self.sanitize_tokens([primary_token] + source + keywords_tokens + search_anchors, context="candidate_tokens")
         out: List[str] = []
         seen: Set[str] = set()
         for token in merged:
@@ -733,27 +817,38 @@ class StageB:
         method_set = {m.lower() for m in method_terms if m}
         ptoken = (primary_token or "").lower()
         for q in queries:
-            query = re.sub(r"\s+", " ", q.strip())
-            terms = [t.lower() for t in re.findall(r"[A-Za-z0-9\-]+", query) if len(t) >= 3]
-            if not query:
+            query = self.normalize_query_text(q)
+            terms = [t.lower() for t in self.sanitize_tokens(re.findall(r"[A-Za-z0-9\-]+", query), context="preflight")]
+            if not query or not terms:
                 bad.append("Пустая поисковая строка")
+                continue
+            if any(t in CORE_STOPWORDS for t in terms):
+                self.search_log["rejected_queries"].append({"query_text": query, "reason": "contains_stopword_term"})
+                bad.append(f"Стоп-слово в запросе: {query}")
                 continue
             if len(terms) == 1:
                 info = probe_map.get(terms[0], {})
                 if info.get("category") in {"TOO_BROAD", "BROAD"}:
                     bad.append(f"Слишком общий одиночный токен: {query}")
-                    self.search_log["rejected_queries"].append({"query": query, "reason": "too_broad_solo"})
+                    self.search_log["rejected_queries"].append({"query_text": query, "reason": "too_broad_solo"})
+                    continue
+            if len(terms) == 2 and ptoken and ptoken in terms:
+                second = terms[1] if terms[0] == ptoken else terms[0]
+                if (second in GENERIC_WORDS) or (not self.is_selective_term(second, probe_map)):
+                    bad.append(f"Незначимый второй термин: {query}")
+                    self.search_log["rejected_queries"].append({"query_text": query, "reason": "non_significant_second_term", "details": {"primary": ptoken, "term": second}})
                     continue
             geo_terms = [t for t in terms if self.is_geography_token(t) or self.is_geo_like_token(t.capitalize())]
             if len(geo_terms) == len(terms):
                 bad.append(f"Geo-only запрос запрещён: {query}")
-                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_only"})
+                self.search_log["rejected_queries"].append({"query_text": query, "reason": "geo_only"})
                 continue
             if geo_terms and not any((t == ptoken) or (t in method_set) for t in terms):
                 bad.append(f"География без пары primary/method запрещена: {query}")
-                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_without_pair"})
+                self.search_log["rejected_queries"].append({"query_text": query, "reason": "geo_without_pair"})
                 continue
             ok.append(query)
+        ok = self.dedup_planned_queries(ok)
         return ok[:8], bad
 
     def classify_query_blocks(self, tokens: List[str]) -> Dict[str, List[str]]:
@@ -763,6 +858,8 @@ class StageB:
         context = []
         for tok in tokens:
             t = tok.lower()
+            if t in CORE_STOPWORDS or t in GENERIC_WORDS:
+                continue
             if re.search(r"\d", t) or "-" in t or re.search(r"[a-z][A-Z]|[A-Z]{2,}", tok) or re.search(r"(net|graph|gan|bert|pcr)$", t):
                 method.append(t)
             elif self.is_geography_token(t) or self.is_geo_like_token(tok.capitalize()):
@@ -774,72 +871,89 @@ class StageB:
         return {"PRIMARY": primary, "METHOD": method, "PHENOMENON": phenomenon, "CONTEXT": context}
 
     def build_seed_queries(self, keywords_for_search: List[str], search_anchors: List[str], packs: List[List[str]], primary_token: str, source_terms: List[str], source_mode: str, probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
-        queries: List[str] = []
+        queries: List[Dict[str, Any]] = []
         seen: Set[str] = set()
         tokens = self.normalize_token_list(source_terms + keywords_for_search + search_anchors)
         blocks = self.classify_query_blocks(tokens)
-        method_terms = [t for t in blocks["METHOD"] if probe_map.get(t, {}).get("category") in {"OK", "NARROW"}]
-        phen_terms = [t for t in blocks["PHENOMENON"] if probe_map.get(t, {}).get("category") in {"OK", "NARROW"}]
+        method_terms = [t for t in blocks["METHOD"] if probe_map.get(t, {}).get("category") in {"OK", "NARROW", "BROAD"}]
+        phen_terms = [t for t in blocks["PHENOMENON"] if probe_map.get(t, {}).get("category") in {"OK", "NARROW", "BROAD"}]
         context_terms = [t for t in blocks["CONTEXT"] if probe_map.get(t, {}).get("category") not in {"TOO_BROAD", "ZERO"}]
 
-        def add_query(parts: List[str]) -> None:
-            parts = [p for p in parts if p]
-            if not parts:
-                return
+        def add_query(parts: List[str], reason: str) -> None:
+            parts = [p for p in self.sanitize_tokens(parts, context="planned_query_parts") if p]
+            if len(parts) >= 2 and primary_token in [x.lower() for x in parts]:
+                second = next((x for x in parts if x.lower() != primary_token.lower()), "")
+                if second and not self.is_selective_term(second, probe_map):
+                    self.search_log["rejected_queries"].append({"query_text": self.build_boolean_query(parts[:3]), "reason": "non_significant_second_term", "details": {"term": second}})
+                    return
             q = self.build_boolean_query(parts[:3])
-            key = q.lower()
-            if q and key not in seen:
-                seen.add(key)
-                queries.append(q)
+            nq = self.normalize_query_text(q).lower()
+            if q and nq and nq not in seen:
+                seen.add(nq)
+                queries.append({"query_text": self.normalize_query_text(q), "terms": parts[:3], "reason": reason})
 
         pcat = probe_map.get(primary_token, {}).get("category", "OK")
         if primary_token and pcat != "ZERO":
-            add_query([primary_token])
+            add_query([primary_token], "primary_seed")
         for m in method_terms[:3]:
-            add_query([primary_token, m])
+            add_query([primary_token, m], "primary_method")
         for ph in phen_terms[:2]:
-            add_query([primary_token, ph])
+            add_query([primary_token, ph], "primary_phenomenon")
         if (not primary_token) or pcat == "ZERO":
             for m in method_terms[:1]:
                 for ph in phen_terms[:1]:
-                    add_query([m, ph])
+                    add_query([m, ph], "fallback_method_phenomenon")
         for c in context_terms[:1]:
-            add_query([primary_token, c])
+            add_query([primary_token, c], "primary_context")
         for pack in packs[:6]:
-            add_query([x.lower() for x in pack])
+            add_query([x.lower() for x in pack], "anchor_pack")
 
-        good, bad = self.preflight_queries(queries[:8], primary_token, method_terms, probe_map)
+        raw_queries = [q["query_text"] for q in queries]
+        good, bad = self.preflight_queries(raw_queries[:8], primary_token, method_terms, probe_map)
         for item in bad:
             self.search_log["errors"].append(f"query_preflight: {item}")
+        self.search_log["planner"] = {
+            "planned_queries": [q for q in queries if q["query_text"] in good][:8],
+            "rejected_queries": self.search_log.get("rejected_queries", []),
+            "removed_duplicates": self.search_log.get("removed_duplicate_queries_count", 0),
+        }
         self.search_log["planned_queries"] = good[:8]
         return good[:8]
 
     def validate_seed_queries(self, queries: List[str], probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
         alive: List[str] = []
-        ok_tokens = [x["token"] for x in self.search_log.get("token_probe", []) if x.get("category") == "OK"]
-        for query in queries:
+        ok_tokens = [x["token"] for x in self.search_log.get("token_probe", []) if x.get("category") in {"OK", "NARROW"}]
+        for query in self.dedup_planned_queries(queries):
             attempts = 0
-            current = query
-            while attempts < 2:
+            current = self.normalize_query_text(query)
+            while attempts < 3:
                 attempts += 1
                 total = 1
                 if not self.offline_fixtures:
                     total, _ = self.openalex_probe_count(current)
                 if total > 0:
-                    alive.append(current)
-                    break
-                self.search_log["rejected_queries"].append({"query": current, "reason": "zero_total"})
-                terms = [t.lower() for t in re.findall(r"[A-Za-z0-9\-]+", current)]
-                narrow = [t for t in terms if probe_map.get(t, {}).get("category") in {"ZERO", "NARROW"}]
-                if narrow and ok_tokens:
-                    repl = ok_tokens[0]
-                    current = self.build_boolean_query([t for t in terms if t not in narrow[:1]] + [repl])
+                    terms = [t.lower() for t in self.sanitize_tokens(re.findall(r"[A-Za-z0-9\-]+", current), context="validate_queries")]
+                    if total > PROBE_TOO_BROAD and len(terms) == 2 and any(probe_map.get(t, {}).get("category") == "TOO_BROAD" for t in terms):
+                        self.search_log["rejected_queries"].append({"query_text": current, "reason": "rejected_too_broad_pair", "details": {"result_total": total}})
+                    else:
+                        alive.append(current)
+                        break
                 else:
-                    current = self.build_boolean_query(terms[:2])
+                    self.search_log["rejected_queries"].append({"query_text": current, "reason": "rejected_zero", "details": {"attempt": attempts}})
+                terms = [t.lower() for t in self.sanitize_tokens(re.findall(r"[A-Za-z0-9\-]+", current), context="validate_rebuild")]
+                replace_target = next((t for t in terms if probe_map.get(t, {}).get("category") in {"ZERO", "TOO_BROAD"}), "")
+                repl = next((t for t in ok_tokens if t not in terms and self.is_selective_term(t, probe_map)), "")
+                if replace_target and repl:
+                    rebuilt = [repl if t == replace_target else t for t in terms]
+                    current = self.build_boolean_query(rebuilt[:3])
+                else:
+                    break
             if len(alive) >= 8:
                 break
-        self.search_log["planned_queries"] = alive[:8]
-        return alive[:8]
+        alive = self.dedup_planned_queries(alive)[:8]
+        self.search_log["planned_queries"] = alive
+        self.search_log.setdefault("planner", {})["removed_duplicates"] = self.search_log.get("removed_duplicate_queries_count", 0)
+        return alive
 
     def openalex_search_pack(self, query: str) -> Tuple[List[Dict[str, Any]], int]:
         params = {"search": query, "per-page": 50}
@@ -1055,8 +1169,27 @@ class StageB:
         url = str(p.get("url", "")).lower()
         return any(hint in url for hint in DATASET_DOMAIN_HINTS)
 
-    def normalize_text_for_match(self, text: str) -> str:
-        return re.sub(r"\s+", " ", re.sub(r"[^\w\s\-]", " ", (text or "").lower())).strip()
+    def normalize_text_for_match(self, text: str) -> Dict[str, str]:
+        base = (text or "").lower()
+        keep_hyphen = re.sub(r"\s+", " ", re.sub(r"[^\w\s\-]", " ", base)).strip()
+        hyphen_as_space = re.sub(r"\s+", " ", keep_hyphen.replace("-", " ")).strip()
+        return {"with_hyphen": keep_hyphen, "hyphen_as_space": hyphen_as_space}
+
+    def token_match(self, token: str, normalized_texts: Dict[str, str]) -> bool:
+        words = [w for w in re.findall(r"[a-z0-9\-]+", token.lower()) if w]
+        if not words:
+            return False
+        variants = [normalized_texts.get("with_hyphen", ""), normalized_texts.get("hyphen_as_space", "")]
+        patterns = []
+        if len(words) == 1:
+            patterns = [r"\b" + re.escape(words[0]) + r"\b"]
+            if "-" in words[0]:
+                split = [w for w in words[0].split("-") if w]
+                if len(split) > 1:
+                    patterns.append(r"\b" + r"\s+".join(re.escape(w) for w in split) + r"\b")
+        else:
+            patterns = [r"\b" + r"\s+".join(re.escape(w) for w in words) + r"\b"]
+        return any(re.search(pat, txt, flags=re.IGNORECASE) for pat in patterns for txt in variants if txt)
 
     def sanitize_blacklist(self, raw_list: List[str]) -> Tuple[List[str], List[Dict[str, str]]]:
         sanitized: List[str] = []
@@ -1093,28 +1226,46 @@ class StageB:
                 return term
         return ""
 
+    def is_term_like(self, token: str) -> bool:
+        t = (token or "").strip()
+        if not t:
+            return False
+        return bool(re.search(r"\d", t) or "-" in t or len(t.split()) >= 2 or re.search(r"[a-z][A-Z]|[A-Z]{2,}", t))
+
     def build_support_tokens(self, keywords_tokens: List[str], primary_token: str, llm_support_tokens: Optional[List[str]] = None) -> List[str]:
         candidate_raw = llm_support_tokens if llm_support_tokens else keywords_tokens
+        candidate_raw = self.sanitize_tokens(candidate_raw, context="support_tokens")
+        primary_low = (primary_token or "").lower()
         out: List[str] = []
         seen: Set[str] = set()
         for tok in candidate_raw:
             clean = self.normalize_search_anchor(str(tok or "")).lower()
-            if not clean or clean == primary_token:
+            if not clean or clean == primary_low:
                 continue
             if clean in seen:
                 continue
-            if self.is_geo_like_token(clean.capitalize()):
+            if self.is_geo_like_token(clean.capitalize()) or self.is_geography_token(clean):
                 continue
-            if clean in EN_STOP or clean in GENERIC_TOKEN_BLACKLIST:
+            if clean in GENERIC_TOKEN_BLACKLIST or clean in CORE_STOPWORDS:
                 continue
-            seen.add(clean)
-            out.append(clean)
-        return out[:15]
+            if llm_support_tokens or self.is_term_like(tok):
+                seen.add(clean)
+                out.append(clean)
+        if not llm_support_tokens and len(out) < 10:
+            fallback = [self.normalize_search_anchor(str(t)).lower() for t in keywords_tokens]
+            for tok in fallback:
+                if tok and tok not in seen and tok != primary_low and tok not in GENERIC_TOKEN_BLACKLIST and tok not in CORE_STOPWORDS:
+                    seen.add(tok)
+                    out.append(tok)
+                if len(out) >= 20:
+                    break
+        return out[:20]
 
     def apply_relevance_and_score(self, papers: List[Dict[str, Any]], primary_token: str, keywords_tokens: List[str], must_have_tokens: List[str], anchor_packs: List[List[str]], drift_blacklist_raw: List[str], support_tokens: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], float, Dict[str, int], Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         eval_flags: List[bool] = []
-        metrics = {"primary_hit_count": 0, "packs_hit_count": 0, "dataset_low_count": 0, "blacklist_low_count": 0}
+        metrics = {"primary_hit_count": 0, "packs_hit_count": 0, "dataset_low_count": 0, "blacklist_low_count": 0, "support_hit_count": 0}
+        pack_examples: List[Dict[str, Any]] = []
         drift_blacklist, drift_blacklist_dropped = self.sanitize_blacklist(drift_blacklist_raw)
         blacklist_matches = 0
 
@@ -1122,19 +1273,21 @@ class StageB:
             title = str(p.get("title", ""))
             abstract = str(p.get("abstract", ""))
             text = f"{title} {abstract}".lower().strip()
-            normalized_text = self.normalize_text_for_match(f"{title} {abstract}")
+            normalized_texts = self.normalize_text_for_match(f"{title} {abstract}")
+            normalized_text = normalized_texts.get("with_hyphen", "")
             title_only = title.lower()
-            hit_primary = bool(primary_token) and (primary_token in text)
-            hits_kw = sum(1 for t in keywords_tokens if t and t in text)
-            hits_must = sum(1 for t in must_have_tokens if t and t in text)
-            hits_support = sum(1 for t in support_tokens if t and re.search(r"\b" + re.escape(t) + r"\b", normalized_text, flags=re.IGNORECASE))
+            hit_primary = bool(primary_token) and self.token_match(primary_token, normalized_texts)
+            hits_kw = sum(1 for t in keywords_tokens if t and self.token_match(t, normalized_texts))
+            hits_must = sum(1 for t in must_have_tokens if t and self.token_match(t, normalized_texts))
+            matched_support = [t for t in support_tokens if t and self.token_match(t, normalized_texts)]
+            hits_support = len(matched_support)
             hits_packs = 0
             for pack in anchor_packs:
                 terms = [t.lower() for t in pack if t]
                 if len(terms) < 2:
                     continue
-                in_text = all(t in text for t in terms)
-                in_title = (not abstract.strip()) and all(t in title_only for t in terms)
+                in_text = all(self.token_match(t, normalized_texts) for t in terms)
+                in_title = (not abstract.strip()) and all(self.token_match(t, self.normalize_text_for_match(title_only)) for t in terms)
                 if in_text or in_title:
                     hits_packs += 1
 
@@ -1142,7 +1295,7 @@ class StageB:
             black_term = self.find_blacklist_match(normalized_text, drift_blacklist)
             black_hit = bool(black_term)
             has_abstract = bool(abstract.strip())
-            support_rule_hit = (hits_support >= 2) or (hits_kw >= 3 and hits_support >= 1)
+            support_rule_hit = (hits_support >= 1) or (hits_kw >= 3 and hits_support >= 1)
 
             if black_hit and (not hit_primary and hits_packs == 0):
                 blacklist_matches += 1
@@ -1172,6 +1325,10 @@ class StageB:
                 metrics["primary_hit_count"] += 1
             if hits_packs >= 1:
                 metrics["packs_hit_count"] += 1
+                if len(pack_examples) < 3:
+                    pack_examples.append({"title": title, "hits_packs": hits_packs})
+            if hits_support >= 1:
+                metrics["support_hit_count"] += 1
 
             score_main = (6 if hit_primary else 0) + (4 * hits_packs) + hits_kw + (2 * hits_must)
             score_support = (3 * hits_support) + (1.5 * hits_kw) + (1.0 * hits_must)
@@ -1188,7 +1345,9 @@ class StageB:
                 "score_support": round(score_support + (citation_score * 0.5) + freshness_score, 4),
                 "relevance_flag": relevance_flag,
                 "reason": reason,
-                "reason_detail": black_term if reason == "low_drift_blacklist" else "",
+                "reason_detail": black_term if reason == "low_drift_blacklist" else ("matched_tokens: " + "; ".join(matched_support[:4]) if reason == "pass_support" else ""),
+                "hits_support": hits_support,
+                "support_reason": "; ".join(matched_support[:4]),
                 "score_components": f"main={round(score_main,3)}; support={round(score_support,3)}; primary={int(hit_primary)}; packs={hits_packs}; kw={hits_kw}; must={hits_must}; support_hits={hits_support}; cit={round(citation_score,3)}; fresh={round(freshness_score,3)}",
             })
             rows.append(row)
@@ -1205,6 +1364,7 @@ class StageB:
             [r for r in rows if r.get("relevance_flag") == "PASS_SUPPORT"],
             key=lambda x: (-x.get("score_support", 0), -(x.get("cited_by_count", 0) or 0), x.get("title", ""),),
         )
+        self.search_log["pack_hit_examples"] = pack_examples
         blacklist_stats = {
             "raw_count": len(drift_blacklist_raw),
             "sanitized_count": len(drift_blacklist),
@@ -1215,11 +1375,12 @@ class StageB:
 
     def write_corpus(self, passed_papers: List[Dict[str, Any]], support_papers: List[Dict[str, Any]], all_papers: List[Dict[str, Any]], allow_replace: bool) -> None:
         common_fields = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
+        extra_fields = ["relevance_flag", "reason", "reason_detail", "hits_support", "support_reason", "score_components"]
         targets = [
             ("corpus.csv", passed_papers[:300], common_fields),
             ("corpus_support.csv", support_papers[:150], common_fields),
-            ("corpus_all.csv", all_papers, common_fields + ["relevance_flag", "reason", "reason_detail", "score_components"]),
-            ("corpus_support_all.csv", support_papers, common_fields + ["relevance_flag", "reason", "reason_detail", "score_components"]),
+            ("corpus_all.csv", all_papers, common_fields + extra_fields),
+            ("corpus_support_all.csv", support_papers, common_fields + extra_fields),
         ]
         for name, rows, fields in targets:
             target = self.out_dir / name
@@ -1421,7 +1582,10 @@ class StageB:
             f"packs_hit_count = {stats.get('packs_hit_count', 0)}",
             f"must_have_count = {stats.get('must_have_count', 0)}",
             f"support_tokens_count = {stats.get('support_tokens_count', 0)}",
-            f"support_hit_count = {stats.get('support_count', 0)}",
+            f"support_hit_count = {stats.get('support_hit_count', 0)}",
+            f"planned_queries_count = {len(self.search_log.get('planned_queries', []))}",
+            f"removed_duplicate_queries_count = {self.search_log.get('removed_duplicate_queries_count', 0)}",
+            f"stopwords_removed = {self.search_log.get('token_sanitation', {}).get('stopwords_removed_count', 0)}",
             f"dataset_low_count = {stats.get('dataset_low_count', 0)}",
             f"drift_blacklist_raw_count = {stats.get('drift_blacklist_raw_count', 0)}",
             f"drift_blacklist_sanitized_count = {stats.get('drift_blacklist_sanitized_count', 0)}",
@@ -1451,6 +1615,8 @@ class StageB:
         zero = [x.get('token','') for x in self.search_log.get('token_probe', []) if x.get('category') == 'ZERO'][:3]
         lines.append(f"top_too_broad_examples = {', '.join(too_broad)}")
         lines.append(f"top_zero_examples = {', '.join(zero)}")
+        stop_examples = self.search_log.get('token_sanitation', {}).get('examples_removed', [])[:3]
+        lines.append(f"stopwords_examples = {', '.join(stop_examples)}")
         for ab in unresolved:
             lines.append(f"аббревиатура не раскрыта: {ab}")
             self.log(f"аббревиатура не раскрыта: {ab}")
@@ -1490,12 +1656,13 @@ class StageB:
         self.search_log["keywords_for_search_count"] = len(keywords_for_search)
         self.search_log["keywords_for_search_preview"] = keywords_for_search[:5]
 
-        base_tokens = [x.lower() for x in self.extract_keywords_tokens(keywords_for_search)]
+        base_tokens = [x.lower() for x in self.sanitize_tokens(self.extract_keywords_tokens(keywords_for_search), context="keywords_tokens")]
         primary_token = self.detect_primary_token(keywords_for_search, search_anchors)
-        must_have_tokens = self.build_must_have_tokens(keywords_for_search)
+        must_have_tokens = [x.lower() for x in self.sanitize_tokens(self.build_must_have_tokens(keywords_for_search), context="must_have_tokens")]
         packs = self.build_anchor_packs(primary_token, base_tokens)
         keywords_tokens = base_tokens
         drift_blacklist: List[str] = []
+        llm_support_raw: List[str] = []
         support_tokens: List[str] = self.build_support_tokens(base_tokens, primary_token)
         source_mode = "keywords" if keywords_used else "anchors"
         source_terms = keywords_for_search if keywords_used else search_anchors
@@ -1526,6 +1693,7 @@ class StageB:
                     "stop_reason": "llm_invalid", "primary_token": primary_token, "packs_count": len(packs),
                     "must_have_count": len(must_have_tokens),
                     "support_tokens_count": len(support_tokens),
+                    "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0),
                     "probe_counts": {},
                 }
                 self.search_log["stats"] = stats
@@ -1541,11 +1709,12 @@ class StageB:
             self.llm_info["reason"] = "validated_and_applied"
             self.llm_info["schema"] = parsed_llm.get("schema", "invalid")
             primary_token = (parsed_llm.get("primary") or primary_token).lower()
-            keywords_tokens = [x.lower() for x in parsed_llm.get("keywords", [])] or base_tokens
-            must_have_tokens = [x.lower() for x in parsed_llm.get("must_have", [])] or must_have_tokens
+            keywords_tokens = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("keywords", []), context="llm_keywords")] or base_tokens
+            must_have_tokens = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("must_have", []), context="llm_must_have")] or must_have_tokens
             packs = self.build_anchor_packs(primary_token, keywords_tokens, parsed_llm.get("packs", []))
-            drift_blacklist = [x.lower() for x in parsed_llm.get("drift_blacklist", [])]
-            support_tokens = self.build_support_tokens(keywords_tokens, primary_token, parsed_llm.get("support_tokens", []))
+            drift_blacklist = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("drift_blacklist", []), context="drift_blacklist")]
+            llm_support_raw = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("support_tokens", []), context="llm_support_tokens")]
+            support_tokens = self.build_support_tokens(keywords_tokens, primary_token, llm_support_raw)
             if parsed_llm.get("abbreviation_map"):
                 self.abbr_full_map.update(parsed_llm.get("abbreviation_map", {}))
             source_mode = "llm"
@@ -1554,12 +1723,20 @@ class StageB:
 
         candidate_tokens = self.gather_candidate_tokens(primary_token, keywords_tokens, search_anchors, llm_token_source, bool(self.llm_info.get("used")))
         probe_map = self.run_token_probe(candidate_tokens, primary_token)
-        support_tokens = [
-            t for t, info in probe_map.items()
-            if t != primary_token and info.get("category") in {"OK", "NARROW"}
-            and not (info.get("geo_like") or self.is_geography_token(t))
-            and (re.search(r"\d", t) or "-" in t or len(t.split()) >= 2)
-        ][:15]
+        if llm_support_raw:
+            support_tokens = [
+                t for t in llm_support_raw
+                if t != primary_token and probe_map.get(t, {}).get("category") in {"OK", "NARROW", "BROAD"}
+                and not (probe_map.get(t, {}).get("geo_like") or self.is_geography_token(t))
+            ][:20]
+        else:
+            auto_support = self.build_support_tokens(keywords_tokens + must_have_tokens, primary_token)
+            support_tokens = [
+                t for t in auto_support
+                if t != primary_token and probe_map.get(t, {}).get("category") in {"OK", "NARROW", "BROAD"}
+                and not (probe_map.get(t, {}).get("geo_like") or self.is_geography_token(t))
+                and (self.is_term_like(t) or probe_map.get(t, {}).get("category") in {"OK", "NARROW"})
+            ][:20]
         probe_stats = Counter([x.get("category", "") for x in self.search_log.get("token_probe", [])])
         self.search_log["llm_effect"] = {
             "from_llm_tokens": len(self.normalize_token_list(llm_token_source)),
@@ -1655,6 +1832,8 @@ class StageB:
                 "packs_hit_count": metrics["packs_hit_count"],
                 "must_have_count": len(must_have_tokens),
                 "support_tokens_count": len(support_tokens),
+                "support_hit_count": metrics["support_hit_count"],
+                "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0),
                 "probe_counts": dict(probe_stats),
                 "dataset_low_count": metrics["dataset_low_count"],
                 "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0),
@@ -1690,6 +1869,8 @@ class StageB:
             "packs_hit_count": metrics["packs_hit_count"],
             "must_have_count": len(must_have_tokens),
             "support_tokens_count": len(support_tokens),
+            "support_hit_count": metrics["support_hit_count"],
+            "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0),
             "probe_counts": dict(probe_stats),
             "dataset_low_count": metrics["dataset_low_count"],
             "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0),
