@@ -42,6 +42,10 @@ GENERIC_WORDS = GENERIC_TOKEN_BLACKLIST | {
     "population", "populations", "algorithm", "framework", "review", "case", "cases", "science",
 }
 
+BLACKLIST_SINGLE_WORD_STOP = {
+    "data", "model", "study", "analysis", "method", "methods", "approach", "review",
+}
+
 DATASET_DOMAIN_HINTS = {
     "gbif.org", "zenodo.org", "figshare.com", "dryad", "datadryad", "pangaea", "kaggle.com",
 }
@@ -137,6 +141,7 @@ class StageB:
             "anchor_top_search": [],
             "anchor_packs": [],
             "anchor_packs_search": [],
+            "support_tokens": [],
             "abbreviation_map": {},
             "queries": [],
             "errors": [],
@@ -171,7 +176,7 @@ class StageB:
         prev_dir = run_dir / "_prev"
         run_dir.mkdir(parents=True, exist_ok=True)
         move_targets = {
-            "corpus.csv", "corpus_all.csv", "search_log_B.json", "stageB_summary.txt", "prisma_lite_B.md", "runB.log", "llm_prompt_B_anchors.txt",
+            "corpus.csv", "corpus_all.csv", "corpus_support.csv", "corpus_support_all.csv", "search_log_B.json", "stageB_summary.txt", "prisma_lite_B.md", "runB.log", "llm_prompt_B_anchors.txt",
         }
         for item in self.out_dir.iterdir():
             if item.name == "_runs":
@@ -925,19 +930,79 @@ class StageB:
         url = str(p.get("url", "")).lower()
         return any(hint in url for hint in DATASET_DOMAIN_HINTS)
 
-    def apply_relevance_and_score(self, papers: List[Dict[str, Any]], primary_token: str, keywords_tokens: List[str], must_have_tokens: List[str], anchor_packs: List[List[str]], drift_blacklist: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, Dict[str, int]]:
+    def normalize_text_for_match(self, text: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[^\w\s\-]", " ", (text or "").lower())).strip()
+
+    def sanitize_blacklist(self, raw_list: List[str]) -> Tuple[List[str], List[Dict[str, str]]]:
+        sanitized: List[str] = []
+        dropped: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        for raw in raw_list:
+            txt = re.sub(r"\s+", " ", str(raw or "").strip().lower())
+            if not txt:
+                continue
+            tokens = [t for t in re.findall(r"[a-z0-9\-]+", txt) if t]
+            is_exception = bool(re.search(r"\d", txt) and "-" in txt)
+            if len(txt) < 5 and not is_exception:
+                dropped.append({"item": txt, "reason": "too_short"})
+                continue
+            if len(tokens) == 1 and 5 <= len(tokens[0]) <= 6 and tokens[0] in BLACKLIST_SINGLE_WORD_STOP:
+                dropped.append({"item": txt, "reason": "generic_single_word"})
+                continue
+            if txt in seen:
+                continue
+            seen.add(txt)
+            sanitized.append(txt)
+        return sanitized, dropped
+
+    def find_blacklist_match(self, normalized_text: str, blacklist_terms: List[str]) -> str:
+        for term in blacklist_terms:
+            words = [w for w in re.findall(r"[a-z0-9\-]+", term.lower()) if w]
+            if not words:
+                continue
+            if len(words) == 1:
+                pattern = r"\b" + re.escape(words[0]) + r"\b"
+            else:
+                pattern = r"\b" + r"\s+".join(re.escape(w) for w in words) + r"\b"
+            if re.search(pattern, normalized_text, flags=re.IGNORECASE):
+                return term
+        return ""
+
+    def build_support_tokens(self, keywords_tokens: List[str], primary_token: str, llm_support_tokens: Optional[List[str]] = None) -> List[str]:
+        candidate_raw = llm_support_tokens if llm_support_tokens else keywords_tokens
+        out: List[str] = []
+        seen: Set[str] = set()
+        for tok in candidate_raw:
+            clean = self.normalize_search_anchor(str(tok or "")).lower()
+            if not clean or clean == primary_token:
+                continue
+            if clean in seen:
+                continue
+            if self.is_geo_like_token(clean.capitalize()):
+                continue
+            if clean in EN_STOP or clean in GENERIC_TOKEN_BLACKLIST:
+                continue
+            seen.add(clean)
+            out.append(clean)
+        return out[:15]
+
+    def apply_relevance_and_score(self, papers: List[Dict[str, Any]], primary_token: str, keywords_tokens: List[str], must_have_tokens: List[str], anchor_packs: List[List[str]], drift_blacklist_raw: List[str], support_tokens: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], float, Dict[str, int], Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         eval_flags: List[bool] = []
-        metrics = {"primary_hit_count": 0, "packs_hit_count": 0, "dataset_low_count": 0}
+        metrics = {"primary_hit_count": 0, "packs_hit_count": 0, "dataset_low_count": 0, "blacklist_low_count": 0}
+        drift_blacklist, drift_blacklist_dropped = self.sanitize_blacklist(drift_blacklist_raw)
+        blacklist_matches = 0
 
         for p in papers:
             title = str(p.get("title", ""))
             abstract = str(p.get("abstract", ""))
             text = f"{title} {abstract}".lower().strip()
+            normalized_text = self.normalize_text_for_match(f"{title} {abstract}")
             title_only = title.lower()
             hit_primary = bool(primary_token) and (primary_token in text)
             hits_kw = sum(1 for t in keywords_tokens if t and t in text)
             hits_must = sum(1 for t in must_have_tokens if t and t in text)
+            hits_support = sum(1 for t in support_tokens if t and re.search(r"\b" + re.escape(t) + r"\b", normalized_text, flags=re.IGNORECASE))
             hits_packs = 0
             for pack in anchor_packs:
                 terms = [t.lower() for t in pack if t]
@@ -949,67 +1014,86 @@ class StageB:
                     hits_packs += 1
 
             dataset_flag = self.is_dataset_candidate(p, text)
-            black_hit = any(b.lower() in text for b in drift_blacklist if b)
+            black_term = self.find_blacklist_match(normalized_text, drift_blacklist)
+            black_hit = bool(black_term)
             has_abstract = bool(abstract.strip())
+            support_rule_hit = (hits_support >= 2) or (hits_kw >= 3 and hits_support >= 1)
+
+            if black_hit and (not hit_primary and hits_packs == 0):
+                blacklist_matches += 1
 
             if dataset_flag:
                 relevance_flag = "LOW"
                 reason = "low_dataset"
                 metrics["dataset_low_count"] += 1
-            elif black_hit and not hit_primary:
+            elif hit_primary or hits_packs >= 1:
+                relevance_flag = "PASS_MAIN"
+                reason = "pass_primary" if hit_primary else "pass_pack"
+            elif black_hit and not hit_primary and hits_packs == 0:
                 relevance_flag = "LOW"
                 reason = "low_drift_blacklist"
+                metrics["blacklist_low_count"] += 1
             elif (not has_abstract) and (not hit_primary) and hits_packs < 1:
                 relevance_flag = "LOW"
                 reason = "low_missing_text"
-            elif hit_primary:
-                relevance_flag = "PASS"
-                reason = "pass_primary"
-            elif hits_packs >= 1:
-                relevance_flag = "PASS"
-                reason = "pass_pack"
-            elif hits_kw >= 3 and hits_must >= 1:
-                relevance_flag = "PASS"
-                reason = "pass_keywords"
+            elif support_rule_hit:
+                relevance_flag = "PASS_SUPPORT"
+                reason = "pass_support"
             else:
                 relevance_flag = "LOW"
-                reason = "low_no_primary_no_pack_low_kw"
+                reason = "low_no_signal"
 
             if hit_primary:
                 metrics["primary_hit_count"] += 1
             if hits_packs >= 1:
                 metrics["packs_hit_count"] += 1
 
-            relevance_score = (6 if hit_primary else 0) + (4 * hits_packs) + hits_kw + (2 * hits_must)
+            score_main = (6 if hit_primary else 0) + (4 * hits_packs) + hits_kw + (2 * hits_must)
+            score_support = (3 * hits_support) + (1.5 * hits_kw) + (1.0 * hits_must)
             citation_score = math.log1p(max(int(p.get("cited_by_count") or 0), 0)) * 0.25
             now_year = datetime.now().year
             year = int(p.get("year") or 0) if str(p.get("year") or "").isdigit() else 0
             freshness_score = 0.5 if (year and year >= (now_year - 5)) else 0.0
-            score = relevance_score + citation_score + freshness_score
+            score = (score_main + citation_score + freshness_score) if relevance_flag == "PASS_MAIN" else (score_support + (citation_score * 0.5) + freshness_score)
 
             row = dict(p)
             row.update({
                 "score": round(score, 4),
+                "score_main": round(score_main + citation_score + freshness_score, 4),
+                "score_support": round(score_support + (citation_score * 0.5) + freshness_score, 4),
                 "relevance_flag": relevance_flag,
                 "reason": reason,
-                "score_components": f"rel={round(relevance_score,3)}; primary={int(hit_primary)}; packs={hits_packs}; kw={hits_kw}; must={hits_must}; cit={round(citation_score,3)}; fresh={round(freshness_score,3)}",
+                "reason_detail": black_term if reason == "low_drift_blacklist" else "",
+                "score_components": f"main={round(score_main,3)}; support={round(score_support,3)}; primary={int(hit_primary)}; packs={hits_packs}; kw={hits_kw}; must={hits_must}; support_hits={hits_support}; cit={round(citation_score,3)}; fresh={round(freshness_score,3)}",
             })
             rows.append(row)
-            eval_flags.append(relevance_flag == "PASS")
+            eval_flags.append(relevance_flag == "PASS_MAIN")
 
         n = min(50, len(eval_flags))
         pass_top_n = sum(1 for flag in eval_flags[:n] if flag)
         drift_score = 1.0 - (pass_top_n / n) if n else 1.0
 
-        rows.sort(key=lambda x: (-x["score"], -(x.get("cited_by_count", 0) or 0), x.get("title", "")))
-        passed = [r for r in rows if r.get("relevance_flag") == "PASS"]
-        return passed, rows, round(drift_score, 4), metrics
+        rows.sort(key=lambda x: (-x.get("score_main", 0), -(x.get("cited_by_count", 0) or 0), x.get("title", "")))
+        passed_main = [r for r in rows if r.get("relevance_flag") == "PASS_MAIN"]
+        passed_support = sorted(
+            [r for r in rows if r.get("relevance_flag") == "PASS_SUPPORT"],
+            key=lambda x: (-x.get("score_support", 0), -(x.get("cited_by_count", 0) or 0), x.get("title", ""),),
+        )
+        blacklist_stats = {
+            "raw_count": len(drift_blacklist_raw),
+            "sanitized_count": len(drift_blacklist),
+            "dropped": drift_blacklist_dropped,
+            "applied_matches_count": blacklist_matches,
+        }
+        return passed_main, passed_support, rows, round(drift_score, 4), metrics, blacklist_stats
 
-    def write_corpus(self, passed_papers: List[Dict[str, Any]], all_papers: List[Dict[str, Any]], allow_replace: bool) -> None:
+    def write_corpus(self, passed_papers: List[Dict[str, Any]], support_papers: List[Dict[str, Any]], all_papers: List[Dict[str, Any]], allow_replace: bool) -> None:
         common_fields = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
         targets = [
             ("corpus.csv", passed_papers[:300], common_fields),
-            ("corpus_all.csv", all_papers, common_fields + ["relevance_flag", "reason", "score_components"]),
+            ("corpus_support.csv", support_papers[:150], common_fields),
+            ("corpus_all.csv", all_papers, common_fields + ["relevance_flag", "reason", "reason_detail", "score_components"]),
+            ("corpus_support_all.csv", support_papers, common_fields + ["relevance_flag", "reason", "reason_detail", "score_components"]),
         ]
         for name, rows, fields in targets:
             target = self.out_dir / name
@@ -1032,6 +1116,7 @@ class StageB:
                         "url": p.get("url", ""),
                         "relevance_flag": p.get("relevance_flag", "PASS"),
                         "reason": p.get("reason", ""),
+                        "reason_detail": p.get("reason_detail", ""),
                         "score_components": p.get("score_components", ""),
                     })
             if allow_replace and len(rows) > 0:
@@ -1056,9 +1141,11 @@ class StageB:
             f"- Seed queries: {stats.get('seed_queries', 0)}",
             f"- Seed count: {stats.get('seed_count', 0)}",
             f"- total_candidates: {stats.get('total_candidates', 0)}",
-            f"- pass_count: {stats.get('pass_count', 0)}",
+            f"- main_count: {stats.get('main_count', 0)}",
+            f"- support_count: {stats.get('support_count', 0)}",
             f"- low_count: {stats.get('low_count', 0)}",
             f"- drift_score: {stats.get('drift_score', 0)}",
+            "- outputs: corpus.csv (object-first main) + corpus_support.csv (support methods/concepts without object)",
             "",
             "## OpenAlex seed queries",
             *[f"- {q.get('query_text','')} → {q.get('result_total', 0)}" for q in openalex_q if q.get("query_kind") == "seed"],
@@ -1072,24 +1159,26 @@ class StageB:
         write_text(self.out_dir / "search_strategy.md", "\n".join(lines) + "\n")
 
     def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> None:
-        txt = (
-            f"Этап B остановлен: {reason}.\n"
-            "Нужен ответ для OpenAlex в виде КОРОТКИХ английских токенов/фраз (латиница), а не предложений.\n"
-            "Примеры корректных токенов: Phoxinus, HydroRIVERS, genotype-environment association, BayPass.\n"
-            "Запрещено давать географию одним словом (Altai/Balkhash и т.п.) без пары с объектом, темой или методом.\n"
-            "Верни строго JSON в формате ниже, без комментариев и текста вокруг:\n"
-            "{\n"
-            "  \"refined_primary_token\": \"Phoxinus\",\n"
-            "  \"refined_keywords_tokens\": [\"riverscape genomics\", \"HydroRIVERS\", \"BayPass\"],\n"
-            "  \"refined_must_have_tokens\": [\"Phoxinus\", \"riverscape\"],\n"
-            "  \"anchor_packs\": [[\"Phoxinus\",\"BayPass\"],[\"Phoxinus\",\"HydroRIVERS\"]],\n"
-            "  \"drift_blacklist\": [\"glaciology\", \"archaeology\"],\n"
-            "  \"abbreviation_map\": {\"SNP\": \"single nucleotide polymorphism\"}\n"
-            "}\n"
-            "Важно: drift_blacklist тоже только на английском.\n"
-            f"Текущие anchors: {anchors}\n"
-            f"Текущие packs: {packs}\n"
-        )
+        txt = f"""Этап B остановлен: {reason}.
+Нужен ответ для OpenAlex в виде КОРОТКИХ английских токенов/фраз (латиница), а не предложений.
+Примеры корректных токенов: Phoxinus, HydroRIVERS, genotype-environment association, BayPass.
+Запрещено давать географию одним словом (Altai/Balkhash и т.п.) без пары с объектом, темой или методом.
+Верни строго JSON в формате ниже, без комментариев и текста вокруг:
+{{
+  "refined_primary_token": "Phoxinus",
+  "refined_keywords_tokens": ["riverscape genomics", "HydroRIVERS", "BayPass"],
+  "refined_must_have_tokens": ["Phoxinus", "riverscape"],
+  "anchor_packs": [["Phoxinus","BayPass"],["Phoxinus","HydroRIVERS"]],
+  "drift_blacklist": ["glaciology", "archaeology", "radiocarbon dating"],
+  "support_tokens": ["riverscape genetics", "genotype-environment association"],
+  "abbreviation_map": {{"SNP": "single nucleotide polymorphism"}}
+}}
+Важно: drift_blacklist только на английском и только тематические направления/фразы длиной >= 5 символов.
+НЕ добавляй короткие куски вроде ob, ir, alt, gen: они ломают фильтр.
+Если сомневаешься в blacklist — лучше не добавляй элемент.
+Текущие anchors: {anchors}
+Текущие packs: {packs}
+"""
         write_text(self.out_dir / "llm_prompt_B_anchors.txt", txt)
 
     def ensure_llm_response_template(self, force: bool = False) -> Path:
@@ -1100,7 +1189,8 @@ class StageB:
                 "refined_keywords_tokens": ["riverscape genomics", "genotype-environment association", "HydroRIVERS", "HydroATLAS", "BayPass", "LFMM2", "ddRAD", "SNP"],
                 "refined_must_have_tokens": ["Phoxinus", "riverscape"],
                 "anchor_packs": [["Phoxinus", "BayPass"], ["Phoxinus", "HydroRIVERS"], ["Phoxinus", "genotype-environment association"], ["riverscape genomics", "gene flow"]],
-                "drift_blacklist": ["glaciology", "archaeology", "radiocarbon", "wheat", "water scarcity"],
+                "drift_blacklist": ["glaciology", "archaeology", "radiocarbon dating", "wheat breeding", "water scarcity"],
+                "support_tokens": ["riverscape genetics", "genotype-environment association", "gene flow", "landscape genomics"],
                 "abbreviation_map": {"SNP": "single nucleotide polymorphism"},
             }
             write_text(p, json.dumps(template, ensure_ascii=False, indent=2) + "\n")
@@ -1125,6 +1215,7 @@ class StageB:
             "must_have": [],
             "packs": [],
             "drift_blacklist": [],
+            "support_tokens": [],
             "abbreviation_map": {},
         }
         if not isinstance(llm, dict) or not llm:
@@ -1154,6 +1245,7 @@ class StageB:
                 packs.append(clean_pack[:3])
 
         drift_blacklist = self.normalize_token_list(llm.get("drift_blacklist", []))
+        support_tokens = self.normalize_token_list(llm.get("support_tokens", []))
         ab_map = llm.get("abbreviation_map") if isinstance(llm.get("abbreviation_map"), dict) else {}
         ab_map_clean = {str(k): str(v).strip() for k, v in ab_map.items() if str(k).strip() and str(v).strip()}
 
@@ -1168,6 +1260,7 @@ class StageB:
             "must_have": must_have,
             "packs": packs,
             "drift_blacklist": [x.lower() for x in drift_blacklist],
+            "support_tokens": [x.lower() for x in support_tokens],
             "abbreviation_map": ab_map_clean,
         })
 
@@ -1196,7 +1289,11 @@ class StageB:
             f"packs_hit_count = {stats.get('packs_hit_count', 0)}",
             f"must_have_count = {stats.get('must_have_count', 0)}",
             f"dataset_low_count = {stats.get('dataset_low_count', 0)}",
-            f"pass_count / low_count = {stats.get('pass_count', 0)} / {stats.get('low_count', 0)}",
+            f"drift_blacklist_raw_count = {stats.get('drift_blacklist_raw_count', 0)}",
+            f"drift_blacklist_sanitized_count = {stats.get('drift_blacklist_sanitized_count', 0)}",
+            f"drift_blacklist_dropped_count = {stats.get('drift_blacklist_dropped_count', 0)}",
+            f"drift_blacklist_low_count = {stats.get('drift_blacklist_low_count', 0)}",
+            f"main_count / support_count / low_count = {stats.get('main_count', 0)} / {stats.get('support_count', 0)} / {stats.get('low_count', 0)}",
             f"drift_score = {stats.get('drift_score', 0)}",
             f"dedup_merged_count = {stats.get('dedup_merged_count', 0)}",
             f"elapsed: {stats.get('elapsed_ms', 0)} ms",
@@ -1205,6 +1302,7 @@ class StageB:
             f"llm_response_path = {llm_path}",
             f"llm_response_reason = {self.llm_info.get('reason', '')}",
             f"llm_response_schema = {self.llm_info.get('schema', 'invalid')}",
+            "support корпус — методические/общие работы без объекта.",
             "Первые 3 OpenAlex seed-запроса:",
         ]
         for q in seed_queries[:3]:
@@ -1234,7 +1332,7 @@ class StageB:
         ok, idea_text = self.ensure_idea_text()
         if not ok:
             self.search_log["errors"].append(idea_text)
-            self.write_corpus([], [], allow_replace=False)
+            self.write_corpus([], [], [], allow_replace=False)
             self.write_prisma({})
             self.write_summary({}, wait_llm=False)
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
@@ -1254,6 +1352,7 @@ class StageB:
         packs = self.build_anchor_packs(primary_token, base_tokens)
         keywords_tokens = base_tokens
         drift_blacklist: List[str] = []
+        support_tokens: List[str] = self.build_support_tokens(base_tokens, primary_token)
         source_mode = "keywords" if keywords_used else "anchors"
         source_terms = keywords_for_search if keywords_used else search_anchors
 
@@ -1299,6 +1398,7 @@ class StageB:
             must_have_tokens = [x.lower() for x in parsed_llm.get("must_have", [])] or must_have_tokens
             packs = self.build_anchor_packs(primary_token, keywords_tokens, parsed_llm.get("packs", []))
             drift_blacklist = [x.lower() for x in parsed_llm.get("drift_blacklist", [])]
+            support_tokens = self.build_support_tokens(keywords_tokens, primary_token, parsed_llm.get("support_tokens", []))
             if parsed_llm.get("abbreviation_map"):
                 self.abbr_full_map.update(parsed_llm.get("abbreviation_map", {}))
             source_mode = "llm"
@@ -1308,6 +1408,7 @@ class StageB:
         self.search_log["primary_token"] = primary_token
         self.search_log["packs_count"] = len(packs)
         self.search_log["must_have_tokens"] = must_have_tokens
+        self.search_log["support_tokens"] = support_tokens
 
         seed_rows: List[Dict[str, Any]] = []
         used_queries = 0
@@ -1360,7 +1461,10 @@ class StageB:
         if not self.offline_fixtures:
             self.crossref_enrich(merged)
 
-        passed_rows, ranked_all, drift_score, metrics = self.apply_relevance_and_score(merged, primary_token, keywords_tokens, must_have_tokens, packs, drift_blacklist)
+        passed_rows, support_rows, ranked_all, drift_score, metrics, blacklist_stats = self.apply_relevance_and_score(
+            merged, primary_token, keywords_tokens, must_have_tokens, packs, drift_blacklist, support_tokens
+        )
+        self.search_log["blacklist"] = blacklist_stats
         self.search_log["primary_hit_count"] = metrics["primary_hit_count"]
         self.search_log["packs_hit_count"] = metrics["packs_hit_count"]
         self.search_log["stats"]["dedup_before"] = self.dedup_before
@@ -1376,8 +1480,9 @@ class StageB:
                 "seed_queries": used_queries,
                 "seed_count": len(seed_rows),
                 "total_candidates": len(ranked_all),
-                "pass_count": len(passed_rows),
-                "low_count": max(len(ranked_all) - len(passed_rows), 0),
+                "main_count": len(passed_rows),
+                "support_count": len(support_rows),
+                "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0),
                 "drift_score": round(drift_score, 4),
                 "elapsed_ms": int((time.time() - t0) * 1000),
                 "primary_token": primary_token,
@@ -1386,6 +1491,10 @@ class StageB:
                 "packs_hit_count": metrics["packs_hit_count"],
                 "must_have_count": len(must_have_tokens),
                 "dataset_low_count": metrics["dataset_low_count"],
+                "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0),
+                "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0),
+                "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])),
+                "drift_blacklist_low_count": metrics["blacklist_low_count"],
                 "dedup_merged_count": self.dedup_merged_count,
                 "stop_reason": reason,
             }
@@ -1398,14 +1507,15 @@ class StageB:
             print(f"Этап B остановлен ({reason}) и ждёт файл: {response_path}")
             return 2
 
-        corpus_updated = len(passed_rows) > 0
-        self.write_corpus(passed_rows, ranked_all, allow_replace=corpus_updated)
+        corpus_updated = (len(passed_rows) + len(support_rows)) > 0
+        self.write_corpus(passed_rows, support_rows, ranked_all, allow_replace=corpus_updated)
         stats = {
             "seed_queries": used_queries,
             "seed_count": len(seed_rows),
             "total_candidates": len(ranked_all),
-            "pass_count": len(passed_rows),
-            "low_count": max(len(ranked_all) - len(passed_rows), 0),
+            "main_count": len(passed_rows),
+            "support_count": len(support_rows),
+            "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0),
             "drift_score": round(drift_score, 4),
             "elapsed_ms": int((time.time() - t0) * 1000),
             "primary_token": primary_token,
@@ -1414,6 +1524,10 @@ class StageB:
             "packs_hit_count": metrics["packs_hit_count"],
             "must_have_count": len(must_have_tokens),
             "dataset_low_count": metrics["dataset_low_count"],
+            "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0),
+            "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0),
+            "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])),
+            "drift_blacklist_low_count": metrics["blacklist_low_count"],
             "dedup_merged_count": self.dedup_merged_count,
         }
         self.search_log["stats"] = {**stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after}
