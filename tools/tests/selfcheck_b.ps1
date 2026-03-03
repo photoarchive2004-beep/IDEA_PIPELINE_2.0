@@ -45,6 +45,26 @@ if (-not ($first.PSObject.Properties.Name -contains "query_text") -or -not ($fir
 }
 Ok "search_log_B.json has query_text and result_total"
 
+if (-not $searchLog.token_probe -or $searchLog.token_probe.Count -lt 1) { Fail "search_log_B.json missing token_probe" }
+Ok "token_probe exists"
+
+$planned = @($searchLog.planned_queries)
+if ($planned.Count -gt 8) { Fail "planned_queries > 8" }
+Ok "planned_queries <= 8"
+
+$tooBroad = @{}
+foreach($tp in @($searchLog.token_probe)){
+  if ($tp.category -eq "TOO_BROAD") { $tooBroad[$tp.token.ToLower()] = $true }
+}
+foreach($q in $planned){
+  $tokens = [regex]::Matches($q, "[A-Za-z0-9\-]+") | ForEach-Object { $_.Value.ToLower() }
+  if ($tokens.Count -eq 1 -and $tooBroad.ContainsKey($tokens[0])) { Fail "Found planned too_broad solo query: $q" }
+}
+Ok "no too_broad solo queries"
+
+if (-not ($searchLog.PSObject.Properties.Name -contains "rejected_queries")) { Fail "rejected_queries field missing" }
+Ok "rejected_queries logging exists"
+
 # Deterministic stop-check: no valid latin anchors => rc 2 + llm files
 $tempIdea = Join-Path $Root "ideas\IDEA-SELFTEST-B-SEED0"
 New-Item -ItemType Directory -Force -Path (Join-Path $tempIdea "in"),(Join-Path $tempIdea "out"),(Join-Path $tempIdea "logs") | Out-Null
@@ -58,5 +78,11 @@ if ($rcStop -ne 2) { Fail "Expected code 2 for seed stop, got $rcStop" }
 if (-not (Test-Path (Join-Path $tempIdea "out\llm_prompt_B_anchors.txt"))) { Fail "Missing llm_prompt_B_anchors.txt for seed stop" }
 if (-not (Test-Path (Join-Path $tempIdea "in\llm_response_B_anchors.json"))) { Fail "Missing llm_response_B_anchors.json template for seed stop" }
 Ok "seed=0 stop behavior validated"
+
+$summary = Get-Content -LiteralPath (Join-Path $idea "out\stageB_summary.txt") -Raw
+foreach($required in @("probe_tokens_tested", "too_broad_count", "broad_count", "ok_count", "narrow_count", "zero_count")){
+  if ($summary -notmatch [regex]::Escape($required)) { Fail "stageB_summary missing $required" }
+}
+Ok "stageB_summary probe counters found"
 
 Write-Host "Selfcheck B complete"
