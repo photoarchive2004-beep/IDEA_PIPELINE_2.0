@@ -169,6 +169,7 @@ class StageB:
         repo = self.idea_dir.parents[1]
         self.secrets = parse_env(repo / "config" / "secrets.env")
         self.mailto = self.secrets.get("OPENALEX_MAILTO", "")
+        self.openalex_key = self.secrets.get("OPENALEX_API_KEY", "")
         self.s2_key = self.secrets.get("SEMANTIC_SCHOLAR_API_KEY", "")
 
         self.session = requests.Session() if requests else None
@@ -272,6 +273,10 @@ class StageB:
             if item.name in move_targets or is_stageb_md or is_cache:
                 prev_dir.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(item), str(prev_dir / item.name))
+        runs_root = self.out_dir / "_runs"
+        run_dirs = sorted([x for x in runs_root.iterdir() if x.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True) if runs_root.exists() else []
+        for old in run_dirs[20:]:
+            shutil.rmtree(old, ignore_errors=True)
 
     def log(self, msg: str) -> None:
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -282,6 +287,13 @@ class StageB:
     def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None, query_kind: str = "seed") -> Tuple[Dict[str, Any], int, int]:
         if self.offline_fixtures:
             raise RuntimeError("offline")
+        params = dict(params or {})
+        if source == "openalex":
+            if self.mailto:
+                params.setdefault("mailto", self.mailto)
+            if self.openalex_key:
+                params.setdefault("api_key", self.openalex_key)
+
         t0 = time.time()
         headers = {"User-Agent": "IDEA_PIPELINE_2.0-StageB/3.0", "Content-Type": "application/json"}
         if source == "semantic_scholar" and self.s2_key:
@@ -291,25 +303,64 @@ class StageB:
         if isinstance(params, dict):
             qtxt = str(params.get("search") or params.get("query") or params.get("query.title") or "")
 
-        try:
-            if self.session:
-                resp = self.session.request(method, url, params=params, json=payload, timeout=25, headers=headers)
+        retry_waits = [1, 2, 4]
+        status_code = 0
+        body_text = ""
+        ms = 0
+        last_error: Optional[Exception] = None
+        for attempt, wait_seconds in enumerate(retry_waits, start=1):
+            try:
+                t0 = time.time()
+                if self.session:
+                    resp = self.session.request(method, url, params=params, json=payload, timeout=25, headers=headers)
+                    ms = int((time.time() - t0) * 1000)
+                    status_code = resp.status_code
+                    body_text = resp.text
+                    if status_code in (429, 502, 503) and attempt < len(retry_waits):
+                        retry_after = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
+                        delay = int(retry_after) if str(retry_after or "").isdigit() else wait_seconds
+                        self.search_log["errors"].append(f"{source}_{query_kind}_retry_http_{status_code}_attempt_{attempt}")
+                        time.sleep(max(delay, 1))
+                        continue
+                else:
+                    final_url = url
+                    if params:
+                        final_url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
+                    data = None
+                    if payload is not None:
+                        data = json.dumps(payload).encode("utf-8")
+                    req = urllib.request.Request(final_url, data=data, headers=headers, method=method)
+                    with urllib.request.urlopen(req, timeout=25) as r:
+                        status_code = int(getattr(r, "status", 200))
+                        body_text = r.read().decode("utf-8", errors="ignore")
+                    ms = int((time.time() - t0) * 1000)
+                break
+            except Exception as e:
+                last_error = e
                 ms = int((time.time() - t0) * 1000)
-                status_code = resp.status_code
-                body_text = resp.text
-            else:
-                final_url = url
-                if params:
-                    final_url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
-                data = None
-                if payload is not None:
-                    data = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(final_url, data=data, headers=headers, method=method)
-                with urllib.request.urlopen(req, timeout=25) as r:
-                    status_code = int(getattr(r, "status", 200))
-                    body_text = r.read().decode("utf-8", errors="ignore")
-                ms = int((time.time() - t0) * 1000)
-        except Exception as e:
+                if attempt < len(retry_waits):
+                    self.search_log["errors"].append(f"{source}_{query_kind}_retry_exception_attempt_{attempt}: {e}")
+                    time.sleep(wait_seconds)
+                    continue
+                self.search_log["queries"].append({
+                    "source": source,
+                    "query_kind": query_kind,
+                    "endpoint_url": url,
+                    "params": params or {},
+                    "query_text": qtxt,
+                    "anchor_pack_used": [],
+                    "http_status": 0,
+                    "elapsed_ms": ms,
+                    "result_total": 0,
+                    "result_items": 0,
+                    "error": str(e),
+                })
+                raise
+
+        if last_error and status_code == 0:
+            raise last_error
+
+        if status_code >= 400:
             ms = int((time.time() - t0) * 1000)
             self.search_log["queries"].append({
                 "source": source,
@@ -318,13 +369,13 @@ class StageB:
                 "params": params or {},
                 "query_text": qtxt,
                 "anchor_pack_used": [],
-                "http_status": 0,
+                "http_status": status_code,
                 "elapsed_ms": ms,
                 "result_total": 0,
                 "result_items": 0,
-                "error": str(e),
+                "error": f"HTTP {status_code}",
             })
-            raise
+            raise RuntimeError(f"HTTP {status_code}")
 
         self.search_log["queries"].append({
             "source": source,
@@ -338,8 +389,6 @@ class StageB:
             "result_total": 0,
             "result_items": 0,
         })
-        if status_code >= 400:
-            raise RuntimeError(f"HTTP {status_code}")
         return json.loads(body_text or "{}"), status_code, ms
 
     def decode_openalex_abstract(self, w: Dict[str, Any]) -> str:
@@ -1017,14 +1066,19 @@ class StageB:
         return alive
 
     def openalex_search_pack(self, query: str) -> Tuple[List[Dict[str, Any]], int]:
-        params = {"search": query, "per-page": MAX_PER_QUERY}
-        if self.mailto:
-            params["mailto"] = self.mailto
+        params = {"search": query, "per-page": MAX_PER_QUERY, "filter": "has_abstract:true"}
         endpoint = "https://api.openalex.org/works"
         try:
             obj, status, elapsed = self.request_json("GET", endpoint, "openalex", params=params, query_kind="seed")
             total = int((obj.get("meta") or {}).get("count") or 0)
             items = obj.get("results", [])
+            if total < 5:
+                fallback_params = {"search": query, "per-page": MAX_PER_QUERY}
+                fallback_obj, _, _ = self.request_json("GET", endpoint, "openalex", params=fallback_params, query_kind="seed")
+                fallback_total = int((fallback_obj.get("meta") or {}).get("count") or 0)
+                if fallback_total > total:
+                    total = fallback_total
+                    items = fallback_obj.get("results", [])
             if self.search_log["queries"]:
                 self.search_log["queries"][-1].update({
                     "query_text": query,
@@ -1402,6 +1456,7 @@ class StageB:
 
             row = dict(p)
             row.update({
+                "tier": "main" if relevance_flag == "PASS_MAIN" else ("support" if relevance_flag == "PASS_SUPPORT" else "low"),
                 "score": round(score, 4),
                 "score_main": round(score_main + citation_score + freshness_score, 4),
                 "score_support": round(score_support + (citation_score * 0.5) + freshness_score, 4),
@@ -1464,13 +1519,25 @@ class StageB:
         selected.sort(key=lambda x: (abs(0.4 - float(x.get("freq", 0))), -len(str(x.get("token", "")))), reverse=False)
         return selected[:6]
 
-    def write_corpus(self, passed_papers: List[Dict[str, Any]], support_papers: List[Dict[str, Any]], all_papers: List[Dict[str, Any]], allow_replace: bool) -> None:
-        common_fields = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
+    def write_corpus(self, passed_papers: List[Dict[str, Any]], support_papers: List[Dict[str, Any]], all_papers: List[Dict[str, Any]], allow_replace: bool = True) -> None:
+        mode_limits = {
+            "FOCUSED": {"main": 180, "support": 60, "all": 220, "min_main": 40},
+            "BALANCED": {"main": 220, "support": 100, "all": 300, "min_main": 50},
+            "WIDE": {"main": 260, "support": 160, "all": 360, "min_main": 50},
+        }
+        limits = mode_limits.get(self.mode, mode_limits["BALANCED"])
+        common_fields = ["rank", "tier", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
         extra_fields = ["relevance_flag", "reason", "reason_detail", "hits_support", "support_reason", "score_components"]
+        main_rows = passed_papers[: int(limits["main"])]
+        support_rows = support_papers[: int(limits["support"])]
+        corpus_rows = main_rows + support_rows
+        if len(main_rows) < int(limits["min_main"]):
+            deficit = int(limits["min_main"]) - len(main_rows)
+            corpus_rows = main_rows + support_rows[: max(deficit, 0)]
         targets = [
-            ("corpus.csv", passed_papers[:300], common_fields),
-            ("corpus_support.csv", support_papers[:150], common_fields),
-            ("corpus_all.csv", all_papers, common_fields + extra_fields),
+            ("corpus.csv", corpus_rows, common_fields),
+            ("corpus_support.csv", support_rows, common_fields),
+            ("corpus_all.csv", all_papers[: int(limits["all"])], common_fields + extra_fields),
             ("corpus_support_all.csv", support_papers, common_fields + extra_fields),
         ]
         for name, rows, fields in targets:
@@ -1482,6 +1549,7 @@ class StageB:
                 for idx, p in enumerate(rows, 1):
                     w.writerow({
                         "rank": idx,
+                        "tier": p.get("tier", "main" if p in passed_papers else "support"),
                         "score": p.get("score", 0),
                         "title": p.get("title", ""),
                         "year": p.get("year", ""),
@@ -1497,12 +1565,7 @@ class StageB:
                         "reason_detail": p.get("reason_detail", ""),
                         "score_components": p.get("score_components", ""),
                     })
-            if allow_replace and len(rows) > 0:
-                shutil.move(str(tmp), str(target))
-            elif not target.exists():
-                shutil.move(str(tmp), str(target))
-            elif tmp.exists():
-                tmp.unlink()
+            shutil.move(str(tmp), str(target))
 
 
     def compute_go_metrics(self, ranked_rows: List[Dict[str, Any]], alive_seed_queries: int) -> Dict[str, Any]:
@@ -1919,7 +1982,10 @@ class StageB:
             "low_count": max(len(ranked) - len(passed) - len(support), 0),
         }
 
-    def stop_for_llm(self, stop_reason: str, reason_text: str, search_anchors: List[str], packs: List[List[str]], stats: Dict[str, Any], t0: float) -> int:
+    def stop_for_llm(self, stop_reason: str, reason_text: str, search_anchors: List[str], packs: List[List[str]], stats: Dict[str, Any], t0: float,
+                     passed_rows: Optional[List[Dict[str, Any]]] = None, support_rows: Optional[List[Dict[str, Any]]] = None,
+                     ranked_all: Optional[List[Dict[str, Any]]] = None) -> int:
+        self.write_corpus(passed_rows or [], support_rows or [], ranked_all or [], allow_replace=True)
         response_path = self.ensure_llm_response_template(force=False)
         prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
         if self.llm_budget_remaining() <= 0:
@@ -1960,7 +2026,7 @@ class StageB:
         t0 = time.time()
         self.archive_previous_outputs()
         self.log("Stage B start")
-        self.log(f"Secrets: OPENALEX_MAILTO={'***' if self.mailto else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
+        self.log(f"Secrets: OPENALEX_MAILTO={'***' if self.mailto else '(missing)'}, OPENALEX_API_KEY={'***' if self.openalex_key else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
 
         ok, idea_text = self.ensure_idea_text()
         if not ok:
@@ -1975,6 +2041,14 @@ class StageB:
         self.geo_terms = self.detect_geo_terms(idea_text, structured)
         _, search_anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
         keywords_for_search, keywords_used = self.get_keywords_for_search(idea_text, structured)
+        adjacent_fields = structured.get("adjacent_fields_to_scan", []) if isinstance(structured, dict) else []
+        if not isinstance(adjacent_fields, list):
+            adjacent_fields = []
+        if self.mode == "WIDE":
+            extra = [str(x).strip() for x in adjacent_fields if isinstance(x, str) and str(x).strip()]
+            keywords_for_search = list(dict.fromkeys(keywords_for_search + extra))[:30]
+        elif self.mode == "FOCUSED":
+            keywords_for_search = keywords_for_search[:10]
         self.search_log["keywords_for_search_used"] = keywords_used
         self.search_log["keywords_for_search_count"] = len(keywords_for_search)
         self.search_log["keywords_for_search_preview"] = keywords_for_search[:5]
@@ -1987,6 +2061,15 @@ class StageB:
         drift_blacklist: List[str] = []
         llm_support_raw: List[str] = []
         support_tokens: List[str] = self.build_support_tokens(base_tokens, primary_token)
+        if self.mode == "FOCUSED":
+            must_have_tokens = must_have_tokens[:8]
+            support_tokens = support_tokens[:8]
+            packs = packs[:4]
+            self.drift_target = min(self.drift_target, 0.24)
+        elif self.mode == "WIDE":
+            support_tokens = support_tokens[:20]
+            self.drift_target = max(self.drift_target, 0.35)
+        self.search_log["stats"]["drift_target"] = self.drift_target
         source_mode = "keywords" if keywords_used else "anchors"
         source_terms = keywords_for_search if keywords_used else search_anchors
         llm_token_source: List[str] = []
@@ -2024,7 +2107,7 @@ class StageB:
                     "drift_round2": "",
                     "auto_fix_rounds_used": 0,
                 }
-                return self.stop_for_llm("llm_invalid", parsed_llm.get("reason", "llm_invalid"), search_anchors, packs, stats, t0)
+                return self.stop_for_llm("llm_already_used_need_edit", parsed_llm.get("reason", "llm_invalid"), search_anchors, packs, stats, t0)
 
             self.llm_info["used"] = True
             self.llm_info["reason"] = "validated_and_applied"
@@ -2191,7 +2274,7 @@ class StageB:
 
         if need_llm:
             stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]]}
-            return self.stop_for_llm("seed_zero", "seed=0", search_anchors, packs, stats, t0)
+            return self.stop_for_llm("seed_zero", "seed=0", search_anchors, packs, stats, t0, passed_rows, support_rows, ranked_all)
 
         if go_eval.get("go"):
             passed_rows, support_rows, ranked_all, drift_score, _ = self.maybe_add_citation_chasing(
@@ -2202,10 +2285,9 @@ class StageB:
 
         if (not go_eval.get("go")):
             stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]], "go_nogo": go_nogo, "go_reasons": go_eval.get("reasons", [])}
-            return self.stop_for_llm("no_go", f"no-go: {', '.join(go_eval.get('reasons', []))}", search_anchors, packs, stats, t0)
+            return self.stop_for_llm("no_go", f"no-go: {', '.join(go_eval.get('reasons', []))}", search_anchors, packs, stats, t0, passed_rows, support_rows, ranked_all)
 
-        corpus_updated = (len(passed_rows) + len(support_rows)) > 0 and len(passed_rows) >= 30
-        self.write_corpus(passed_rows, support_rows, ranked_all, allow_replace=corpus_updated)
+        self.write_corpus(passed_rows, support_rows, ranked_all, allow_replace=True)
         stats = {
             "seed_queries": used_queries,
             "seed_count": len(seed_rows),

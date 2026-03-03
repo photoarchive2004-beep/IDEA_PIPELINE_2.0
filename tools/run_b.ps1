@@ -1,4 +1,4 @@
-﻿param(
+param(
   [string]$IdeaDir = "",
   [ValidateSet("BALANCED","FOCUSED","WIDE")]
   [string]$Mode = "BALANCED"
@@ -82,7 +82,7 @@ try {
 
   Say "Stage B: проверяю зависимости..."
   Log "[CMD] $py -m pip install -r $req"
-  & $py -m pip install -r $req *> $Log
+  & $py -m pip install -r $req *>> $Log
 
   if (-not $hasIdea) {
     Say ""
@@ -92,13 +92,13 @@ try {
 
   Say "Stage B: выполняю (идея: $ideaName, mode: $Mode)..."
   Log "[CMD] $py $module --idea `"$IdeaDir`" --mode $Mode"
-  & $py $module --idea $IdeaDir --mode $Mode *> $Log
+  & $py $module --idea $IdeaDir --mode $Mode *>> $Log
   $rc = $LASTEXITCODE
 
   if ($rc -eq 0) {
     Say ""
     Say "✅ Stage B готова."
-    Say "Проверь: out\\corpus.csv, out\\stageB_summary.txt, out\\search_log_B.json"
+    Say "Файлы: out\corpus.csv, out\corpus_all.csv, out\stageB_summary.txt, out\search_log_B.json"
     exit 0
   }
 
@@ -108,30 +108,42 @@ try {
     $resp = Join-Path $IdeaDir "in\llm_response_B_anchors.json"
     $summary = Join-Path $outDir "stageB_summary.txt"
     $stopReason = ""
+
     if (Test-Path $summary) {
       $match = Select-String -LiteralPath $summary -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
       if ($match) { $stopReason = $match.Matches[0].Groups[1].Value.Trim() }
     }
+
     if (-not (Test-Path $resp)) { New-Item -ItemType File -Force -Path $resp | Out-Null }
 
     Say ""
-    Say "Открылся файл ответа: in\llm_response_B_anchors.json"
-    Say "Заполни JSON и запусти RUN_B.bat снова."
+    Say "⚠️ Stage B завершилась с ожиданием ручного шага."
 
-    if (($stopReason -eq "llm_budget_exhausted")) {
-      Say "Лимит 3 обращения исчерпан — новый prompt не будет открыт."
-      Say "Отредактируй response вручную или удали out\llm_budget_B.json чтобы сбросить бюджет."
-      if (Test-Path $summary) {
-        Start-Process notepad.exe -ArgumentList $summary | Out-Null
-      }
+    if ($stopReason -eq "llm_already_used_need_edit") {
+      Say "Обнаружен некорректный JSON-ответ. Второй запрос в ChatGPT не нужен."
+      Say "Открою только in\llm_response_B_anchors.json для ручной правки."
+      Start-Process notepad.exe -ArgumentList $resp | Out-Null
+      exit 2
+    }
+
+    if ($stopReason -eq "llm_budget_exhausted") {
+      Say "Лимит обращений к ChatGPT исчерпан."
+      Say "Открою файл in\llm_response_B_anchors.json для ручной правки."
+      Start-Process notepad.exe -ArgumentList $resp | Out-Null
+      exit 2
+    }
+
+    if (Test-Path $prompt) {
+      Set-Clipboard -Value (Get-Content -Raw -LiteralPath $prompt)
+      Say "Нужен 1 шаг в ChatGPT:"
+      Say "1) PROMPT из out\llm_prompt_B_anchors.txt уже в буфере обмена."
+      Say "2) Вставь его в ChatGPT и скопируй обратно ТОЛЬКО JSON."
+      Say "3) Вставь JSON в in\llm_response_B_anchors.json, сохрани и запусти RUN_B.bat снова."
+      Start-Process notepad.exe -ArgumentList $prompt | Out-Null
     } else {
-      Say "Скопируй prompt из out\llm_prompt_B_anchors.txt в ChatGPT, получи JSON, вставь в response файл."
-      if (Test-Path $prompt) {
-        Set-Clipboard -Value (Get-Content -Raw -LiteralPath $prompt)
-        Start-Process notepad.exe -ArgumentList $prompt | Out-Null
-      } else {
-        Say "⚠️ Prompt не найден: out\llm_prompt_B_anchors.txt"
-      }
+      Say "Prompt не найден: out\llm_prompt_B_anchors.txt"
+      Say "Открою summary и response для ручной диагностики."
+      if (Test-Path $summary) { Start-Process notepad.exe -ArgumentList $summary | Out-Null }
     }
 
     Start-Process notepad.exe -ArgumentList $resp | Out-Null
