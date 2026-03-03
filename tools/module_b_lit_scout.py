@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -28,6 +29,12 @@ EN_STOP = {
 }
 GENERIC_BLACKLIST = {
     "хиты", "и т.п", "и тп", "по чистым", "чистым деревом", "baseline", "overview", "introduction", "введение",
+}
+
+GENERIC_TOKEN_BLACKLIST = {
+    "model", "analysis", "study", "data", "method", "approach", "results", "result", "review",
+    "paper", "research", "system", "effect", "effects", "based", "using", "novel", "case", "cases",
+    "метод", "модель", "данные", "результаты", "результат", "обзор", "исследование", "подход",
 }
 
 SERVICE_LABELS = {
@@ -154,7 +161,7 @@ class StageB:
             with p.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
 
-    def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], int, int]:
+    def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None, query_kind: str = "seed") -> Tuple[Dict[str, Any], int, int]:
         if self.offline_fixtures:
             raise RuntimeError("offline")
         t0 = time.time()
@@ -188,6 +195,7 @@ class StageB:
             ms = int((time.time() - t0) * 1000)
             self.search_log["queries"].append({
                 "source": source,
+                "query_kind": query_kind,
                 "endpoint_url": url,
                 "params": params or {},
                 "query_text": qtxt,
@@ -202,6 +210,7 @@ class StageB:
 
         self.search_log["queries"].append({
             "source": source,
+            "query_kind": query_kind,
             "endpoint_url": url,
             "params": params or {},
             "query_text": qtxt,
@@ -214,6 +223,25 @@ class StageB:
         if status_code >= 400:
             raise RuntimeError(f"HTTP {status_code}")
         return json.loads(body_text or "{}"), status_code, ms
+
+    def decode_openalex_abstract(self, w: Dict[str, Any]) -> str:
+        inv = w.get("abstract_inverted_index") or {}
+        if not isinstance(inv, dict) or not inv:
+            return ""
+        max_pos = -1
+        for pos_list in inv.values():
+            if isinstance(pos_list, list) and pos_list:
+                max_pos = max(max_pos, max(pos_list))
+        if max_pos < 0:
+            return ""
+        words = [""] * (max_pos + 1)
+        for token, pos_list in inv.items():
+            if not isinstance(pos_list, list):
+                continue
+            for pos in pos_list:
+                if isinstance(pos, int) and 0 <= pos <= max_pos:
+                    words[pos] = str(token)
+        return re.sub(r"\s+", " ", " ".join([w for w in words if w])).strip()
 
     def ensure_idea_text(self) -> Tuple[bool, str]:
         top = self.idea_dir / "idea.txt"
@@ -409,6 +437,30 @@ class StageB:
             return self.keyword_fallback(idea_text, structured), False
         return cleaned[:20], True
 
+    def extract_keywords_tokens(self, keywords_for_search: List[str]) -> List[str]:
+        tokens: List[str] = []
+        for kw in keywords_for_search:
+            raw_tokens = re.findall(r"[A-Za-z0-9\-]{4,}", self.normalize_search_anchor(kw))
+            for t in raw_tokens:
+                tl = t.lower()
+                if tl in GENERIC_TOKEN_BLACKLIST:
+                    continue
+                tokens.append(t)
+        uniq = list(dict.fromkeys(tokens))
+        return uniq[:40]
+
+    def detect_primary_token(self, structured: Dict[str, Any], keywords_tokens: List[str]) -> str:
+        src = structured.get("structured_idea", structured) if isinstance(structured, dict) else {}
+        for key in ("main_entity", "primary_entity", "object", "species", "target_entity"):
+            v = src.get(key) if isinstance(src, dict) else None
+            if isinstance(v, str):
+                parts = re.findall(r"[A-Za-z0-9\-]{4,}", self.normalize_search_anchor(v))
+                if parts:
+                    return parts[0].lower()
+        if keywords_tokens:
+            return min((t.lower() for t in keywords_tokens), key=lambda x: (len(x), x), default="")
+        return ""
+
     def build_boolean_query(self, terms: List[str]) -> str:
         uniq = [self.normalize_search_anchor(x) for x in terms if self.normalize_search_anchor(x)]
         uniq = list(dict.fromkeys(uniq))[:3]
@@ -496,7 +548,7 @@ class StageB:
             params["mailto"] = self.mailto
         endpoint = "https://api.openalex.org/works"
         try:
-            obj, status, elapsed = self.request_json("GET", endpoint, "openalex", params=params)
+            obj, status, elapsed = self.request_json("GET", endpoint, "openalex", params=params, query_kind="seed")
             total = int((obj.get("meta") or {}).get("count") or 0)
             items = obj.get("results", [])
             if self.search_log["queries"]:
@@ -532,13 +584,14 @@ class StageB:
             "concepts": [c.get("display_name", "") for c in (w.get("concepts") or [])[:5]],
             "referenced_works": w.get("referenced_works", [])[:15],
             "related_works": w.get("related_works", [])[:15],
+            "abstract": self.decode_openalex_abstract(w),
         }
 
     def semantic_scholar_search(self, pack: List[str]) -> List[Dict[str, Any]]:
         q = " ".join(pack[:3])
         params = {"query": q, "limit": 25, "fields": "title,year,venue,authors,citationCount,externalIds,url"}
         try:
-            obj, _, _ = self.request_json("GET", "https://api.semanticscholar.org/graph/v1/paper/search", "semantic_scholar", params=params)
+            obj, _, _ = self.request_json("GET", "https://api.semanticscholar.org/graph/v1/paper/search", "semantic_scholar", params=params, query_kind="expansion")
             self.search_log["service_status"]["semantic_scholar"] = "ok"
             out = []
             for p in obj.get("data", []):
@@ -548,12 +601,15 @@ class StageB:
                     "authors_short": ", ".join([a.get("name", "") for a in p.get("authors", [])[:4]]),
                     "cited_by_count": p.get("citationCount", 0) or 0,
                     "source_tags": {"semanticscholar_search"}, "url": p.get("url", ""), "type": "",
-                    "concepts": [], "referenced_works": [], "related_works": [],
+                    "concepts": [], "referenced_works": [], "related_works": [], "abstract": "",
                 })
             return out
         except Exception as e:
             self.search_log["service_status"]["semantic_scholar"] = "degraded"
-            self.search_log["errors"].append(f"semantic_search_error: {e}")
+            if "429" in str(e):
+                self.search_log["errors"].append("semantic_search_error: 429 rate limit; fallback to OpenAlex/Crossref")
+            else:
+                self.search_log["errors"].append(f"semantic_search_error: {e}")
             return []
 
     def semantic_recommend(self, seeds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -562,7 +618,7 @@ class StageB:
             return []
         payload = {"positive_paper_ids": positive, "negative_paper_ids": []}
         try:
-            obj, _, _ = self.request_json("POST", "https://api.semanticscholar.org/recommendations/v1/papers", "semantic_scholar", payload=payload)
+            obj, _, _ = self.request_json("POST", "https://api.semanticscholar.org/recommendations/v1/papers", "semantic_scholar", payload=payload, query_kind="expansion")
             self.search_log["service_status"]["semantic_scholar"] = "ok"
             out: List[Dict[str, Any]] = []
             for p in obj.get("recommendedPapers", []):
@@ -572,7 +628,7 @@ class StageB:
                     "authors_short": ", ".join([a.get("name", "") for a in p.get("authors", [])[:4]]),
                     "cited_by_count": p.get("citationCount", 0) or 0,
                     "source_tags": {"semanticscholar_recommendations"}, "url": f"https://www.semanticscholar.org/paper/{p.get('paperId', '')}",
-                    "type": "", "concepts": [], "referenced_works": [], "related_works": [],
+                    "type": "", "concepts": [], "referenced_works": [], "related_works": [], "abstract": "",
                 })
             return out
         except Exception as e:
@@ -587,7 +643,7 @@ class StageB:
                 continue
             try:
                 params = {"query.title": p["title"], "rows": 1}
-                obj, _, _ = self.request_json("GET", "https://api.crossref.org/works", "crossref", params=params)
+                obj, _, _ = self.request_json("GET", "https://api.crossref.org/works", "crossref", params=params, query_kind="metadata")
                 items = (obj.get("message") or {}).get("items") or []
                 if items:
                     doi = normalize_doi(items[0].get("DOI", ""))
@@ -610,7 +666,7 @@ class StageB:
             ids.extend(p.get("related_works", [])[:5])
         for wid in ids[:120]:
             try:
-                obj, _, _ = self.request_json("GET", f"https://api.openalex.org/works/{wid.split('/')[-1]}", "openalex")
+                obj, _, _ = self.request_json("GET", f"https://api.openalex.org/works/{wid.split('/')[-1]}", "openalex", query_kind="expansion")
                 cand = self.paper_openalex(obj, "openalex_related")
                 text = (cand.get("title", "") + " " + cand.get("venue", "")).lower()
                 pack_match = any(sum(1 for a in pack if a.lower() in text) >= 1 for pack in anchor_packs)
@@ -637,21 +693,54 @@ class StageB:
                 keep[key] = p
         return list(keep.values())
 
-    def score(self, papers: List[Dict[str, Any]], anchors: List[str], anchor_packs: List[List[str]]) -> List[Dict[str, Any]]:
-        out = []
+    def apply_relevance_and_score(self, papers: List[Dict[str, Any]], primary_token: str, keywords_tokens: List[str], anchor_packs: List[List[str]], drift_blacklist: List[str], whitelist_terms: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float]:
+        rows: List[Dict[str, Any]] = []
+        pack_terms = [" ".join([x.lower() for x in pack if x]).strip() for pack in anchor_packs]
         for p in papers:
-            text = (p.get("title", "") + " " + p.get("venue", "")).lower()
-            hits = sum(1 for a in anchors[:12] if a.lower() in text)
-            pack_hits = sum(1 for pack in anchor_packs if sum(1 for a in pack if a.lower() in text) >= 2)
-            s = hits * 1.6 + pack_hits * 2.5 + (p.get("cited_by_count", 0) or 0) * 0.01
-            p["score"] = round(s, 4)
-            out.append(p)
-        out.sort(key=lambda x: (-x["score"], -(x.get("cited_by_count", 0) or 0), x.get("title", "")))
-        return out
+            text = f"{p.get('title','')} {p.get('abstract','')}".lower().strip()
+            hit_primary = bool(primary_token) and primary_token in text
+            hits_kw = sum(1 for t in keywords_tokens if t.lower() in text)
+            hits_packs = sum(1 for pack in pack_terms if pack and pack in text)
+            black_hit = any(b.lower() in text for b in drift_blacklist if b)
+            white_hits = sum(1 for w in whitelist_terms if w and w.lower() in text)
+            pass_gate = hit_primary or hits_kw >= 2 or (hits_packs >= 1 if pack_terms else False)
+            reason = ""
+            if black_hit and not hit_primary:
+                pass_gate = False
+                reason = "drift blacklist hit without primary token"
+            elif whitelist_terms and white_hits == 0 and not hit_primary:
+                pass_gate = False
+                reason = "no whitelist term hit"
+            elif not pass_gate:
+                reason = "no primary token and <2 keyword hits"
 
-    def write_corpus(self, papers: List[Dict[str, Any]], allow_replace: bool) -> None:
-        fields = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
-        for name, rows in (("corpus_all.csv", papers), ("corpus.csv", papers[:300])):
+            year = int(p.get("year") or 0) if str(p.get("year") or "").isdigit() else 0
+            freshness = max(min(year - 2000, 25), 0) / 25 if year else 0
+            citation = math.log1p(max(int(p.get("cited_by_count") or 0), 0))
+            rel = (5.0 if hit_primary else 0.0) + 1.5 * hits_kw + 2.0 * hits_packs
+            score = rel + 0.2 * citation + 0.1 * freshness
+            row = dict(p)
+            row.update({
+                "score": round(score, 4),
+                "relevance_flag": "PASS" if pass_gate else "LOW",
+                "reason": reason,
+                "score_components": f"rel={round(rel,3)};cit={round(citation,3)};fresh={round(freshness,3)};primary={int(hit_primary)};kw={hits_kw};packs={hits_packs}",
+            })
+            rows.append(row)
+        rows.sort(key=lambda x: (-x["score"], -(x.get("cited_by_count", 0) or 0), x.get("title", "")))
+        n = min(50, len(rows))
+        pass_top_n = sum(1 for r in rows[:n] if r.get("relevance_flag") == "PASS")
+        drift_score = 1.0 - (pass_top_n / n) if n else 1.0
+        passed = [r for r in rows if r.get("relevance_flag") == "PASS"]
+        return passed, rows, round(drift_score, 4)
+
+    def write_corpus(self, passed_papers: List[Dict[str, Any]], all_papers: List[Dict[str, Any]], allow_replace: bool) -> None:
+        common_fields = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
+        targets = [
+            ("corpus.csv", passed_papers[:300], common_fields),
+            ("corpus_all.csv", all_papers, common_fields + ["relevance_flag", "reason", "score_components"]),
+        ]
+        for name, rows, fields in targets:
             target = self.out_dir / name
             tmp = self.out_dir / f"{name}.tmp"
             with tmp.open("w", newline="", encoding="utf-8") as f:
@@ -670,8 +759,11 @@ class StageB:
                         "cited_by_count": p.get("cited_by_count", 0),
                         "source_tags": ",".join(sorted(list(p.get("source_tags", set())))),
                         "url": p.get("url", ""),
+                        "relevance_flag": p.get("relevance_flag", "PASS"),
+                        "reason": p.get("reason", ""),
+                        "score_components": p.get("score_components", ""),
                     })
-            if allow_replace and len(papers) > 0:
+            if allow_replace and len(rows) > 0:
                 shutil.move(str(tmp), str(target))
             elif not target.exists():
                 shutil.move(str(tmp), str(target))
@@ -679,38 +771,46 @@ class StageB:
                 tmp.unlink()
 
     def write_prisma(self, stats: Dict[str, Any]) -> None:
-        qlines = [f"  - {q.get('query_text','')} → {q.get('result_total', 0)}" for q in self.search_log.get("queries", [])[:8]]
+        openalex_q = [q for q in self.search_log.get("queries", []) if q.get("source") == "openalex"]
+        s2_q = [q for q in self.search_log.get("queries", []) if q.get("source") == "semantic_scholar"]
+        unresolved = sorted([ab for ab in self.abbr_mentions if ab not in self.abbr_full_map])
         lines = [
             "# PRISMA-lite для этапа B",
             "",
             f"- Запуск: {self.search_log.get('started_at', '')}",
             f"- Завершение: {self.search_log.get('finished_at', now_iso())}",
-            "- Источники: OpenAlex (основной), Semantic Scholar (добор/рекомендации), Crossref (нормализация DOI)",
-            f"- Статус OpenAlex: {self.search_log['service_status']['openalex']}",
-            f"- Статус Semantic Scholar: {self.search_log['service_status']['semantic_scholar']}",
-            f"- Статус Crossref: {self.search_log['service_status']['crossref']}",
+            f"- OpenAlex: {self.search_log['service_status']['openalex']}",
+            f"- Semantic Scholar: {self.search_log['service_status']['semantic_scholar']}",
+            f"- Crossref: {self.search_log['service_status']['crossref']}",
             f"- Seed queries: {stats.get('seed_queries', 0)}",
             f"- Seed count: {stats.get('seed_count', 0)}",
-            f"- Expanded count: {stats.get('expanded_count', 0)}",
-            f"- Semantic Scholar count: {stats.get('semanticscholar_count', 0)}",
-            f"- Crossref count: {stats.get('crossref_count', 0)}",
-            f"- Dedup count: {stats.get('dedup_count', 0)}",
-            f"- Final count: {stats.get('final_count', 0)}",
-            "- Выполненные запросы:",
-            *qlines,
+            f"- total_candidates: {stats.get('total_candidates', 0)}",
+            f"- pass_count: {stats.get('pass_count', 0)}",
+            f"- low_count: {stats.get('low_count', 0)}",
+            f"- drift_score: {stats.get('drift_score', 0)}",
+            "",
+            "## OpenAlex seed queries",
+            *[f"- {q.get('query_text','')} → {q.get('result_total', 0)}" for q in openalex_q if q.get("query_kind") == "seed"],
+            "",
+            "## Semantic Scholar queries",
+            *[f"- {q.get('query_text','')} → {q.get('result_total', 0)}" for q in s2_q],
         ]
-        write_text(self.out_dir / "prisma_lite_B.md", "\n".join([self.format_human_abbr(x) for x in lines]) + "\n")
+        if unresolved:
+            lines += ["", "## Аббревиатуры без расшифровки", *[f"- {ab}" for ab in unresolved]]
+        write_text(self.out_dir / "prisma_lite_B.md", "\n".join(lines) + "\n")
+        write_text(self.out_dir / "search_strategy.md", "\n".join(lines) + "\n")
 
     def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> None:
         txt = (
-            f"Этап B остановлен: {reason}. Нужны новые search-anchors для латинского поиска. Верни только JSON:\n"
+            f"Этап B остановлен: {reason}. Уточни фильтр релевантности и ограничения дрейфа. Верни только JSON:\n"
             "{\n"
-            "  \"cleaned_search_anchors\": [\"...\"],\n"
+            "  \"refined_primary_token\": \"...\",\n"
+            "  \"refined_keywords_tokens\": [\"...\"],\n"
             "  \"anchor_packs\": [[\"...\",\"...\"],[\"...\",\"...\",\"...\"]],\n"
             "  \"drift_blacklist\": [\"...\"],\n"
-            "  \"abbreviation_map\": {\"ABBR\": \"Full expansion\"}\n"
+            "  \"whitelist_terms\": [\"...\"]\n"
             "}\n"
-            "Ограничения: 10-20 cleaned_search_anchors, 4-6 anchor_packs по 2-3 термина, только латиница/цифры/дефис, без русских фраз.\n"
+            "Ограничения: refined_keywords_tokens 10-25 токенов, anchor_packs 4-6 по 2-3 термина, drift_blacklist 10-30, whitelist_terms (optional) 5-15.\n"
             f"Текущие anchors: {anchors}\n"
             f"Текущие packs: {packs}\n"
         )
@@ -720,10 +820,11 @@ class StageB:
         p = self.in_dir / "llm_response_B_anchors.json"
         if not p.exists():
             template = {
-                "cleaned_search_anchors": ["Phoxinus", "Balkhash", "cytochrome-b"],
-                "anchor_packs": [["Phoxinus"], ["Phoxinus", "Balkhash"], ["Phoxinus", "cytochrome-b"]],
-                "drift_blacklist": ["review", "broad survey"],
-                "abbreviation_map": {"mtDNA": "mitochondrial DNA"},
+                "refined_primary_token": "Phoxinus",
+                "refined_keywords_tokens": ["Phoxinus", "Balkhash", "cytochrome-b", "riverscape"],
+                "anchor_packs": [["Phoxinus", "Balkhash"], ["Phoxinus", "cytochrome-b"], ["Phoxinus", "riverscape genetics"], ["Balkhash", "population genomics"]],
+                "drift_blacklist": ["water scarcity", "urban water supply"],
+                "whitelist_terms": ["phoxinus", "population genetics"],
             }
             write_text(p, json.dumps(template, ensure_ascii=False, indent=2) + "\n")
         return p
@@ -739,49 +840,24 @@ class StageB:
             return {}
 
     def write_summary(self, stats: Dict[str, Any], used_europe: bool, wait_llm: bool, used_user_response: bool, corpus_updated: bool, stop_reason: str = "") -> None:
+        sources = f"openalex={self.search_log['service_status']['openalex']}, semanticscholar={self.search_log['service_status']['semantic_scholar']}, crossref={self.search_log['service_status']['crossref']}"
+        seed_queries = [q for q in self.search_log.get("queries", []) if q.get("source") == "openalex" and q.get("query_kind") == "seed"]
         lines = [
-            "Stage B: сбор корпуса литературы завершен." if not wait_llm else "Stage B: требуется дополнительная очистка якорей.",
-            f"Идея: {self.idea_dir.name}",
             f"run_id: {self.run_id}",
-            f"Режим: {self.mode}",
+            f"sources status: {sources}",
             f"seed_queries: {stats.get('seed_queries', 0)}",
             f"seed_count: {stats.get('seed_count', 0)}",
-            f"Количество работ после расширения: {stats.get('expanded_count', 0)}",
-            f"Количество работ из Semantic Scholar: {stats.get('semanticscholar_count', 0)}",
-            f"Количество нормализованных через Crossref: {stats.get('crossref_count', 0)}",
-            f"Количество после дедупликации: {stats.get('dedup_count', 0)}",
-            f"final_count: {stats.get('final_count', 0)}",
-            f"elapsed: {stats.get('elapsed_ms', 0)} мс",
+            f"total_candidates_before_gate: {stats.get('total_candidates', 0)}",
+            f"pass_count: {stats.get('pass_count', 0)}",
             f"drift_score: {stats.get('drift_score', 0)}",
-            "Europe PubMed Central (PMC) не использовался: тема не определена как биомедицинская по быстрому признаку." if not used_europe else "Europe PubMed Central (PMC) использован из-за биомедицинского профиля.",
-            f"Статус OpenAlex: {self.search_log['service_status']['openalex']}",
-            f"Статус Semantic Scholar: {self.search_log['service_status']['semantic_scholar']}",
-            f"Статус Crossref: {self.search_log['service_status']['crossref']}",
-            f"Файл корпуса: {self.out_dir / 'corpus.csv'}",
-            f"Полный корпус: {self.out_dir / 'corpus_all.csv'}",
-            f"Диагностика: {self.out_dir / 'search_log_B.json'}",
-            f"Текстовый лог: {self.out_dir / 'runB.log'}",
+            f"elapsed: {stats.get('elapsed_ms', 0)} ms",
+            "Первые 3 OpenAlex seed-запроса:",
         ]
-        if used_user_response:
-            lines.append("Использован ответ пользователя из in/llm_response_B_anchors.json.")
-        if self.query_snippets:
-            lines.append("Первые 3 выполненных запроса:")
-            for q in self.query_snippets[:3]:
-                lines.append(f"- {q['query_text']} → {q['result_total']}")
-        if stats.get("seed_count", 0) == 0:
-            lines.append("Seed=0: включён безопасный план Б (якоря от языковой модели), проверь термины поиска.")
-            lines.append(f"Ничего не найдено (seed=0). Этап B остановлен и ждёт файл: {self.in_dir / 'llm_response_B_anchors.json'}")
-            lines.append("Открой файл out\\llm_prompt_B_anchors.txt, вставь его в ChatGPT, ответ сохрани в in\\llm_response_B_anchors.json, затем запусти RUN_B ещё раз.")
-        if not corpus_updated:
-            lines.append("Корпус не обновлялся, т.к. final_count == 0.")
+        for q in seed_queries[:3]:
+            lines.append(f"- {q.get('query_text','')} → {q.get('result_total', 0)}")
         if wait_llm:
-            if stop_reason:
-                lines.append(f"Причина остановки: {stop_reason}")
-            lines += [
-                f"Создан prompt: {self.out_dir / 'llm_prompt_B_anchors.txt'}",
-                f"Ожидаемый ответ: {self.in_dir / 'llm_response_B_anchors.json'}",
-            ]
-        write_text(self.out_dir / "stageB_summary.txt", "\n".join([self.format_human_abbr(x) for x in lines[:28]]) + "\n")
+            lines.append(f"STOP_REASON={stop_reason}; ждёт {self.in_dir / 'llm_response_B_anchors.json'}")
+        write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines[:25]) + "\n")
 
     def load_fixture(self) -> List[Dict[str, Any]]:
         fp = self.offline_fixtures / "openalex_seed.json" if self.offline_fixtures else None
@@ -800,7 +876,7 @@ class StageB:
         ok, idea_text = self.ensure_idea_text()
         if not ok:
             self.search_log["errors"].append(idea_text)
-            self.write_corpus([], allow_replace=False)
+            self.write_corpus([], [], allow_replace=False)
             self.write_prisma({})
             self.write_summary({}, used_europe=False, wait_llm=False, used_user_response=False, corpus_updated=False)
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
@@ -816,18 +892,24 @@ class StageB:
 
         llm = self.load_llm_anchor_response()
         used_user_response = False
-        llm_anchors = llm.get("cleaned_search_anchors")
-        if llm_anchors and llm.get("anchor_packs") and isinstance(llm_anchors, list):
-            search_anchors = [self.normalize_search_anchor(a) for a in llm_anchors if isinstance(a, str)]
-            search_anchors = [a for a in search_anchors if a][:20]
-            packs = [[self.normalize_search_anchor(x) for x in p[:3] if isinstance(x, str)] for p in llm.get("anchor_packs", []) if isinstance(p, list)]
-            packs = [[x for x in p if x] for p in packs if len([x for x in p if x]) >= 1][:6]
-            ab_map.update({k: v for k, v in (llm.get("abbreviation_map", {}) or {}).items() if isinstance(k, str) and isinstance(v, str)})
-            self.search_log["abbreviation_map"] = ab_map
-            self.abbr_full_map = dict(ab_map)
-            self.search_log["anchor_top_search"] = search_anchors[:20]
-            self.search_log["anchor_packs_search"] = packs
-            used_user_response = True
+        refined_primary = ""
+        refined_tokens: List[str] = []
+        drift_blacklist: List[str] = []
+        whitelist_terms: List[str] = []
+        if isinstance(llm, dict) and llm:
+            if isinstance(llm.get("refined_primary_token"), str):
+                refined_primary = self.normalize_search_anchor(llm.get("refined_primary_token", "")).lower()
+            if isinstance(llm.get("refined_keywords_tokens"), list):
+                refined_tokens = [self.normalize_search_anchor(str(x)).lower() for x in llm.get("refined_keywords_tokens", []) if isinstance(x, str)]
+                refined_tokens = [x for x in refined_tokens if x]
+            if isinstance(llm.get("anchor_packs"), list):
+                packs = [[self.normalize_search_anchor(x) for x in p[:3] if isinstance(x, str)] for p in llm.get("anchor_packs", []) if isinstance(p, list)]
+                packs = [[x for x in p if x] for p in packs if len([x for x in p if x]) >= 1][:6]
+            if isinstance(llm.get("drift_blacklist"), list):
+                drift_blacklist = [str(x).strip().lower() for x in llm.get("drift_blacklist", []) if isinstance(x, str) and str(x).strip()]
+            if isinstance(llm.get("whitelist_terms"), list):
+                whitelist_terms = [str(x).strip().lower() for x in llm.get("whitelist_terms", []) if isinstance(x, str) and str(x).strip()]
+            used_user_response = bool(refined_primary or refined_tokens or drift_blacklist or whitelist_terms)
 
         seed_rows: List[Dict[str, Any]] = []
         used_queries = 0
@@ -837,10 +919,10 @@ class StageB:
             self.search_log["errors"].append("query_preflight: нет валидных seed-запросов")
             self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "нет валидных seed-запросов после самопроверки")
             response_path = self.ensure_llm_response_template()
-            stats = {"seed_queries": 0, "seed_count": 0, "expanded_count": 0, "semanticscholar_count": 0, "crossref_count": 0, "dedup_count": 0, "final_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000), "stop_reason": "невалидные поисковые строки"}
+            stats = {"seed_queries": 0, "seed_count": 0, "total_candidates": 0, "pass_count": 0, "low_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000), "stop_reason": "невалидные поисковые строки"}
             self.search_log["stats"] = stats
             self.search_log["finished_at"] = now_iso()
-            self.write_corpus([], allow_replace=False)
+            self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(self.in_dir / "llm_response_B_anchors.json")]
             self.write_prisma(stats)
             self.write_summary(stats, used_europe=False, wait_llm=True, used_user_response=used_user_response, corpus_updated=False, stop_reason="невалидные поисковые строки")
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
@@ -878,7 +960,6 @@ class StageB:
         if not need_llm and not self.offline_fixtures:
             for p in packs[:2]:
                 semantic_rows.extend(self.semantic_scholar_search(p))
-            self.search_log["service_status"]["semantic_scholar"] = "degraded"
             expanded = self.expand_openalex(seed_rows, packs)
 
         if len(seed_rows) < 20:
@@ -886,35 +967,21 @@ class StageB:
 
         merged = self.dedup(seed_rows + semantic_rows + recommend_rows + expanded)
         crossref_count = self.crossref_enrich(merged) if not self.offline_fixtures else 0
-        ranked = self.score(merged, search_anchors, packs)
+        keywords_tokens = refined_tokens or [x.lower() for x in self.extract_keywords_tokens(keywords_for_search)]
+        primary_token = refined_primary or self.detect_primary_token(structured, keywords_tokens)
+        passed_rows, ranked_all, filtered_drift_share = self.apply_relevance_and_score(merged, primary_token, keywords_tokens, packs, drift_blacklist, whitelist_terms)
 
-        # drift estimation: first N rows must match object term or >=2 keyword tokens
-        if seed_rows:
-            drifted = 0
-            sample = seed_rows[:100]
-            object_term = self.normalize_search_anchor(seed_query_list[0] if seed_query_list else "").lower()
-            token_pool = [self.normalize_search_anchor(x).lower() for x in keywords_for_search][:20]
-            for p in sample:
-                txt = (p.get("title", "") + " " + p.get("venue", "")).lower()
-                object_ok = bool(object_term) and object_term in txt
-                tok_hits = sum(1 for tok in token_pool if tok and tok in txt)
-                if not (object_ok or tok_hits >= 2):
-                    drifted += 1
-            filtered_drift_share = drifted / max(len(sample), 1)
-
-        drift_stop = filtered_drift_share > 0.7
+        drift_stop = filtered_drift_share >= 0.40
         if (need_llm and not self.offline_fixtures) or (drift_stop and not self.offline_fixtures):
             reason = "seed=0" if need_llm else f"сильный дрейф темы: доля нерелевантных {round(filtered_drift_share * 100,1)}%"
             self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason)
             response_path = self.ensure_llm_response_template()
             stats = {
-                "seed_queries": min(used_queries, 8),
+                "seed_queries": used_queries,
                 "seed_count": len(seed_rows),
-                "expanded_count": len(expanded),
-                "semanticscholar_count": len(semantic_rows) + len(recommend_rows),
-                "crossref_count": crossref_count,
-                "dedup_count": len(merged),
-                "final_count": len(ranked),
+                "total_candidates": len(ranked_all),
+                "pass_count": len(passed_rows),
+                "low_count": max(len(ranked_all) - len(passed_rows), 0),
                 "drift_score": round(filtered_drift_share, 4),
                 "elapsed_ms": int((time.time() - t0) * 1000),
             }
@@ -923,24 +990,22 @@ class StageB:
             print(stop_msg)
             print(next_msg)
             stats["stop_reason"] = reason
+            self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(self.in_dir / "llm_response_B_anchors.json")]
             self.search_log["stats"] = stats
             self.search_log["finished_at"] = now_iso()
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
-            self.write_corpus(ranked, allow_replace=False)
             self.write_prisma(stats)
             self.write_summary(stats, used_europe=False, wait_llm=True, used_user_response=used_user_response, corpus_updated=False, stop_reason=reason)
             return 2
 
-        corpus_updated = len(ranked) > 0
-        self.write_corpus(ranked, allow_replace=corpus_updated)
+        corpus_updated = len(passed_rows) > 0
+        self.write_corpus(passed_rows, ranked_all, allow_replace=corpus_updated)
         stats = {
-            "seed_queries": min(used_queries, 8),
+            "seed_queries": used_queries,
             "seed_count": len(seed_rows),
-            "expanded_count": len(expanded),
-            "semanticscholar_count": len(semantic_rows) + len(recommend_rows),
-            "crossref_count": crossref_count,
-            "dedup_count": len(merged),
-            "final_count": len(ranked),
+            "total_candidates": len(ranked_all),
+            "pass_count": len(passed_rows),
+            "low_count": max(len(ranked_all) - len(passed_rows), 0),
             "drift_score": round(filtered_drift_share, 4),
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
