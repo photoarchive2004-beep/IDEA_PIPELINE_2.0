@@ -30,6 +30,12 @@ GENERIC_BLACKLIST = {
     "хиты", "и т.п", "и тп", "по чистым", "чистым деревом", "baseline", "overview", "introduction", "введение",
 }
 
+SERVICE_LABELS = {
+    "openalex": "OpenAlex",
+    "semantic_scholar": "Semantic Scholar",
+    "crossref": "Crossref",
+}
+
 CYR_MAP = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i",
     "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
@@ -111,7 +117,7 @@ class StageB:
                 "openalex": "offline",
                 "semantic_scholar": "offline",
                 "crossref": "offline",
-                "researchrabbit": "degraded",
+                "researchrabbit": "offline",
                 "europe_pmc": "offline",
             },
             "stats": {},
@@ -352,53 +358,84 @@ class StageB:
         val = re.sub(r"\s+", " ", val).strip(" -")
         return val
 
-    def build_seed_queries(self, search_anchors: List[str], packs: List[List[str]]) -> List[List[str]]:
-        queries: List[List[str]] = []
+    def load_keywords_for_search(self, structured: Dict[str, Any]) -> List[str]:
+        src = structured.get("structured_idea", structured) if isinstance(structured, dict) else {}
+        raw = src.get("keywords_for_search") if isinstance(src, dict) else None
+        if not isinstance(raw, list):
+            return []
+        cleaned: List[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            q = re.sub(r"\s+", " ", item.strip())
+            if q:
+                cleaned.append(q)
+        return cleaned[:20]
+
+    def build_boolean_query(self, terms: List[str]) -> str:
+        uniq = [self.normalize_search_anchor(x) for x in terms if self.normalize_search_anchor(x)]
+        uniq = list(dict.fromkeys(uniq))[:3]
+        if len(uniq) <= 1:
+            return uniq[0] if uniq else ""
+        if len(uniq) == 2:
+            return f"({uniq[0]} AND {uniq[1]})"
+        return f"({uniq[0]} AND ({uniq[1]} OR {uniq[2]}))"
+
+    def preflight_queries(self, queries: List[str]) -> Tuple[List[str], List[str]]:
+        ok: List[str] = []
+        bad: List[str] = []
+        for q in queries:
+            query = re.sub(r"\s+", " ", q.strip())
+            terms = [t for t in re.findall(r"[A-Za-z0-9\-]+", query) if len(t) >= 3]
+            if not query:
+                bad.append("Пустая поисковая строка")
+                continue
+            if len(query) > 120 or len(terms) > 8:
+                bad.append(f"Слишком длинная строка: {query}")
+                continue
+            if re.fullmatch(r"[A-Z][a-z]{3,}", query) and not re.search(r"\d", query):
+                bad.append(f"Похоже на geo-only или одиночный термин: {query}")
+                continue
+            if " AND " in query and " OR " not in query and query.count("AND") >= 2:
+                bad.append(f"Риск нулевой выдачи (много AND без OR): {query}")
+                continue
+            if any(b in query.lower() for b in GENERIC_BLACKLIST):
+                bad.append(f"Мусорная/служебная фраза: {query}")
+                continue
+            ok.append(query)
+        return ok[:8], bad
+
+    def build_seed_queries(self, keywords_for_search: List[str], search_anchors: List[str], packs: List[List[str]]) -> List[str]:
+        queries: List[str] = []
         seen: Set[str] = set()
 
-        def add_query(parts: List[str]) -> None:
-            clean = []
-            for p in parts:
-                n = self.normalize_search_anchor(p)
-                if n:
-                    clean.append(n)
-            clean = clean[:3]
-            if not clean:
-                return
-            key = "|".join(clean).lower()
-            if key in seen:
+        def add_query(q: str) -> None:
+            query = re.sub(r"\s+", " ", q.strip())
+            key = query.lower()
+            if not query or key in seen:
                 return
             seen.add(key)
-            queries.append(clean)
+            queries.append(query)
 
-        strong_single = None
-        for a in search_anchors:
-            if re.fullmatch(r"[A-Z][a-z]{3,}", a or ""):
-                strong_single = a
-                break
-        if strong_single:
-            add_query([strong_single])
+        for kw in keywords_for_search:
+            terms = [self.normalize_search_anchor(x) for x in re.split(r"[,:;]", kw)]
+            terms = [x for x in terms if x]
+            if not terms:
+                terms = [self.normalize_search_anchor(x) for x in kw.split() if len(x) >= 4][:3]
+            add_query(self.build_boolean_query(terms[:3]))
 
-        for pack in packs:
-            add_query(pack[:3])
+        if not queries:
+            for pack in packs:
+                add_query(self.build_boolean_query(pack[:3]))
+            for a in search_anchors[:6]:
+                add_query(self.normalize_search_anchor(a))
 
-        for a in search_anchors:
-            add_query([a])
+        good, bad = self.preflight_queries(queries[:8])
+        for item in bad:
+            self.search_log["errors"].append(f"query_preflight: {item}")
+        return good[:8]
 
-        if len(search_anchors) >= 3:
-            step = 2
-            i = 0
-            while i + 1 < len(search_anchors):
-                add_query(search_anchors[i:i + 2])
-                i += step
-
-        return queries[:8]
-
-    def pack_query(self, pack: List[str]) -> str:
-        return " ".join(pack)
-
-    def openalex_search_pack(self, pack: List[str]) -> Tuple[List[Dict[str, Any]], int]:
-        query = self.pack_query(pack)
+    def openalex_search_pack(self, query: str) -> Tuple[List[Dict[str, Any]], int]:
         params = {"search": query, "per-page": 50}
         if self.mailto:
             params["mailto"] = self.mailto
@@ -410,17 +447,17 @@ class StageB:
             if self.search_log["queries"]:
                 self.search_log["queries"][-1].update({
                     "query_text": query,
-                    "anchor_pack_used": pack,
+                    "anchor_pack_used": [query],
                     "result_total": total,
                     "result_items": len(items),
                 })
             if len(self.query_snippets) < 3:
                 self.query_snippets.append({"query_text": query, "result_total": total})
-            self.search_log["service_status"]["openalex"] = "success"
+            self.search_log["service_status"]["openalex"] = "ok"
             return items, total
         except Exception:
             if self.search_log["queries"]:
-                self.search_log["queries"][-1].update({"query_text": query, "anchor_pack_used": pack})
+                self.search_log["queries"][-1].update({"query_text": query, "anchor_pack_used": [query]})
             if len(self.query_snippets) < 3:
                 self.query_snippets.append({"query_text": query, "result_total": 0})
             raise
@@ -447,7 +484,7 @@ class StageB:
         params = {"query": q, "limit": 25, "fields": "title,year,venue,authors,citationCount,externalIds,url"}
         try:
             obj, _, _ = self.request_json("GET", "https://api.semanticscholar.org/graph/v1/paper/search", "semantic_scholar", params=params)
-            self.search_log["service_status"]["semantic_scholar"] = "success"
+            self.search_log["service_status"]["semantic_scholar"] = "ok"
             out = []
             for p in obj.get("data", []):
                 out.append({
@@ -471,7 +508,7 @@ class StageB:
         payload = {"positive_paper_ids": positive, "negative_paper_ids": []}
         try:
             obj, _, _ = self.request_json("POST", "https://api.semanticscholar.org/recommendations/v1/papers", "semantic_scholar", payload=payload)
-            self.search_log["service_status"]["semantic_scholar"] = "success"
+            self.search_log["service_status"]["semantic_scholar"] = "ok"
             out: List[Dict[str, Any]] = []
             for p in obj.get("recommendedPapers", []):
                 out.append({
@@ -503,7 +540,7 @@ class StageB:
                         p["doi"] = doi
                         p["source_tags"].add("crossref")
                         count += 1
-                self.search_log["service_status"]["crossref"] = "success"
+                self.search_log["service_status"]["crossref"] = "ok"
             except Exception as e:
                 self.search_log["service_status"]["crossref"] = "degraded"
                 self.search_log["errors"].append(f"crossref_error: {e}")
@@ -581,11 +618,22 @@ class StageB:
                     })
             if allow_replace and len(papers) > 0:
                 shutil.move(str(tmp), str(target))
+            elif not target.exists():
+                shutil.move(str(tmp), str(target))
+            elif tmp.exists():
+                tmp.unlink()
 
     def write_prisma(self, stats: Dict[str, Any]) -> None:
+        qlines = [f"  - {q.get('query_text','')} → {q.get('result_total', 0)}" for q in self.search_log.get("queries", [])[:8]]
         lines = [
-            "# PRISMA-lite Stage B",
+            "# PRISMA-lite для этапа B",
             "",
+            f"- Запуск: {self.search_log.get('started_at', '')}",
+            f"- Завершение: {self.search_log.get('finished_at', now_iso())}",
+            "- Источники: OpenAlex (основной), Semantic Scholar (добор/рекомендации), Crossref (нормализация DOI)",
+            f"- Статус OpenAlex: {self.search_log['service_status']['openalex']}",
+            f"- Статус Semantic Scholar: {self.search_log['service_status']['semantic_scholar']}",
+            f"- Статус Crossref: {self.search_log['service_status']['crossref']}",
             f"- Seed queries: {stats.get('seed_queries', 0)}",
             f"- Seed count: {stats.get('seed_count', 0)}",
             f"- Expanded count: {stats.get('expanded_count', 0)}",
@@ -593,19 +641,21 @@ class StageB:
             f"- Crossref count: {stats.get('crossref_count', 0)}",
             f"- Dedup count: {stats.get('dedup_count', 0)}",
             f"- Final count: {stats.get('final_count', 0)}",
+            "- Выполненные запросы:",
+            *qlines,
         ]
         write_text(self.out_dir / "prisma_lite_B.md", "\n".join([self.format_human_abbr(x) for x in lines]) + "\n")
 
-    def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]]) -> None:
+    def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> None:
         txt = (
-            "Ничего не найдено в OpenAlex (seed=0). Нужны новые search-anchors для латинского поиска. Верни только JSON:\n"
+            f"Этап B остановлен: {reason}. Нужны новые search-anchors для латинского поиска. Верни только JSON:\n"
             "{\n"
             "  \"cleaned_search_anchors\": [\"...\"],\n"
             "  \"anchor_packs\": [[\"...\",\"...\"],[\"...\",\"...\",\"...\"]],\n"
             "  \"drift_blacklist\": [\"...\"],\n"
             "  \"abbreviation_map\": {\"ABBR\": \"Full expansion\"}\n"
             "}\n"
-            "Ограничения: 8-20 cleaned_search_anchors, 4-6 anchor_packs, только латиница/цифры/дефис, без русских фраз.\n"
+            "Ограничения: 10-20 cleaned_search_anchors, 4-6 anchor_packs по 2-3 термина, только латиница/цифры/дефис, без русских фраз.\n"
             f"Текущие anchors: {anchors}\n"
             f"Текущие packs: {packs}\n"
         )
@@ -633,18 +683,19 @@ class StageB:
         except Exception:
             return {}
 
-    def write_summary(self, stats: Dict[str, Any], used_europe: bool, wait_llm: bool, used_user_response: bool, corpus_updated: bool) -> None:
+    def write_summary(self, stats: Dict[str, Any], used_europe: bool, wait_llm: bool, used_user_response: bool, corpus_updated: bool, stop_reason: str = "") -> None:
         lines = [
             "Stage B: сбор корпуса литературы завершен." if not wait_llm else "Stage B: требуется дополнительная очистка якорей.",
             f"Идея: {self.idea_dir.name}",
             f"Режим: {self.mode}",
-            f"Количество seed запросов: {stats.get('seed_queries', 0)}",
-            f"Количество seed работ: {stats.get('seed_count', 0)}",
+            f"seed_queries: {stats.get('seed_queries', 0)}",
+            f"seed_count: {stats.get('seed_count', 0)}",
             f"Количество работ после расширения: {stats.get('expanded_count', 0)}",
             f"Количество работ из Semantic Scholar: {stats.get('semanticscholar_count', 0)}",
             f"Количество нормализованных через Crossref: {stats.get('crossref_count', 0)}",
             f"Количество после дедупликации: {stats.get('dedup_count', 0)}",
-            f"Итоговый размер корпуса: {stats.get('final_count', 0)}",
+            f"final_count: {stats.get('final_count', 0)}",
+            f"elapsed: {stats.get('elapsed_ms', 0)} мс",
             "Europe PubMed Central (PMC) не использовался: тема не определена как биомедицинская по быстрому признаку." if not used_europe else "Europe PubMed Central (PMC) использован из-за биомедицинского профиля.",
             f"Статус OpenAlex: {self.search_log['service_status']['openalex']}",
             f"Статус Semantic Scholar: {self.search_log['service_status']['semantic_scholar']}",
@@ -667,6 +718,8 @@ class StageB:
         if not corpus_updated:
             lines.append("Корпус не обновлялся, т.к. final_count == 0.")
         if wait_llm:
+            if stop_reason:
+                lines.append(f"Причина остановки: {stop_reason}")
             lines += [
                 f"Создан prompt: {self.out_dir / 'llm_prompt_B_anchors.txt'}",
                 f"Ожидаемый ответ: {self.in_dir / 'llm_response_B_anchors.json'}",
@@ -697,6 +750,7 @@ class StageB:
 
         structured = self.load_structured()
         display_anchors, search_anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
+        keywords_for_search = self.load_keywords_for_search(structured)
         packs = self.build_anchor_packs(search_anchors)
 
         llm = self.load_llm_anchor_response()
@@ -717,13 +771,28 @@ class StageB:
         seed_rows: List[Dict[str, Any]] = []
         used_queries = 0
 
+        seed_query_list = self.build_seed_queries(keywords_for_search, search_anchors, packs)
+        if not seed_query_list and not self.offline_fixtures:
+            self.search_log["errors"].append("query_preflight: нет валидных seed-запросов")
+            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "нет валидных seed-запросов после самопроверки")
+            response_path = self.ensure_llm_response_template()
+            stats = {"seed_queries": 0, "seed_count": 0, "expanded_count": 0, "semanticscholar_count": 0, "crossref_count": 0, "dedup_count": 0, "final_count": 0, "elapsed_ms": int((time.time() - t0) * 1000)}
+            self.search_log["stats"] = stats
+            self.search_log["finished_at"] = now_iso()
+            self.write_corpus([], allow_replace=False)
+            self.write_prisma(stats)
+            self.write_summary(stats, used_europe=False, wait_llm=True, used_user_response=used_user_response, corpus_updated=False, stop_reason="невалидные поисковые строки")
+            write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+            print(f"Этап B остановлен и ждёт файл: {response_path}")
+            return 2
+
         if self.offline_fixtures:
             seed_rows = self.load_fixture()
         else:
-            for p in self.build_seed_queries(search_anchors, packs):
+            for q in seed_query_list:
                 used_queries += 1
                 try:
-                    rows, _ = self.openalex_search_pack(p)
+                    rows, _ = self.openalex_search_pack(q)
                     seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
                 except Exception as e:
                     self.search_log["service_status"]["openalex"] = "degraded"
@@ -758,17 +827,22 @@ class StageB:
         crossref_count = self.crossref_enrich(merged) if not self.offline_fixtures else 0
         ranked = self.score(merged, search_anchors, packs)
 
-        # drift estimation: rows with zero anchor hits
+        # drift estimation: first N rows must match at least one pack or keyword
         if ranked:
             drifted = 0
-            for p in ranked:
+            sample = ranked[:50]
+            for p in sample:
                 txt = (p.get("title", "") + " " + p.get("venue", "")).lower()
-                if sum(1 for a in search_anchors[:10] if a.lower() in txt) == 0:
+                pack_ok = any(sum(1 for a in pack if a.lower() in txt) >= 1 for pack in packs[:6])
+                kw_ok = any(self.normalize_search_anchor(k).lower() in txt for k in keywords_for_search[:8] if self.normalize_search_anchor(k))
+                if not (pack_ok or kw_ok):
                     drifted += 1
-            filtered_drift_share = drifted / len(ranked)
+            filtered_drift_share = drifted / max(len(sample), 1)
 
-        if (need_llm and not self.offline_fixtures) or ((filtered_drift_share > 0.4) and not llm and not self.offline_fixtures):
-            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6])
+        drift_stop = filtered_drift_share > 0.7
+        if (need_llm and not self.offline_fixtures) or (drift_stop and not llm and not self.offline_fixtures):
+            reason = "seed=0" if need_llm else f"сильный дрейф темы: доля нерелевантных {round(filtered_drift_share * 100,1)}%"
+            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason)
             response_path = self.ensure_llm_response_template()
             stats = {
                 "seed_queries": min(used_queries, 8),
@@ -785,10 +859,11 @@ class StageB:
             print(stop_msg)
             print(next_msg)
             self.search_log["stats"] = stats
+            self.search_log["finished_at"] = now_iso()
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
             self.write_corpus(ranked, allow_replace=False)
             self.write_prisma(stats)
-            self.write_summary(stats, used_europe=False, wait_llm=True, used_user_response=used_user_response, corpus_updated=False)
+            self.write_summary(stats, used_europe=False, wait_llm=True, used_user_response=used_user_response, corpus_updated=False, stop_reason=reason)
             return 2
 
         corpus_updated = len(ranked) > 0

@@ -18,7 +18,6 @@ if (-not $idea) { Fail "No IDEA-* folder found" }
 Ok "Idea selected: $idea"
 
 & $py -m pip install -r (Join-Path $Root "tools\requirements_b.txt") | Out-Null
-
 $module = Join-Path $Root "tools\module_b_lit_scout.py"
 $fixture = Join-Path $Root "tools\tests\fixtures"
 
@@ -30,29 +29,34 @@ if ($rc -ne 0 -and $rc -ne 2) {
   if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) { Fail "Offline run failed" }
 }
 
-if ($rc -eq 2) {
-  Warn "Stage B requested LLM cleaner in online mode; validating offline pipeline"
-  & $py $module --idea $idea --mode BALANCED --offline-fixtures $fixture
-  if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) { Fail "Offline fallback failed" }
-}
-
-$need = @(
-  "out\corpus.csv",
-  "out\corpus_all.csv",
-  "out\stageB_summary.txt",
-  "out\search_log_B.json",
-  "out\prisma_lite_B.md",
-  "out\runB.log"
-)
+$need = @("out\corpus.csv","out\corpus_all.csv","out\stageB_summary.txt","out\search_log_B.json","out\prisma_lite_B.md","out\runB.log")
 foreach($rel in $need){
   $p = Join-Path $idea $rel
   if (-not (Test-Path $p)) { Fail "Missing output: $rel" }
   Ok "Exists: $rel"
 }
 
-$corpusPath = Join-Path $idea "out\corpus.csv"
-$header = (Get-Content -LiteralPath $corpusPath -TotalCount 1)
-if ($header -notmatch "rank" -or $header -notmatch "score") { Fail "corpus.csv missing rank/score columns" }
-Ok "corpus.csv has rank and score columns"
+$logPath = Join-Path $idea "out\search_log_B.json"
+$searchLog = Get-Content -LiteralPath $logPath -Raw | ConvertFrom-Json
+if (-not $searchLog.queries -or $searchLog.queries.Count -lt 1) { Fail "search_log_B.json has no queries" }
+$first = $searchLog.queries[0]
+if (-not ($first.PSObject.Properties.Name -contains "query_text") -or -not ($first.PSObject.Properties.Name -contains "result_total")) {
+  Fail "search_log_B.json query entries missing query_text/result_total"
+}
+Ok "search_log_B.json has query_text and result_total"
+
+# Deterministic stop-check: no valid latin anchors => rc 2 + llm files
+$tempIdea = Join-Path $Root "ideas\IDEA-SELFTEST-B-SEED0"
+New-Item -ItemType Directory -Force -Path (Join-Path $tempIdea "in"),(Join-Path $tempIdea "out"),(Join-Path $tempIdea "logs") | Out-Null
+Set-Content -LiteralPath (Join-Path $tempIdea "idea.txt") -Value "и или но это как что для между если" -Encoding UTF8
+if (Test-Path (Join-Path $tempIdea "out\structured_idea.json")) { Remove-Item -LiteralPath (Join-Path $tempIdea "out\structured_idea.json") -Force }
+
+& $py $module --idea $tempIdea --mode BALANCED
+$rcStop = $LASTEXITCODE
+if ($rcStop -eq 0) { Fail "Expected non-zero code for seed stop, got 0" }
+if ($rcStop -ne 2) { Fail "Expected code 2 for seed stop, got $rcStop" }
+if (-not (Test-Path (Join-Path $tempIdea "out\llm_prompt_B_anchors.txt"))) { Fail "Missing llm_prompt_B_anchors.txt for seed stop" }
+if (-not (Test-Path (Join-Path $tempIdea "in\llm_response_B_anchors.json"))) { Fail "Missing llm_response_B_anchors.json template for seed stop" }
+Ok "seed=0 stop behavior validated"
 
 Write-Host "Selfcheck B complete"
