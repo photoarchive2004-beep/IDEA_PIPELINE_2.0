@@ -91,7 +91,7 @@ DRIFT_TARGET = 0.30
 DRIFT_HARD_STOP = 0.60
 PRIMARY_SIGNAL_MIN = 0.20
 TOPN_FOR_METRICS = 50
-LLM_BUDGET_PER_RUN = 1
+LLM_BUDGET_PER_IDEA = 3
 CITATION_CHASE_ENABLE = True
 CITATION_TOPK = 20
 CITATION_MAX_ADD = 120
@@ -224,12 +224,16 @@ class StageB:
             "examples_punct": [],
         }
         self.search_log["sanitation"] = {"stopwords_removed": 0, "examples": []}
-        self.llm_budget = LLM_BUDGET_PER_RUN
+        self.llm_budget = LLM_BUDGET_PER_IDEA
+        self.llm_budget_path = self.out_dir / "llm_budget_B.json"
+        self.llm_budget_state = self.load_llm_budget_state()
         self.llm_prompts_created = 0
         self.llm_prompt_created = False
         self.drift_target = DRIFT_TARGET_DEFAULT
         self.search_log["stats"] = {
-            "llm_budget": self.llm_budget,
+            "llm_budget_total": self.llm_budget,
+            "llm_budget_used": self.llm_budget_used(),
+            "llm_budget_remaining": self.llm_budget_remaining(),
             "llm_prompts_created": 0,
             "llm_used": False,
             "auto_fix_rounds_used": 0,
@@ -244,7 +248,7 @@ class StageB:
                 "DRIFT_HARD_STOP": DRIFT_HARD_STOP,
                 "PRIMARY_SIGNAL_MIN": PRIMARY_SIGNAL_MIN,
                 "TOPN_FOR_METRICS": TOPN_FOR_METRICS,
-                "LLM_BUDGET_PER_RUN": LLM_BUDGET_PER_RUN,
+                "LLM_BUDGET_PER_IDEA": LLM_BUDGET_PER_IDEA,
                 "CITATION_CHASE_ENABLE": CITATION_CHASE_ENABLE,
                 "CITATION_TOPK": CITATION_TOPK,
                 "CITATION_MAX_ADD": CITATION_MAX_ADD,
@@ -1656,9 +1660,53 @@ class StageB:
             lines += ["", "## Нераскрытые аббревиатуры", *[f"- {ab}" for ab in unresolved]]
         write_text(self.out_dir / "prisma_lite_B.md", "\n".join(lines) + "\n")
         self.write_search_strategy(stats)
+
+    def load_llm_budget_state(self) -> Dict[str, Any]:
+        defaults = {
+            "budget_total": self.llm_budget,
+            "used": 0,
+            "updated_at": now_iso(),
+            "last_stop_reason": "",
+            "last_run_id": "",
+        }
+        if not self.llm_budget_path.exists():
+            return defaults
+        try:
+            raw = json.loads(read_text(self.llm_budget_path))
+            if not isinstance(raw, dict):
+                return defaults
+            budget_total = int(raw.get("budget_total", self.llm_budget) or self.llm_budget)
+            used = int(raw.get("used", 0) or 0)
+            return {
+                "budget_total": max(budget_total, self.llm_budget),
+                "used": max(used, 0),
+                "updated_at": str(raw.get("updated_at") or defaults["updated_at"]),
+                "last_stop_reason": str(raw.get("last_stop_reason") or ""),
+                "last_run_id": str(raw.get("last_run_id") or ""),
+            }
+        except Exception:
+            return defaults
+
+    def llm_budget_used(self) -> int:
+        return int(self.llm_budget_state.get("used", 0) or 0)
+
+    def llm_budget_remaining(self) -> int:
+        return max(self.llm_budget - self.llm_budget_used(), 0)
+
+    def save_llm_budget_state(self, stop_reason: str, increment_used: bool) -> None:
+        used = self.llm_budget_used() + (1 if increment_used else 0)
+        self.llm_budget_state = {
+            "budget_total": self.llm_budget,
+            "used": max(used, 0),
+            "updated_at": now_iso(),
+            "last_stop_reason": stop_reason,
+            "last_run_id": self.run_id,
+        }
+        write_text(self.llm_budget_path, json.dumps(self.llm_budget_state, ensure_ascii=False, indent=2) + "\n")
+
     def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> bool:
         prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
-        if self.llm_prompt_created or prompt_path.exists() or self.llm_prompts_created >= self.llm_budget:
+        if self.llm_budget_remaining() <= 0:
             return False
         txt = f"""Этап B остановлен: {reason}.
 Нужен ответ для OpenAlex в виде КОРОТКИХ английских токенов/фраз (латиница), а не предложений.
@@ -1679,7 +1727,7 @@ class StageB:
 Если сомневаешься в blacklist — лучше не добавляй элемент.
 Текущие anchors: {anchors}
 Текущие packs: {packs}
-"""
+        """
         write_text(prompt_path, txt)
         self.llm_prompt_created = True
         self.llm_prompts_created += 1
@@ -1821,7 +1869,9 @@ class StageB:
             f"llm_response_path = {llm_path}",
             f"llm_response_reason = {self.llm_info.get('reason', '')}",
             f"llm_response_schema = {self.llm_info.get('schema', 'invalid')}",
-            f"llm_budget = {self.llm_budget}",
+            f"llm_budget_total = {self.llm_budget}",
+            f"llm_budget_used = {self.llm_budget_used()}",
+            f"llm_budget_remaining = {self.llm_budget_remaining()}",
             f"llm_prompt_created = {'YES' if self.llm_prompt_created else 'NO'}",
             f"llm_prompts_created = {self.llm_prompts_created}",
             f"llm_used = {'YES' if self.llm_info.get('used') else 'NO'}",
@@ -1855,9 +1905,9 @@ class StageB:
         if wait_llm:
             lines.append(f"STOP_REASON = {stop_reason}")
             lines.append(f"WAIT_FILE = {llm_path}")
-            lines.append(f"LLM budget used: {self.llm_prompts_created}/{self.llm_budget}")
-            if stop_reason == "llm_already_used_need_edit":
-                lines.append("второго запроса в ChatGPT не будет, отредактируй in/llm_response_B_anchors.json")
+            lines.append(f"LLM budget used: {self.llm_budget_used()}/{self.llm_budget}")
+            if stop_reason == "llm_budget_exhausted":
+                lines.append("Лимит 3 обращения к ChatGPT исчерпан. Отредактируй existing in/llm_response_B_anchors.json или сбрось бюджет вручную (удалив llm_budget_B.json).")
         write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines) + "\n")
 
     def round_metrics(self, round_id: int, drift_score: float, planned_queries_count: int, passed: List[Dict[str, Any]], support: List[Dict[str, Any]], ranked: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1870,21 +1920,30 @@ class StageB:
         }
 
     def stop_for_llm(self, stop_reason: str, reason_text: str, search_anchors: List[str], packs: List[List[str]], stats: Dict[str, Any], t0: float) -> int:
-        response_path = self.ensure_llm_response_template(force=not self.llm_info.get("used"))
-        if self.llm_info.get("used"):
-            stop_reason = "llm_already_used_need_edit"
-        elif self.llm_prompts_created < self.llm_budget:
-            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
+        response_path = self.ensure_llm_response_template(force=False)
+        prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
+        if self.llm_budget_remaining() <= 0:
+            stop_reason = "llm_budget_exhausted"
+            if prompt_path.exists():
+                prompt_path.unlink()
+            self.save_llm_budget_state(stop_reason, increment_used=False)
+        else:
+            created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
+            self.save_llm_budget_state(stop_reason, increment_used=created)
         stats["stop_reason"] = stop_reason
         stats["elapsed_ms"] = int((time.time() - t0) * 1000)
-        self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(response_path)]
-        self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats, "llm_budget": self.llm_budget, "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
+        stop_files = [str(response_path)]
+        if prompt_path.exists():
+            stop_files.insert(0, str(prompt_path))
+        self.search_log["stop_files"] = stop_files
+        self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats, "llm_budget_total": self.llm_budget, "llm_budget_used": self.llm_budget_used(), "llm_budget_remaining": self.llm_budget_remaining(), "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
         self.search_log["finished_at"] = now_iso()
         write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
         self.write_prisma(stats)
         self.write_summary(stats, wait_llm=True, stop_reason=stop_reason)
-        if stop_reason == "llm_already_used_need_edit":
-            print("Второй запрос в ChatGPT не делаем. Отредактируй in/llm_response_B_anchors.json и запусти RUN_B снова.")
+        if stop_reason == "llm_budget_exhausted":
+            print("Лимит 3 обращения к ChatGPT исчерпан. Новый prompt не создаётся.")
+            print("Отредактируй existing in/llm_response_B_anchors.json или удали out/llm_budget_B.json для сброса бюджета.")
         else:
             print(f"Этап B остановлен ({stop_reason}) и ждёт файл: {response_path}")
         return 2
@@ -2179,7 +2238,9 @@ class StageB:
             "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "",
             "auto_fix_rounds_used": auto_fix_rounds_used,
             "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]],
-            "llm_budget": self.llm_budget,
+            "llm_budget_total": self.llm_budget,
+            "llm_budget_used": self.llm_budget_used(),
+            "llm_budget_remaining": self.llm_budget_remaining(),
             "llm_prompts_created": self.llm_prompts_created,
             "llm_used": bool(self.llm_info.get("used")),
             "go_nogo": go_nogo,
@@ -2188,7 +2249,7 @@ class StageB:
             "primary_signal": go_eval.get("primary_signal", 0),
             "alive_seed_queries": alive_seed_queries,
         }
-        self.search_log["stats"] = {**stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after, "llm_budget": self.llm_budget, "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
+        self.search_log["stats"] = {**stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after, "llm_budget_total": self.llm_budget, "llm_budget_used": self.llm_budget_used(), "llm_budget_remaining": self.llm_budget_remaining(), "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
         self.search_log["finished_at"] = now_iso()
         self.write_prisma(stats)
         self.write_summary(stats, wait_llm=False)

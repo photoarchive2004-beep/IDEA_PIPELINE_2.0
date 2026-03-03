@@ -94,8 +94,8 @@ $llmPromptsCreated = 0
 if ($searchLog.stats -and ($searchLog.stats.PSObject.Properties.Name -contains "llm_prompts_created")) {
   $llmPromptsCreated = [int]$searchLog.stats.llm_prompts_created
 }
-if ($llmPromptsCreated -gt 1) { Fail "llm_prompts_created must be <= 1, got $llmPromptsCreated" }
-Ok "llm prompt budget respected (<=1)"
+if ($llmPromptsCreated -gt 3) { Fail "llm_prompts_created must be <= 3, got $llmPromptsCreated" }
+Ok "llm prompt budget respected (<=3)"
 
 if ($searchLog.stats -and ($searchLog.stats.PSObject.Properties.Name -contains "go_nogo")) {
   $go = [string]$searchLog.stats.go_nogo
@@ -107,7 +107,7 @@ if ($searchLog.stats -and ($searchLog.stats.PSObject.Properties.Name -contains "
     $hasPrompt = Test-Path (Join-Path $idea "out\llm_prompt_B_anchors.txt")
     $stopReason = ""
     if ($searchLog.stats.PSObject.Properties.Name -contains "stop_reason") { $stopReason = [string]$searchLog.stats.stop_reason }
-    if ((-not $hasPrompt) -and ($stopReason -ne "llm_already_used_need_edit")) { Fail "NO-GO must create prompt or set stop_reason=llm_already_used_need_edit" }
+    if ((-not $hasPrompt) -and ($stopReason -ne "llm_budget_exhausted")) { Fail "NO-GO must create prompt or set stop_reason=llm_budget_exhausted" }
     Ok "NO-GO stop behavior validated"
   }
 }
@@ -125,6 +125,45 @@ if ($rcStop -ne 2) { Fail "Expected code 2 for seed stop, got $rcStop" }
 if (-not (Test-Path (Join-Path $tempIdea "out\llm_prompt_B_anchors.txt"))) { Fail "Missing llm_prompt_B_anchors.txt for seed stop" }
 if (-not (Test-Path (Join-Path $tempIdea "in\llm_response_B_anchors.json"))) { Fail "Missing llm_response_B_anchors.json template for seed stop" }
 Ok "seed=0 stop behavior validated"
+
+# Stage B launcher must never reference Stage A prompt
+$runBScript = Get-Content -LiteralPath (Join-Path $Root "tools\run_b.ps1") -Raw
+if ($runBScript -match "llm_prompt_A\.txt") { Fail "run_b.ps1 must not reference llm_prompt_A.txt" }
+if ($runBScript -match "Find-Prompt") { Fail "run_b.ps1 must not use wildcard prompt resolver" }
+if ($runBScript -notmatch "llm_prompt_B_anchors\.txt") { Fail "run_b.ps1 must use llm_prompt_B_anchors.txt" }
+Ok "run_b.ps1 references only Stage B prompt path"
+
+# Persistent budget check: 3 STOPs allowed, 4th returns llm_budget_exhausted without prompt refresh
+$budgetIdea = Join-Path $Root "ideas\IDEA-SELFTEST-B-BUDGET"
+New-Item -ItemType Directory -Force -Path (Join-Path $budgetIdea "in"),(Join-Path $budgetIdea "out"),(Join-Path $budgetIdea "logs") | Out-Null
+Set-Content -LiteralPath (Join-Path $budgetIdea "idea.txt") -Value "и или но это как что для между если" -Encoding UTF8
+$budgetPath = Join-Path $budgetIdea "out\llm_budget_B.json"
+$promptPath = Join-Path $budgetIdea "out\llm_prompt_B_anchors.txt"
+$summaryPath = Join-Path $budgetIdea "out\stageB_summary.txt"
+if (Test-Path $budgetPath) { Remove-Item -LiteralPath $budgetPath -Force }
+if (Test-Path $promptPath) { Remove-Item -LiteralPath $promptPath -Force }
+
+for ($i = 1; $i -le 3; $i++) {
+  & $py $module --idea $budgetIdea --mode BALANCED
+  if ($LASTEXITCODE -ne 2) { Fail "Budget run #$i must return rc=2" }
+  if (-not (Test-Path $budgetPath)) { Fail "Budget file missing after run #$i" }
+  $budget = Get-Content -LiteralPath $budgetPath -Raw | ConvertFrom-Json
+  if ([int]$budget.used -ne $i) { Fail "Budget used must be $i after run #$i, got $($budget.used)" }
+  if (-not (Test-Path $promptPath)) { Fail "Prompt must exist during budget run #$i" }
+}
+$promptTimestamp = (Get-Item -LiteralPath $promptPath).LastWriteTimeUtc
+Start-Sleep -Milliseconds 1200
+& $py $module --idea $budgetIdea --mode BALANCED
+if ($LASTEXITCODE -ne 2) { Fail "Budget run #4 must return rc=2" }
+$summary4 = Get-Content -LiteralPath $summaryPath -Raw
+if ($summary4 -notmatch "STOP_REASON\s*=\s*llm_budget_exhausted") { Fail "4th run must set STOP_REASON=llm_budget_exhausted" }
+$budget4 = Get-Content -LiteralPath $budgetPath -Raw | ConvertFrom-Json
+if ([int]$budget4.used -ne 3) { Fail "Budget used must remain 3 on exhausted run, got $($budget4.used)" }
+if (Test-Path $promptPath) {
+  $promptTimestampAfter = (Get-Item -LiteralPath $promptPath).LastWriteTimeUtc
+  if ($promptTimestampAfter -ne $promptTimestamp) { Fail "Prompt must not be refreshed on budget exhausted run" }
+}
+Ok "persistent LLM budget=3 validated"
 
 # Offline fixture with abstracts should produce support hits and support corpus
 $tempFixture = Join-Path $Root "tools\tests\fixtures\tmp_support"
