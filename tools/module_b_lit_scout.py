@@ -63,6 +63,11 @@ GEO_HINTS = {
     "altai", "altaya", "kazakhstan", "siberia", "mongolia", "china", "russia", "balkhash", "ural", "volga",
 }
 
+METHOD_HINTS = {
+    "baypass", "lfmm2", "ddrad", "snp", "abba-baba", "hydrorivers", "hydroatlas", "genotype-environment",
+    "genotype", "association", "regression", "meta-analysis", "machine-learning", "modeling",
+}
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -150,6 +155,16 @@ class StageB:
         self.dedup_before = 0
         self.dedup_after = 0
         self.dedup_merged_count = 0
+        self.geo_terms: Set[str] = set()
+        self.llm_info: Dict[str, Any] = {
+            "found": False,
+            "used": False,
+            "schema": "invalid",
+            "reason": "response_not_found",
+            "path": str((self.in_dir / "llm_response_B_anchors.json").resolve()),
+        }
+        self.search_log["llm"] = dict(self.llm_info)
+        self.search_log["rejected_queries"] = []
 
     def archive_previous_outputs(self) -> None:
         run_dir = self.out_dir / "_runs" / self.run_id
@@ -306,7 +321,62 @@ class StageB:
         return [t for t in re.split(r"[^A-Za-zА-Яа-я0-9\-]+", s.lower()) if t]
 
     def is_geography_token(self, token: str) -> bool:
-        return token.lower() in GEO_HINTS
+        t = (token or "").strip().lower()
+        return t in GEO_HINTS or t in self.geo_terms
+
+    def has_latin_for_seed(self, text: str) -> bool:
+        return bool(re.search(r"[A-Za-z]", text or ""))
+
+    def has_seed_chars(self, text: str) -> bool:
+        return bool(re.search(r"[A-Za-z0-9\-]", text or ""))
+
+    def normalize_token_list(self, items: Any) -> List[str]:
+        if not isinstance(items, list):
+            return []
+        cleaned: List[str] = []
+        seen: Set[str] = set()
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            tok = self.normalize_search_anchor(item)
+            if not tok or len(tok) > 60:
+                continue
+            if not self.has_seed_chars(tok):
+                continue
+            key = tok.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(tok)
+        return cleaned
+
+    def detect_geo_terms(self, idea_text: str, structured: Dict[str, Any]) -> Set[str]:
+        src = structured.get("structured_idea", structured) if isinstance(structured, dict) else {}
+        text_parts = [idea_text]
+        if isinstance(src, dict):
+            for val in src.values():
+                if isinstance(val, str):
+                    text_parts.append(val)
+                elif isinstance(val, list):
+                    text_parts.extend([str(x) for x in val if isinstance(x, str)])
+        blob = "\n".join(text_parts)
+        terms = {
+            w.lower()
+            for w in re.findall(r"\b[A-Z][a-z]{3,19}\b", blob)
+            if "-" not in w and not re.search(r"\d", w) and w.lower() not in METHOD_HINTS
+        }
+        return terms | set(GEO_HINTS)
+
+    def is_geo_like_token(self, token: str) -> bool:
+        tok = (token or "").strip()
+        if not tok or len(tok) < 4 or len(tok) > 20:
+            return False
+        if not re.fullmatch(r"[A-Z][a-z]+", tok):
+            return False
+        low = tok.lower()
+        if low in METHOD_HINTS:
+            return False
+        return low in self.geo_terms
 
     def token_strength(self, token: str) -> int:
         t = token.strip()
@@ -546,9 +616,11 @@ class StageB:
             return f"({uniq[0]} AND {uniq[1]})"
         return f"({uniq[0]} AND ({uniq[1]} OR {uniq[2]}))"
 
-    def preflight_queries(self, queries: List[str]) -> Tuple[List[str], List[str]]:
+    def preflight_queries(self, queries: List[str], primary_token: str, method_terms: List[str]) -> Tuple[List[str], List[str]]:
         ok: List[str] = []
         bad: List[str] = []
+        method_set = {m.lower() for m in method_terms if m}
+        ptoken = (primary_token or "").lower()
         for q in queries:
             query = re.sub(r"\s+", " ", q.strip())
             terms = [t for t in re.findall(r"[A-Za-z0-9\-]+", query) if len(t) >= 3]
@@ -561,10 +633,23 @@ class StageB:
             qtokens = [x.lower() for x in re.findall(r"[A-Za-z0-9\-]+", query)]
             if len(qtokens) == 1 and qtokens[0] in GEO_HINTS:
                 bad.append(f"Geo-only запрос запрещён: {query}")
+                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_only_single_term"})
                 continue
             if re.fullmatch(r"[A-Z][a-z]{3,}", query) and not re.search(r"\d", query) and qtokens and qtokens[0] in GEO_HINTS:
                 bad.append(f"Похоже на geo-only или одиночный термин: {query}")
+                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_only_title_case"})
                 continue
+            geo_terms = [t for t in terms if self.is_geography_token(t) or self.is_geo_like_token(t)]
+            if len(geo_terms) == len(terms):
+                bad.append(f"Geo-only запрос запрещён: {query}")
+                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_only_all_terms"})
+                continue
+            if geo_terms:
+                has_pair = any((t.lower() == ptoken) or (t.lower() in method_set) or ("-" in t) or bool(re.search(r"\d", t)) for t in terms)
+                if not has_pair:
+                    bad.append(f"География без объекта/метода запрещена: {query}")
+                    self.search_log["rejected_queries"].append({"query": query, "reason": "geo_without_pair"})
+                    continue
             if " AND " in query and " OR " not in query and query.count("AND") >= 2:
                 bad.append(f"Риск нулевой выдачи (много AND без OR): {query}")
                 continue
@@ -574,7 +659,7 @@ class StageB:
             ok.append(query)
         return ok[:8], bad
 
-    def build_seed_queries(self, keywords_for_search: List[str], search_anchors: List[str], packs: List[List[str]]) -> List[str]:
+    def build_seed_queries(self, keywords_for_search: List[str], search_anchors: List[str], packs: List[List[str]], primary_token: str, source_terms: List[str], source_mode: str) -> List[str]:
         queries: List[str] = []
         seen: Set[str] = set()
 
@@ -585,9 +670,10 @@ class StageB:
                 short = " ".join(re.findall(r"[A-Za-z0-9\-]{4,}", short)[:3])
             tokens.extend(re.findall(r"[A-Za-z0-9\-]{3,}", short))
         unique_tokens = [t for t in dict.fromkeys(tokens) if len(t) >= 3][:24]
-        object_term = unique_tokens[0] if unique_tokens else (search_anchors[0] if search_anchors else "")
+        object_term = primary_token or (unique_tokens[0] if unique_tokens else (search_anchors[0] if search_anchors else ""))
         method_terms = [t for t in unique_tokens if re.search(r"\d", t) or "-" in t or t.lower() in {"baypass", "lfmm2", "ddrad", "snp", "abba-baba", "hydrorivers", "hydroatlas"}][:4]
         phenomenon_terms = [t for t in unique_tokens if t.lower() in {"adaptation", "gene", "flow", "genomics", "environment", "association", "riverscape"}][:4]
+        source_terms_clean = self.normalize_token_list(source_terms)
 
         def add_query(q: str) -> None:
             query = re.sub(r"\s+", " ", q.strip())
@@ -597,8 +683,14 @@ class StageB:
             seen.add(key)
             queries.append(query)
 
-        if object_term:
-            add_query(self.normalize_search_anchor(object_term))
+        if source_mode == "llm":
+            for pack in packs[:6]:
+                add_query(self.build_boolean_query(pack[:3]))
+            for tok in source_terms_clean[:4]:
+                add_query(self.build_boolean_query([object_term, tok]))
+        else:
+            if object_term:
+                add_query(self.normalize_search_anchor(object_term))
         for m in method_terms[:3]:
             add_query(self.build_boolean_query([object_term, m]))
         for p in phenomenon_terms[:2]:
@@ -610,10 +702,11 @@ class StageB:
         if not queries:
             for pack in packs:
                 add_query(self.build_boolean_query(pack[:3]))
-            for a in search_anchors[:6]:
+            fallback_anchors = search_anchors if source_mode != "keywords" else source_terms_clean
+            for a in fallback_anchors[:6]:
                 add_query(self.normalize_search_anchor(a))
 
-        good, bad = self.preflight_queries(queries[:8])
+        good, bad = self.preflight_queries(queries[:8], object_term, method_terms + source_terms_clean)
         for item in bad:
             self.search_log["errors"].append(f"query_preflight: {item}")
         return good[:8]
@@ -974,35 +1067,41 @@ class StageB:
             *[f"- {q.get('query_text','')} → {q.get('result_total', 0)}" for q in s2_q],
         ]
         if unresolved:
-            lines += ["", "## Аббревиатуры без расшифровки", *[f"- {ab}" for ab in unresolved]]
+            lines += ["", "## Аббревиатуры без расшифровки", *[f"- аббревиатура не раскрыта: {ab}" for ab in unresolved]]
         write_text(self.out_dir / "prisma_lite_B.md", "\n".join(lines) + "\n")
         write_text(self.out_dir / "search_strategy.md", "\n".join(lines) + "\n")
 
     def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> None:
         txt = (
-            f"Этап B остановлен: {reason}. Уточни фильтр релевантности и ограничения дрейфа. Верни только JSON:\n"
+            f"Этап B остановлен: {reason}.\n"
+            "Нужен ответ для OpenAlex в виде КОРОТКИХ английских токенов/фраз (латиница), а не предложений.\n"
+            "Примеры корректных токенов: Phoxinus, HydroRIVERS, genotype-environment association, BayPass.\n"
+            "Запрещено давать географию одним словом (Altai/Balkhash и т.п.) без пары с объектом, темой или методом.\n"
+            "Верни строго JSON в формате ниже, без комментариев и текста вокруг:\n"
             "{\n"
-            "  \"refined_primary_token\": \"...\",\n"
-            "  \"refined_must_have_tokens\": [\"...\"],\n"
-            "  \"refined_keywords_tokens\": [\"...\"],\n"
-            "  \"anchor_packs\": [[\"...\",\"...\"],[\"...\",\"...\",\"...\"]],\n"
-            "  \"drift_blacklist\": [\"...\"]\n"
+            "  \"refined_primary_token\": \"Phoxinus\",\n"
+            "  \"refined_keywords_tokens\": [\"riverscape genomics\", \"HydroRIVERS\", \"BayPass\"],\n"
+            "  \"refined_must_have_tokens\": [\"Phoxinus\", \"riverscape\"],\n"
+            "  \"anchor_packs\": [[\"Phoxinus\",\"BayPass\"],[\"Phoxinus\",\"HydroRIVERS\"]],\n"
+            "  \"drift_blacklist\": [\"glaciology\", \"archaeology\"],\n"
+            "  \"abbreviation_map\": {\"SNP\": \"single nucleotide polymorphism\"}\n"
             "}\n"
-            "Ограничения: refined_must_have_tokens 5-15, refined_keywords_tokens 10-25 токенов, anchor_packs 4-6 по 2-3 термина, drift_blacklist 10-30.\n"
+            "Важно: drift_blacklist тоже только на английском.\n"
             f"Текущие anchors: {anchors}\n"
             f"Текущие packs: {packs}\n"
         )
         write_text(self.out_dir / "llm_prompt_B_anchors.txt", txt)
 
-    def ensure_llm_response_template(self) -> Path:
+    def ensure_llm_response_template(self, force: bool = False) -> Path:
         p = self.in_dir / "llm_response_B_anchors.json"
-        if not p.exists():
+        if force or not p.exists():
             template = {
                 "refined_primary_token": "Phoxinus",
-                "refined_must_have_tokens": ["phoxinus", "cytochrome-b", "riverscape"],
-                "refined_keywords_tokens": ["Phoxinus", "Balkhash", "cytochrome-b", "riverscape", "lfmm2"],
-                "anchor_packs": [["Phoxinus", "cytochrome-b"], ["Phoxinus", "riverscape"], ["lfmm2", "adaptation"], ["Phoxinus", "lfmm2", "adaptation"]],
-                "drift_blacklist": ["water scarcity", "urban water supply"],
+                "refined_keywords_tokens": ["riverscape genomics", "genotype-environment association", "HydroRIVERS", "HydroATLAS", "BayPass", "LFMM2", "ddRAD", "SNP"],
+                "refined_must_have_tokens": ["Phoxinus", "riverscape"],
+                "anchor_packs": [["Phoxinus", "BayPass"], ["Phoxinus", "HydroRIVERS"], ["Phoxinus", "genotype-environment association"], ["riverscape genomics", "gene flow"]],
+                "drift_blacklist": ["glaciology", "archaeology", "radiocarbon", "wheat", "water scarcity"],
+                "abbreviation_map": {"SNP": "single nucleotide polymorphism"},
             }
             write_text(p, json.dumps(template, ensure_ascii=False, indent=2) + "\n")
         return p
@@ -1017,10 +1116,77 @@ class StageB:
         except Exception:
             return {}
 
-    def write_summary(self, stats: Dict[str, Any], used_europe: bool, wait_llm: bool, used_user_response: bool, corpus_updated: bool, stop_reason: str = "") -> None:
+    def parse_llm_anchor_response(self, llm: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "schema": "invalid",
+            "reason": "invalid_missing_required_keys",
+            "primary": "",
+            "keywords": [],
+            "must_have": [],
+            "packs": [],
+            "drift_blacklist": [],
+            "abbreviation_map": {},
+        }
+        if not isinstance(llm, dict) or not llm:
+            return out
+
+        schema = "invalid"
+        if isinstance(llm.get("refined_primary_token"), str) or isinstance(llm.get("refined_keywords_tokens"), list):
+            schema = "refined"
+        elif isinstance(llm.get("cleaned_search_anchors"), list) or isinstance(llm.get("cleaned_anchors"), list):
+            schema = "legacy"
+        out["schema"] = schema
+
+        if schema == "refined":
+            primary = self.normalize_search_anchor(str(llm.get("refined_primary_token") or ""))
+            keywords = self.normalize_token_list(llm.get("refined_keywords_tokens", []))
+            must_have = self.normalize_token_list(llm.get("refined_must_have_tokens", []))
+        else:
+            primary = ""
+            keywords = self.normalize_token_list(llm.get("cleaned_search_anchors") or llm.get("cleaned_anchors") or [])
+            must_have = []
+
+        raw_packs = llm.get("anchor_packs") if isinstance(llm.get("anchor_packs"), list) else []
+        packs: List[List[str]] = []
+        for pack in raw_packs:
+            clean_pack = self.normalize_token_list(pack)
+            if len(clean_pack) >= 2:
+                packs.append(clean_pack[:3])
+
+        drift_blacklist = self.normalize_token_list(llm.get("drift_blacklist", []))
+        ab_map = llm.get("abbreviation_map") if isinstance(llm.get("abbreviation_map"), dict) else {}
+        ab_map_clean = {str(k): str(v).strip() for k, v in ab_map.items() if str(k).strip() and str(v).strip()}
+
+        token_pool = self.normalize_token_list([primary] + keywords + must_have + [x for p in packs for x in p])
+        latin_pool = [t for t in token_pool if self.has_latin_for_seed(t)]
+        latin_pack_count = sum(1 for p in packs if any(self.has_latin_for_seed(t) for t in p))
+        has_primary = bool(primary and self.has_latin_for_seed(primary))
+
+        out.update({
+            "primary": primary,
+            "keywords": keywords,
+            "must_have": must_have,
+            "packs": packs,
+            "drift_blacklist": [x.lower() for x in drift_blacklist],
+            "abbreviation_map": ab_map_clean,
+        })
+
+        if len(latin_pool) < 8:
+            out["reason"] = "invalid_non_latin_tokens"
+            out["schema"] = "invalid"
+            return out
+        if not has_primary and latin_pack_count < 2:
+            out["reason"] = "invalid_missing_primary_or_packs"
+            out["schema"] = "invalid"
+            return out
+        out["reason"] = "validated"
+        return out
+
+    def write_summary(self, stats: Dict[str, Any], wait_llm: bool, stop_reason: str = "") -> None:
         sources = f"openalex={self.search_log['service_status']['openalex']}, semanticscholar={self.search_log['service_status']['semantic_scholar']}, crossref={self.search_log['service_status']['crossref']}"
         seed_queries = [q for q in self.search_log.get("queries", []) if q.get("source") == "openalex" and q.get("query_kind") == "seed"]
         unresolved = sorted([ab for ab in self.abbr_mentions if ab not in self.abbr_full_map])
+        llm_path = self.llm_info.get("path", str((self.in_dir / "llm_response_B_anchors.json").resolve()))
         lines = [
             f"run_id: {self.run_id}",
             f"sources status: {sources}",
@@ -1034,15 +1200,22 @@ class StageB:
             f"drift_score = {stats.get('drift_score', 0)}",
             f"dedup_merged_count = {stats.get('dedup_merged_count', 0)}",
             f"elapsed: {stats.get('elapsed_ms', 0)} ms",
+            f"llm_response_found = {'YES' if self.llm_info.get('found') else 'NO'}",
+            f"llm_response_used = {'YES' if self.llm_info.get('used') else 'NO'}",
+            f"llm_response_path = {llm_path}",
+            f"llm_response_reason = {self.llm_info.get('reason', '')}",
+            f"llm_response_schema = {self.llm_info.get('schema', 'invalid')}",
             "Первые 3 OpenAlex seed-запроса:",
         ]
         for q in seed_queries[:3]:
             lines.append(f"- {q.get('query_text','')} → {q.get('result_total', 0)}")
-        if unresolved:
-            lines.append(f"unresolved_abbreviations_count = {len(unresolved)}")
+        for ab in unresolved:
+            lines.append(f"аббревиатура не раскрыта: {ab}")
+            self.log(f"аббревиатура не раскрыта: {ab}")
         if wait_llm:
-            lines.append(f"STOP_REASON={stop_reason}; ждёт {self.in_dir / 'llm_response_B_anchors.json'}")
-        write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines[:25]) + "\n")
+            lines.append(f"STOP_REASON = {stop_reason}")
+            lines.append(f"WAIT_FILE = {llm_path}")
+        write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines[:40]) + "\n")
 
     def load_fixture(self) -> List[Dict[str, Any]]:
         fp = self.offline_fixtures / "openalex_seed.json" if self.offline_fixtures else None
@@ -1063,11 +1236,12 @@ class StageB:
             self.search_log["errors"].append(idea_text)
             self.write_corpus([], [], allow_replace=False)
             self.write_prisma({})
-            self.write_summary({}, used_europe=False, wait_llm=False, used_user_response=False, corpus_updated=False)
+            self.write_summary({}, wait_llm=False)
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
             return 0
 
         structured = self.load_structured()
+        self.geo_terms = self.detect_geo_terms(idea_text, structured)
         _, search_anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
         keywords_for_search, keywords_used = self.get_keywords_for_search(idea_text, structured)
         self.search_log["keywords_for_search_used"] = keywords_used
@@ -1078,50 +1252,77 @@ class StageB:
         primary_token = self.detect_primary_token(keywords_for_search, search_anchors)
         must_have_tokens = self.build_must_have_tokens(keywords_for_search)
         packs = self.build_anchor_packs(primary_token, base_tokens)
-
-        llm = self.load_llm_anchor_response()
-        used_user_response = False
-        refined_primary = ""
-        refined_tokens: List[str] = []
-        refined_must: List[str] = []
+        keywords_tokens = base_tokens
         drift_blacklist: List[str] = []
-        if isinstance(llm, dict) and llm:
-            if isinstance(llm.get("refined_primary_token"), str):
-                refined_primary = self.normalize_search_anchor(llm.get("refined_primary_token", "")).lower()
-            if isinstance(llm.get("refined_keywords_tokens"), list):
-                refined_tokens = [self.normalize_search_anchor(str(x)).lower() for x in llm.get("refined_keywords_tokens", []) if isinstance(x, str)]
-                refined_tokens = [x for x in refined_tokens if x]
-            if isinstance(llm.get("refined_must_have_tokens"), list):
-                refined_must = [self.normalize_search_anchor(str(x)).lower() for x in llm.get("refined_must_have_tokens", []) if isinstance(x, str)]
-                refined_must = [x for x in refined_must if x]
-            if isinstance(llm.get("anchor_packs"), list):
-                packs = self.build_anchor_packs(refined_primary or primary_token, refined_tokens or base_tokens, llm.get("anchor_packs", []))
-            if isinstance(llm.get("drift_blacklist"), list):
-                drift_blacklist = [str(x).strip().lower() for x in llm.get("drift_blacklist", []) if isinstance(x, str) and str(x).strip()]
-            used_user_response = bool(refined_primary or refined_tokens or refined_must or drift_blacklist)
+        source_mode = "keywords" if keywords_used else "anchors"
+        source_terms = keywords_for_search if keywords_used else search_anchors
 
-        primary_token = refined_primary or primary_token
-        keywords_tokens = refined_tokens or base_tokens
-        must_have_tokens = refined_must or must_have_tokens
+        llm_path = self.in_dir / "llm_response_B_anchors.json"
+        llm_raw = self.load_llm_anchor_response()
+        self.llm_info = {
+            "found": llm_path.exists(),
+            "used": False,
+            "schema": "invalid",
+            "reason": "response_not_found" if not llm_path.exists() else "invalid_missing_required_keys",
+            "path": str(llm_path.resolve()),
+        }
+        if llm_path.exists():
+            parsed_llm = self.parse_llm_anchor_response(llm_raw)
+            self.llm_info["schema"] = parsed_llm.get("schema", "invalid")
+            self.llm_info["reason"] = parsed_llm.get("reason", "invalid_missing_required_keys")
+            if parsed_llm.get("schema") == "invalid":
+                self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], parsed_llm.get("reason", "llm_invalid"))
+                response_path = self.ensure_llm_response_template(force=True)
+                self.llm_info["used"] = False
+                self.llm_info["reason"] = parsed_llm.get("reason", "llm_invalid")
+                self.search_log["llm"] = dict(self.llm_info)
+                stats = {
+                    "seed_queries": 0, "seed_count": 0, "total_candidates": 0, "pass_count": 0,
+                    "low_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000),
+                    "stop_reason": "llm_invalid", "primary_token": primary_token, "packs_count": len(packs),
+                    "must_have_count": len(must_have_tokens),
+                }
+                self.search_log["stats"] = stats
+                self.search_log["finished_at"] = now_iso()
+                self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(response_path)]
+                self.write_prisma(stats)
+                self.write_summary(stats, wait_llm=True, stop_reason="llm_invalid")
+                write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+                print(f"Этап B остановлен (llm_invalid) и ждёт файл: {response_path}")
+                return 2
 
+            self.llm_info["used"] = True
+            self.llm_info["reason"] = "validated_and_applied"
+            self.llm_info["schema"] = parsed_llm.get("schema", "invalid")
+            primary_token = (parsed_llm.get("primary") or primary_token).lower()
+            keywords_tokens = [x.lower() for x in parsed_llm.get("keywords", [])] or base_tokens
+            must_have_tokens = [x.lower() for x in parsed_llm.get("must_have", [])] or must_have_tokens
+            packs = self.build_anchor_packs(primary_token, keywords_tokens, parsed_llm.get("packs", []))
+            drift_blacklist = [x.lower() for x in parsed_llm.get("drift_blacklist", [])]
+            if parsed_llm.get("abbreviation_map"):
+                self.abbr_full_map.update(parsed_llm.get("abbreviation_map", {}))
+            source_mode = "llm"
+            source_terms = keywords_tokens
+
+        self.search_log["llm"] = dict(self.llm_info)
         self.search_log["primary_token"] = primary_token
         self.search_log["packs_count"] = len(packs)
         self.search_log["must_have_tokens"] = must_have_tokens
 
         seed_rows: List[Dict[str, Any]] = []
         used_queries = 0
-        seed_query_list = self.build_seed_queries(keywords_for_search, search_anchors, packs)
+        seed_query_list = self.build_seed_queries(keywords_for_search, search_anchors, packs, primary_token, source_terms, source_mode)
 
         if not seed_query_list and not self.offline_fixtures:
             self.search_log["errors"].append("query_preflight: нет валидных seed-запросов")
-            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "нет валидных seed-запросов после самопроверки")
-            response_path = self.ensure_llm_response_template()
-            stats = {"seed_queries": 0, "seed_count": 0, "total_candidates": 0, "pass_count": 0, "low_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000), "stop_reason": "невалидные поисковые строки", "primary_token": primary_token, "packs_count": len(packs), "must_have_count": len(must_have_tokens)}
+            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "невалидные поисковые строки")
+            response_path = self.ensure_llm_response_template(force=not self.llm_info.get("used"))
+            stats = {"seed_queries": 0, "seed_count": 0, "total_candidates": 0, "pass_count": 0, "low_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000), "stop_reason": "llm_invalid", "primary_token": primary_token, "packs_count": len(packs), "must_have_count": len(must_have_tokens)}
             self.search_log["stats"] = stats
             self.search_log["finished_at"] = now_iso()
-            self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(self.in_dir / "llm_response_B_anchors.json")]
+            self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(response_path)]
             self.write_prisma(stats)
-            self.write_summary(stats, used_europe=False, wait_llm=True, used_user_response=used_user_response, corpus_updated=False, stop_reason="невалидные поисковые строки")
+            self.write_summary(stats, wait_llm=True, stop_reason="llm_invalid")
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
             print(f"Этап B остановлен и ждёт файл: {response_path}")
             return 2
@@ -1167,8 +1368,9 @@ class StageB:
 
         drift_stop = drift_score >= 0.40
         if need_llm or drift_stop:
-            reason = "seed=0" if need_llm else f"high drift: {round(drift_score * 100,1)}%"
-            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason)
+            reason = "seed_zero" if need_llm else "drift_high"
+            reason_text = "seed=0" if need_llm else f"high drift: {round(drift_score * 100,1)}%"
+            self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
             response_path = self.ensure_llm_response_template()
             stats = {
                 "seed_queries": used_queries,
@@ -1187,12 +1389,12 @@ class StageB:
                 "dedup_merged_count": self.dedup_merged_count,
                 "stop_reason": reason,
             }
-            self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(self.in_dir / "llm_response_B_anchors.json")]
+            self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(response_path)]
             self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after}
             self.search_log["finished_at"] = now_iso()
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
             self.write_prisma(stats)
-            self.write_summary(stats, used_europe=False, wait_llm=True, used_user_response=used_user_response, corpus_updated=False, stop_reason=reason)
+            self.write_summary(stats, wait_llm=True, stop_reason=reason)
             print(f"Этап B остановлен ({reason}) и ждёт файл: {response_path}")
             return 2
 
@@ -1217,7 +1419,7 @@ class StageB:
         self.search_log["stats"] = {**stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after}
         self.search_log["finished_at"] = now_iso()
         self.write_prisma(stats)
-        self.write_summary(stats, used_europe=False, wait_llm=False, used_user_response=used_user_response, corpus_updated=corpus_updated)
+        self.write_summary(stats, wait_llm=False)
         write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
         self.log("Stage B done")
         return 0
