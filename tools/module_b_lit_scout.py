@@ -226,7 +226,7 @@ class StageB:
         }
         self.search_log["sanitation"] = {"stopwords_removed": 0, "examples": []}
         self.llm_budget = LLM_BUDGET_PER_IDEA
-        self.llm_budget_path = self.out_dir / "llm_budget_B.json"
+        self.llm_budget_path = self.out_dir / "llm_requests_B.json"
         self.llm_budget_state = self.load_llm_budget_state()
         self.llm_prompts_created = 0
         self.llm_prompt_created = False
@@ -1726,7 +1726,7 @@ class StageB:
 
     def load_llm_budget_state(self) -> Dict[str, Any]:
         defaults = {
-            "budget_total": self.llm_budget,
+            "limit": self.llm_budget,
             "used": 0,
             "updated_at": now_iso(),
             "last_stop_reason": "",
@@ -1738,10 +1738,10 @@ class StageB:
             raw = json.loads(read_text(self.llm_budget_path))
             if not isinstance(raw, dict):
                 return defaults
-            budget_total = int(raw.get("budget_total", self.llm_budget) or self.llm_budget)
+            budget_total = int(raw.get("limit", raw.get("budget_total", self.llm_budget)) or self.llm_budget)
             used = int(raw.get("used", 0) or 0)
             return {
-                "budget_total": max(budget_total, self.llm_budget),
+                "limit": max(budget_total, self.llm_budget),
                 "used": max(used, 0),
                 "updated_at": str(raw.get("updated_at") or defaults["updated_at"]),
                 "last_stop_reason": str(raw.get("last_stop_reason") or ""),
@@ -1759,7 +1759,7 @@ class StageB:
     def save_llm_budget_state(self, stop_reason: str, increment_used: bool) -> None:
         used = self.llm_budget_used() + (1 if increment_used else 0)
         self.llm_budget_state = {
-            "budget_total": self.llm_budget,
+            "limit": self.llm_budget,
             "used": max(used, 0),
             "updated_at": now_iso(),
             "last_stop_reason": stop_reason,
@@ -1968,9 +1968,9 @@ class StageB:
         if wait_llm:
             lines.append(f"STOP_REASON = {stop_reason}")
             lines.append(f"WAIT_FILE = {llm_path}")
-            lines.append(f"LLM budget used: {self.llm_budget_used()}/{self.llm_budget}")
-            if stop_reason == "llm_budget_exhausted":
-                lines.append("Лимит 3 обращения к ChatGPT исчерпан. Отредактируй existing in/llm_response_B_anchors.json или сбрось бюджет вручную (удалив llm_budget_B.json).")
+            lines.append(f"LLM budget used: {self.llm_budget_used()} / {self.llm_budget}")
+            if stop_reason == "llm_limit_reached_edit_json":
+                lines.append("Лимит 3 обращения к ChatGPT исчерпан. Отредактируй in/llm_response_B_anchors.json. Новый prompt не создаётся.")
         write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines) + "\n")
 
     def round_metrics(self, round_id: int, drift_score: float, planned_queries_count: int, passed: List[Dict[str, Any]], support: List[Dict[str, Any]], ranked: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1989,13 +1989,24 @@ class StageB:
         response_path = self.ensure_llm_response_template(force=False)
         prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
         if self.llm_budget_remaining() <= 0:
-            stop_reason = "llm_budget_exhausted"
+            stop_reason = "llm_limit_reached_edit_json"
             if prompt_path.exists():
                 prompt_path.unlink()
             self.save_llm_budget_state(stop_reason, increment_used=False)
         else:
             created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
             self.save_llm_budget_state(stop_reason, increment_used=created)
+            if not created:
+                stats["stop_reason"] = "internal_error_prompt_missing"
+                stats["elapsed_ms"] = int((time.time() - t0) * 1000)
+                self.search_log["errors"].append("internal_error_prompt_missing: rc2 requested without llm_prompt_B_anchors.txt")
+                self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats, "llm_budget_total": self.llm_budget, "llm_budget_used": self.llm_budget_used(), "llm_budget_remaining": self.llm_budget_remaining(), "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
+                self.search_log["finished_at"] = now_iso()
+                write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+                self.write_prisma(stats)
+                self.write_summary(stats, wait_llm=True, stop_reason="internal_error_prompt_missing")
+                print("Внутренняя ошибка: Stage B должна была создать out/llm_prompt_B_anchors.txt, но файл отсутствует.")
+                return 1
         stats["stop_reason"] = stop_reason
         stats["elapsed_ms"] = int((time.time() - t0) * 1000)
         stop_files = [str(response_path)]
@@ -2007,9 +2018,9 @@ class StageB:
         write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
         self.write_prisma(stats)
         self.write_summary(stats, wait_llm=True, stop_reason=stop_reason)
-        if stop_reason == "llm_budget_exhausted":
+        if stop_reason == "llm_limit_reached_edit_json":
             print("Лимит 3 обращения к ChatGPT исчерпан. Новый prompt не создаётся.")
-            print("Отредактируй existing in/llm_response_B_anchors.json или удали out/llm_budget_B.json для сброса бюджета.")
+            print("Отредактируй in/llm_response_B_anchors.json вручную и запусти Stage B снова.")
         else:
             print(f"Этап B остановлен ({stop_reason}) и ждёт файл: {response_path}")
         return 2

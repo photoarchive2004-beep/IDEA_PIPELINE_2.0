@@ -117,37 +117,38 @@ try {
     if (-not (Test-Path $resp)) { New-Item -ItemType File -Force -Path $resp | Out-Null }
 
     Say ""
-    Say "⚠️ Stage B завершилась с ожиданием ручного шага."
+    Say "⚠️ Stage B ждёт ручной шаг."
 
-    if ($stopReason -eq "llm_already_used_need_edit") {
-      Say "Обнаружен некорректный JSON-ответ. Второй запрос в ChatGPT не нужен."
-      Say "Открою только in\llm_response_B_anchors.json для ручной правки."
+    if ($stopReason -eq "llm_limit_reached_edit_json") {
+      Say "Лимит ChatGPT 3/3 уже использован."
+      Say "Шаг 1: Откроется файл in\llm_response_B_anchors.json."
+      Say "Шаг 2: Впиши или поправь JSON вручную."
+      Say "Шаг 3: Сохрани файл."
+      Say "Шаг 4: Прочитай подсказку в out\stageB_summary.txt."
+      Say "Шаг 5: Запусти RUN_B.bat снова."
       Start-Process notepad.exe -ArgumentList $resp | Out-Null
-      exit 2
-    }
-
-    if ($stopReason -eq "llm_budget_exhausted") {
-      Say "Лимит обращений к ChatGPT исчерпан."
-      Say "Открою файл in\llm_response_B_anchors.json для ручной правки."
-      Start-Process notepad.exe -ArgumentList $resp | Out-Null
+      if (Test-Path $summary) { Start-Process notepad.exe -ArgumentList $summary | Out-Null }
       exit 2
     }
 
     if (Test-Path $prompt) {
       Set-Clipboard -Value (Get-Content -Raw -LiteralPath $prompt)
-      Say "Нужен 1 шаг в ChatGPT:"
-      Say "1) PROMPT из out\llm_prompt_B_anchors.txt уже в буфере обмена."
-      Say "2) Вставь его в ChatGPT и скопируй обратно ТОЛЬКО JSON."
-      Say "3) Вставь JSON в in\llm_response_B_anchors.json, сохрани и запусти RUN_B.bat снова."
+      Say "Шаг 1: Открой ChatGPT."
+      Say "Шаг 2: Prompt Stage B уже в буфере обмена. Вставь его в ChatGPT."
+      Say "Шаг 3: Скопируй обратно только JSON без текста."
+      Say "Шаг 4: Вставь JSON в in\llm_response_B_anchors.json и сохрани."
+      Say "Шаг 5: Запусти RUN_B.bat снова."
       Start-Process notepad.exe -ArgumentList $prompt | Out-Null
-    } else {
-      Say "Prompt не найден: out\llm_prompt_B_anchors.txt"
-      Say "Открою summary и response для ручной диагностики."
+      Start-Process notepad.exe -ArgumentList $resp | Out-Null
       if (Test-Path $summary) { Start-Process notepad.exe -ArgumentList $summary | Out-Null }
+      exit 2
     }
 
+    Say "Ошибка Stage B: не найден out\llm_prompt_B_anchors.txt."
+    Say "Открой out\stageB_summary.txt и проверь STOP_REASON."
+    if (Test-Path $summary) { Start-Process notepad.exe -ArgumentList $summary | Out-Null }
     Start-Process notepad.exe -ArgumentList $resp | Out-Null
-    exit 2
+    exit 1
   }
 
   Say ""
