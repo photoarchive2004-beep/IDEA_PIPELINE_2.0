@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import time
 import urllib.parse
 import urllib.request
@@ -102,6 +103,7 @@ class StageB:
             "anchor_top_display": [],
             "anchor_top_search": [],
             "anchor_packs": [],
+            "anchor_packs_search": [],
             "abbreviation_map": {},
             "queries": [],
             "errors": [],
@@ -341,7 +343,56 @@ class StageB:
             packs.append([anchors[1], anchors[4]])
         packs = packs[:6]
         self.search_log["anchor_packs"] = packs
+        self.search_log["anchor_packs_search"] = packs
         return packs
+
+    def normalize_search_anchor(self, value: str) -> str:
+        val = self.translit_cyr((value or "").strip())
+        val = re.sub(r"[^A-Za-z0-9\-\s]", " ", val)
+        val = re.sub(r"\s+", " ", val).strip(" -")
+        return val
+
+    def build_seed_queries(self, search_anchors: List[str], packs: List[List[str]]) -> List[List[str]]:
+        queries: List[List[str]] = []
+        seen: Set[str] = set()
+
+        def add_query(parts: List[str]) -> None:
+            clean = []
+            for p in parts:
+                n = self.normalize_search_anchor(p)
+                if n:
+                    clean.append(n)
+            clean = clean[:3]
+            if not clean:
+                return
+            key = "|".join(clean).lower()
+            if key in seen:
+                return
+            seen.add(key)
+            queries.append(clean)
+
+        strong_single = None
+        for a in search_anchors:
+            if re.fullmatch(r"[A-Z][a-z]{3,}", a or ""):
+                strong_single = a
+                break
+        if strong_single:
+            add_query([strong_single])
+
+        for pack in packs:
+            add_query(pack[:3])
+
+        for a in search_anchors:
+            add_query([a])
+
+        if len(search_anchors) >= 3:
+            step = 2
+            i = 0
+            while i + 1 < len(search_anchors):
+                add_query(search_anchors[i:i + 2])
+                i += step
+
+        return queries[:8]
 
     def pack_query(self, pack: List[str]) -> str:
         return " ".join(pack)
@@ -506,10 +557,12 @@ class StageB:
         out.sort(key=lambda x: (-x["score"], -(x.get("cited_by_count", 0) or 0), x.get("title", "")))
         return out
 
-    def write_corpus(self, papers: List[Dict[str, Any]]) -> None:
+    def write_corpus(self, papers: List[Dict[str, Any]], allow_replace: bool) -> None:
         fields = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
         for name, rows in (("corpus_all.csv", papers), ("corpus.csv", papers[:300])):
-            with (self.out_dir / name).open("w", newline="", encoding="utf-8") as f:
+            target = self.out_dir / name
+            tmp = self.out_dir / f"{name}.tmp"
+            with tmp.open("w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fields)
                 w.writeheader()
                 for idx, p in enumerate(rows, 1):
@@ -526,6 +579,8 @@ class StageB:
                         "source_tags": ",".join(sorted(list(p.get("source_tags", set())))),
                         "url": p.get("url", ""),
                     })
+            if allow_replace and len(papers) > 0:
+                shutil.move(str(tmp), str(target))
 
     def write_prisma(self, stats: Dict[str, Any]) -> None:
         lines = [
@@ -543,18 +598,30 @@ class StageB:
 
     def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]]) -> None:
         txt = (
-            "Провал первичного поиска. Верни только JSON:\n"
+            "Ничего не найдено в OpenAlex (seed=0). Нужны новые search-anchors для латинского поиска. Верни только JSON:\n"
             "{\n"
-            "  \"cleaned_anchors\": [\"...\"],\n"
+            "  \"cleaned_search_anchors\": [\"...\"],\n"
             "  \"anchor_packs\": [[\"...\",\"...\"],[\"...\",\"...\",\"...\"]],\n"
             "  \"drift_blacklist\": [\"...\"],\n"
             "  \"abbreviation_map\": {\"ABBR\": \"Full expansion\"}\n"
             "}\n"
-            "Ограничения: 10-20 cleaned_anchors, 4-6 anchor_packs, только по теме идеи.\n"
+            "Ограничения: 8-20 cleaned_search_anchors, 4-6 anchor_packs, только латиница/цифры/дефис, без русских фраз.\n"
             f"Текущие anchors: {anchors}\n"
             f"Текущие packs: {packs}\n"
         )
         write_text(self.out_dir / "llm_prompt_B_anchors.txt", txt)
+
+    def ensure_llm_response_template(self) -> Path:
+        p = self.in_dir / "llm_response_B_anchors.json"
+        if not p.exists():
+            template = {
+                "cleaned_search_anchors": ["Phoxinus", "Balkhash", "cytochrome-b"],
+                "anchor_packs": [["Phoxinus"], ["Phoxinus", "Balkhash"], ["Phoxinus", "cytochrome-b"]],
+                "drift_blacklist": ["review", "broad survey"],
+                "abbreviation_map": {"mtDNA": "mitochondrial DNA"},
+            }
+            write_text(p, json.dumps(template, ensure_ascii=False, indent=2) + "\n")
+        return p
 
     def load_llm_anchor_response(self) -> Dict[str, Any]:
         p = self.in_dir / "llm_response_B_anchors.json"
@@ -566,7 +633,7 @@ class StageB:
         except Exception:
             return {}
 
-    def write_summary(self, stats: Dict[str, Any], used_europe: bool, wait_llm: bool) -> None:
+    def write_summary(self, stats: Dict[str, Any], used_europe: bool, wait_llm: bool, used_user_response: bool, corpus_updated: bool) -> None:
         lines = [
             "Stage B: сбор корпуса литературы завершен." if not wait_llm else "Stage B: требуется дополнительная очистка якорей.",
             f"Идея: {self.idea_dir.name}",
@@ -587,12 +654,18 @@ class StageB:
             f"Диагностика: {self.out_dir / 'search_log_B.json'}",
             f"Текстовый лог: {self.out_dir / 'runB.log'}",
         ]
+        if used_user_response:
+            lines.append("Использован ответ пользователя из in/llm_response_B_anchors.json.")
         if self.query_snippets:
             lines.append("Первые 3 выполненных запроса:")
             for q in self.query_snippets[:3]:
-                lines.append(f"- {q['query_text']} -> {q['result_total']}")
+                lines.append(f"- {q['query_text']} → {q['result_total']}")
         if stats.get("seed_count", 0) == 0:
             lines.append("Seed=0: включён безопасный план Б (якоря от языковой модели), проверь термины поиска.")
+            lines.append(f"Ничего не найдено (seed=0). Этап B остановлен и ждёт файл: {self.in_dir / 'llm_response_B_anchors.json'}")
+            lines.append("Открой файл out\\llm_prompt_B_anchors.txt, вставь его в ChatGPT, ответ сохрани в in\\llm_response_B_anchors.json, затем запусти RUN_B ещё раз.")
+        if not corpus_updated:
+            lines.append("Корпус не обновлялся, т.к. final_count == 0.")
         if wait_llm:
             lines += [
                 f"Создан prompt: {self.out_dir / 'llm_prompt_B_anchors.txt'}",
@@ -616,9 +689,9 @@ class StageB:
         ok, idea_text = self.ensure_idea_text()
         if not ok:
             self.search_log["errors"].append(idea_text)
-            self.write_corpus([])
+            self.write_corpus([], allow_replace=False)
             self.write_prisma({})
-            self.write_summary({}, used_europe=False, wait_llm=False)
+            self.write_summary({}, used_europe=False, wait_llm=False, used_user_response=False, corpus_updated=False)
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
             return 0
 
@@ -627,13 +700,19 @@ class StageB:
         packs = self.build_anchor_packs(search_anchors)
 
         llm = self.load_llm_anchor_response()
-        if llm.get("cleaned_anchors") and llm.get("anchor_packs"):
-            search_anchors = [a for a in llm.get("cleaned_anchors", []) if isinstance(a, str)][:20]
-            display_anchors = display_anchors[:20]
-            packs = [p for p in llm.get("anchor_packs", []) if isinstance(p, list) and len(p) >= 2][:6]
+        used_user_response = False
+        llm_anchors = llm.get("cleaned_search_anchors")
+        if llm_anchors and llm.get("anchor_packs") and isinstance(llm_anchors, list):
+            search_anchors = [self.normalize_search_anchor(a) for a in llm_anchors if isinstance(a, str)]
+            search_anchors = [a for a in search_anchors if a][:20]
+            packs = [[self.normalize_search_anchor(x) for x in p[:3] if isinstance(x, str)] for p in llm.get("anchor_packs", []) if isinstance(p, list)]
+            packs = [[x for x in p if x] for p in packs if len([x for x in p if x]) >= 1][:6]
             ab_map.update({k: v for k, v in (llm.get("abbreviation_map", {}) or {}).items() if isinstance(k, str) and isinstance(v, str)})
             self.search_log["abbreviation_map"] = ab_map
             self.abbr_full_map = dict(ab_map)
+            self.search_log["anchor_top_search"] = search_anchors[:20]
+            self.search_log["anchor_packs_search"] = packs
+            used_user_response = True
 
         seed_rows: List[Dict[str, Any]] = []
         used_queries = 0
@@ -641,23 +720,14 @@ class StageB:
         if self.offline_fixtures:
             seed_rows = self.load_fixture()
         else:
-            for p in packs[:6]:
+            for p in self.build_seed_queries(search_anchors, packs):
+                used_queries += 1
                 try:
                     rows, _ = self.openalex_search_pack(p)
                     seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
-                    used_queries += 1
                 except Exception as e:
                     self.search_log["service_status"]["openalex"] = "degraded"
                     self.search_log["errors"].append(f"openalex_seed_error: {e}")
-            if len(seed_rows) == 0:
-                broad_pack = search_anchors[:10]
-                if broad_pack:
-                    try:
-                        rows, _ = self.openalex_search_pack(broad_pack)
-                        seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
-                        used_queries += 1
-                    except Exception as e:
-                        self.search_log["errors"].append(f"openalex_fallback_error: {e}")
 
         # abbreviation policy: only after strong seed and explicit expansion
         if len(seed_rows) >= 30:
@@ -697,8 +767,9 @@ class StageB:
                     drifted += 1
             filtered_drift_share = drifted / len(ranked)
 
-        if (need_llm or filtered_drift_share > 0.4) and not llm and not self.offline_fixtures:
+        if (need_llm and not self.offline_fixtures) or ((filtered_drift_share > 0.4) and not llm and not self.offline_fixtures):
             self.write_llm_anchor_prompt(search_anchors[:20], packs[:6])
+            response_path = self.ensure_llm_response_template()
             stats = {
                 "seed_queries": min(used_queries, 8),
                 "seed_count": len(seed_rows),
@@ -709,14 +780,19 @@ class StageB:
                 "final_count": len(ranked),
                 "elapsed_ms": int((time.time() - t0) * 1000),
             }
+            stop_msg = f"Ничего не найдено (seed=0). Этап B остановлен и ждёт файл: {response_path}"
+            next_msg = "Открой файл out\\llm_prompt_B_anchors.txt, вставь его в ChatGPT, ответ сохрани в in\\llm_response_B_anchors.json, затем запусти RUN_B ещё раз."
+            print(stop_msg)
+            print(next_msg)
             self.search_log["stats"] = stats
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
-            self.write_corpus(ranked)
+            self.write_corpus(ranked, allow_replace=False)
             self.write_prisma(stats)
-            self.write_summary(stats, used_europe=False, wait_llm=True)
+            self.write_summary(stats, used_europe=False, wait_llm=True, used_user_response=used_user_response, corpus_updated=False)
             return 2
 
-        self.write_corpus(ranked)
+        corpus_updated = len(ranked) > 0
+        self.write_corpus(ranked, allow_replace=corpus_updated)
         stats = {
             "seed_queries": min(used_queries, 8),
             "seed_count": len(seed_rows),
@@ -730,7 +806,7 @@ class StageB:
         self.search_log["stats"] = stats
         self.search_log["finished_at"] = now_iso()
         self.write_prisma(stats)
-        self.write_summary(stats, used_europe=False, wait_llm=False)
+        self.write_summary(stats, used_europe=False, wait_llm=False, used_user_response=used_user_response, corpus_updated=corpus_updated)
         write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
         self.log("Stage B done")
         return 0
