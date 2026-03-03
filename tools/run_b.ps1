@@ -116,17 +116,28 @@ try {
   if ($rc -eq 2) {
     $prompt = Find-Prompt (Join-Path $IdeaDir "out")
     $resp = Join-Path $IdeaDir "in\llm_response_B_anchors.json"
+    $summary = Join-Path $IdeaDir "out\stageB_summary.txt"
+    $stopReason = ""
+    if (Test-Path $summary) {
+      $match = Select-String -LiteralPath $summary -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
+      if ($match) { $stopReason = $match.Matches[0].Groups[1].Value.Trim() }
+    }
     if (-not (Test-Path $resp)) { New-Item -ItemType File -Force -Path $resp | Out-Null }
 
     Say ""
-    Say "Нужен ChatGPT (1 раз) для Stage B:"
-    Say "1) Откроются prompt и файл ответа."
-    Say "2) Prompt уже в буфере обмена (Ctrl+V в ChatGPT)."
-    Say "3) Скопируй только JSON-ответ."
-    Say "4) Вставь JSON в in\llm_response_B_anchors.json и сохрани."
-    Say "5) Запусти RUN_B.bat ещё раз."
+    if ($stopReason -eq "llm_already_used_need_edit") {
+      Say "Второй запрос в ChatGPT не делаем."
+      Say "Отредактируй in\llm_response_B_anchors.json и запусти RUN_B.bat снова."
+    } else {
+      Say "Нужен ChatGPT (1 раз) для Stage B:"
+      Say "1) Откроются prompt и файл ответа."
+      Say "2) Prompt уже в буфере обмена (Ctrl+V в ChatGPT)."
+      Say "3) Скопируй только JSON-ответ."
+      Say "4) Вставь JSON в in\llm_response_B_anchors.json и сохрани."
+      Say "5) Запусти RUN_B.bat ещё раз."
+    }
 
-    if ($prompt) {
+    if ($prompt -and $stopReason -ne "llm_already_used_need_edit") {
       Set-Clipboard -Value (Get-Content -Raw -LiteralPath $prompt)
       Start-Process notepad.exe -ArgumentList $prompt | Out-Null
     }

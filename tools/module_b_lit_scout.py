@@ -234,21 +234,23 @@ class StageB:
             "llm_used": False,
             "auto_fix_rounds_used": 0,
             "drift_target": self.drift_target,
-            "config_seed_queries_max": SEED_QUERIES_MAX,
-            "config_seed_queries_min_alive": SEED_QUERIES_MIN_ALIVE,
-            "config_max_per_query": MAX_PER_QUERY,
-            "config_max_seed_items_total": MAX_SEED_ITEMS_TOTAL,
-            "config_auto_fix_rounds": AUTO_FIX_ROUNDS,
-            "config_drift_target": DRIFT_TARGET,
-            "config_drift_hard_stop": DRIFT_HARD_STOP,
-            "config_primary_signal_min": PRIMARY_SIGNAL_MIN,
-            "config_topn_for_metrics": TOPN_FOR_METRICS,
-            "config_llm_budget_per_run": LLM_BUDGET_PER_RUN,
-            "config_citation_chase_enable": CITATION_CHASE_ENABLE,
-            "config_citation_topk": CITATION_TOPK,
-            "config_citation_max_add": CITATION_MAX_ADD,
-            "config_citation_per_seed_cap": CITATION_PER_SEED_CAP,
-            "config_stopword_list_en_ru_size": len(STOPWORD_LIST_EN_RU),
+            "config": {
+                "SEED_QUERIES_MAX": SEED_QUERIES_MAX,
+                "SEED_QUERIES_MIN_ALIVE": SEED_QUERIES_MIN_ALIVE,
+                "MAX_PER_QUERY": MAX_PER_QUERY,
+                "MAX_SEED_ITEMS_TOTAL": MAX_SEED_ITEMS_TOTAL,
+                "AUTO_FIX_ROUNDS": AUTO_FIX_ROUNDS,
+                "DRIFT_TARGET": DRIFT_TARGET,
+                "DRIFT_HARD_STOP": DRIFT_HARD_STOP,
+                "PRIMARY_SIGNAL_MIN": PRIMARY_SIGNAL_MIN,
+                "TOPN_FOR_METRICS": TOPN_FOR_METRICS,
+                "LLM_BUDGET_PER_RUN": LLM_BUDGET_PER_RUN,
+                "CITATION_CHASE_ENABLE": CITATION_CHASE_ENABLE,
+                "CITATION_TOPK": CITATION_TOPK,
+                "CITATION_MAX_ADD": CITATION_MAX_ADD,
+                "CITATION_PER_SEED_CAP": CITATION_PER_SEED_CAP,
+                "STOPWORD_LIST_EN_RU_SIZE": len(STOPWORD_LIST_EN_RU),
+            },
         }
 
     def archive_previous_outputs(self) -> None:
@@ -849,6 +851,7 @@ class StageB:
             probe_map[tok] = {
                 "token": tok,
                 "result_total": total,
+                "total": total,
                 "elapsed_ms": elapsed,
                 "category": category,
                 "decision": decision,
@@ -970,6 +973,10 @@ class StageB:
         self.search_log["planned_queries_detail"] = [q for q in queries if q["query_text"] in good][:SEED_QUERIES_MAX]
         return good[:SEED_QUERIES_MAX]
 
+
+    def plan_seed_queries(self, keywords_for_search: List[str], search_anchors: List[str], packs: List[List[str]], primary_token: str, source_terms: List[str], source_mode: str, probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
+        return self.build_seed_queries(keywords_for_search, search_anchors, packs, primary_token, source_terms, source_mode, probe_map)
+
     def validate_seed_queries(self, queries: List[str], probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
         alive: List[str] = []
         ok_tokens = [x["token"] for x in self.search_log.get("token_probe", []) if x.get("category") in {"OK", "NARROW"}]
@@ -1019,6 +1026,7 @@ class StageB:
                     "query_text": query,
                     "anchor_pack_used": [query],
                     "result_total": total,
+                    "total": total,
                     "result_items": len(items),
                 })
             if len(self.query_snippets) < 3:
@@ -1583,7 +1591,7 @@ class StageB:
             "|---|---:|---:|---:|",
         ]
         for q in rows:
-            lines.append(f"| {q.get('query_text','')} | {q.get('result_total',0)} | {MAX_PER_QUERY} | {q.get('items_added',0)} |")
+            lines.append(f"| {q.get('query_text','')} | {q.get('result_total',0)} | {q.get('cap_used', MAX_PER_QUERY)} | {q.get('items_added',0)} |")
         lines += [
             "",
             "## Token probe",
@@ -1591,19 +1599,22 @@ class StageB:
             "|---|---:|---|---|",
         ]
         for t in self.search_log.get("token_probe", []):
-            lines.append(f"| {t.get('token','')} | {t.get('result_total',0)} | {t.get('category','')} | {t.get('decision','')} |")
+            lines.append(f"| {t.get('token','')} | {t.get('total', t.get('result_total',0))} | {t.get('category','')} | {t.get('decision','')} |")
         lines += [
             "",
+            "## GO and metrics",
+            f"- go_nogo: {stats.get('go_nogo', '')}",
+            f"- drift_round0: {stats.get('drift_round0', '')}",
+            f"- drift_round1: {stats.get('drift_round1', '')}",
+            f"- drift_round2: {stats.get('drift_round2', '')}",
+            "",
             "## Final counts",
-            f"- seed_candidates: {stats.get('seed_count', 0)}",
+            f"- seed_count: {stats.get('seed_count', 0)}",
+            f"- total_candidates: {stats.get('total_candidates', 0)}",
             f"- dedup_after: {self.search_log.get('stats', {}).get('dedup_after', 0)}",
             f"- main_count: {stats.get('main_count', 0)}",
             f"- support_count: {stats.get('support_count', 0)}",
             f"- low_count: {stats.get('low_count', 0)}",
-            f"- drift_round0: {stats.get('drift_round0', '')}",
-            f"- drift_round1: {stats.get('drift_round1', '')}",
-            f"- drift_round2: {stats.get('drift_round2', '')}",
-            f"- go_nogo: {stats.get('go_nogo', '')}",
         ]
         write_text(self.out_dir / "search_strategy_B.md", "\n".join(lines) + "\n")
 
@@ -1635,11 +1646,11 @@ class StageB:
             *[f"- {q.get('query_text','')} → {q.get('result_total', 0)}" for q in s2_q],
             "",
             "## Token probe",
-            *[f"- {i.get('token','')}: total={i.get('result_total',0)}, category={i.get('category','')}, decision={i.get('decision','')}" for i in self.search_log.get('token_probe', [])],
+            *[f"- {i.get('token','')}: total={i.get('total', i.get('result_total',0))}, category={i.get('category','')}, decision={i.get('decision','')}" for i in self.search_log.get('token_probe', [])],
             "",
             "## Query planning",
             *[f"- planned: {q}" for q in self.search_log.get('planned_queries', [])],
-            *[f"- rejected: {q.get('query','')} ({q.get('reason','')})" for q in self.search_log.get('rejected_queries', [])],
+            *[f"- rejected: {q.get('query_text','')} ({q.get('reason','')})" for q in self.search_log.get('rejected_queries', [])],
         ]
         if unresolved:
             lines += ["", "## Нераскрытые аббревиатуры", *[f"- {ab}" for ab in unresolved]]
@@ -1847,7 +1858,7 @@ class StageB:
             lines.append(f"LLM budget used: {self.llm_prompts_created}/{self.llm_budget}")
             if stop_reason == "llm_already_used_need_edit":
                 lines.append("второго запроса в ChatGPT не будет, отредактируй in/llm_response_B_anchors.json")
-        write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines[:40]) + "\n")
+        write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines) + "\n")
 
     def round_metrics(self, round_id: int, drift_score: float, planned_queries_count: int, passed: List[Dict[str, Any]], support: List[Dict[str, Any]], ranked: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {
@@ -1872,7 +1883,10 @@ class StageB:
         write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
         self.write_prisma(stats)
         self.write_summary(stats, wait_llm=True, stop_reason=stop_reason)
-        print(f"Этап B остановлен ({stop_reason}) и ждёт файл: {response_path}")
+        if stop_reason == "llm_already_used_need_edit":
+            print("Второй запрос в ChatGPT не делаем. Отредактируй in/llm_response_B_anchors.json и запусти RUN_B снова.")
+        else:
+            print(f"Этап B остановлен ({stop_reason}) и ждёт файл: {response_path}")
         return 2
 
     def load_fixture(self) -> List[Dict[str, Any]]:
@@ -2000,7 +2014,7 @@ class StageB:
 
         seed_rows: List[Dict[str, Any]] = []
         used_queries = 0
-        seed_query_list = self.build_seed_queries(keywords_for_search, search_anchors, packs, primary_token, source_terms, source_mode, probe_map)
+        seed_query_list = self.plan_seed_queries(keywords_for_search, search_anchors, packs, primary_token, source_terms, source_mode, probe_map)
         seed_query_list = self.validate_seed_queries(seed_query_list, probe_map)
 
         if not seed_query_list and not self.offline_fixtures:
@@ -2016,7 +2030,7 @@ class StageB:
                 try:
                     rows, total = self.openalex_search_pack(q)
                     rows = rows[:MAX_PER_QUERY]
-                    self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "cap_used": MAX_PER_QUERY, "items_added": len(rows), "round": 0})
+                    self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "total": total, "cap_used": MAX_PER_QUERY, "items_added": len(rows), "round": 0})
                     seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
                     if len(seed_rows) >= MAX_SEED_ITEMS_TOTAL:
                         seed_rows = seed_rows[:MAX_SEED_ITEMS_TOTAL]
@@ -2079,7 +2093,7 @@ class StageB:
                         try:
                             rows, total = self.openalex_search_pack(q)
                             rows = rows[:MAX_PER_QUERY]
-                            self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "cap_used": MAX_PER_QUERY, "items_added": len(rows), "round": round_id})
+                            self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "total": total, "cap_used": MAX_PER_QUERY, "items_added": len(rows), "round": round_id})
                             seed_rows_round.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
                             if len(seed_rows_round) >= MAX_SEED_ITEMS_TOTAL:
                                 seed_rows_round = seed_rows_round[:MAX_SEED_ITEMS_TOTAL]
