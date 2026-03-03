@@ -43,6 +43,10 @@ CYR_MAP = {
     "э": "e", "ю": "yu", "я": "ya",
 }
 
+GEO_HINTS = {
+    "altai", "altaya", "kazakhstan", "siberia", "mongolia", "china", "russia", "balkhash", "ural", "volga",
+}
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -95,6 +99,7 @@ class StageB:
         self.run_log = self.out_dir / "runB.log"
         self.search_log_path = self.out_dir / "search_log_B.json"
         self.module_log = self.logs_dir / f"moduleB_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.run_id = f"B_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         repo = self.idea_dir.parents[1]
         self.secrets = parse_env(repo / "config" / "secrets.env")
@@ -103,6 +108,7 @@ class StageB:
 
         self.session = requests.Session() if requests else None
         self.search_log: Dict[str, Any] = {
+            "run_id": self.run_id,
             "started_at": now_iso(),
             "mode": self.mode,
             "anchor_candidates": [],
@@ -125,6 +131,22 @@ class StageB:
         self.abbr_full_map: Dict[str, str] = {}
         self.abbr_mentions: Set[str] = set()
         self.query_snippets: List[Dict[str, Any]] = []
+
+    def archive_previous_outputs(self) -> None:
+        run_dir = self.out_dir / "_runs" / self.run_id
+        prev_dir = run_dir / "_prev"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        move_targets = {
+            "corpus.csv", "corpus_all.csv", "search_log_B.json", "stageB_summary.txt", "prisma_lite_B.md", "runB.log", "llm_prompt_B_anchors.txt",
+        }
+        for item in self.out_dir.iterdir():
+            if item.name == "_runs":
+                continue
+            is_strategy = item.is_file() and re.fullmatch(r"search_strategy.*\.md", item.name)
+            is_cache = item.name in {"cache_openalex", "cache_semanticscholar"}
+            if item.name in move_targets or is_strategy or is_cache:
+                prev_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(item), str(prev_dir / item.name))
 
     def log(self, msg: str) -> None:
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -358,11 +380,24 @@ class StageB:
         val = re.sub(r"\s+", " ", val).strip(" -")
         return val
 
-    def load_keywords_for_search(self, structured: Dict[str, Any]) -> List[str]:
+    def keyword_fallback(self, idea_text: str, structured: Dict[str, Any]) -> List[str]:
+        src = structured.get("structured_idea", structured) if isinstance(structured, dict) else {}
+        for key in ("search_queries", "key_terms"):
+            val = src.get(key) if isinstance(src, dict) else None
+            if isinstance(val, list):
+                out = [re.sub(r"\s+", " ", str(x).strip()) for x in val if isinstance(x, str) and str(x).strip()]
+                if out:
+                    return out[:20]
+        latin_like = re.findall(r"\b(?=[A-Za-z0-9\-]{4,}\b)(?=.*[A-Za-z])[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\b", idea_text)
+        cyr_names = re.findall(r"\b[А-ЯЁ][а-яё]{3,}\b", idea_text)
+        out = list(dict.fromkeys(latin_like + [self.translit_cyr(x) for x in cyr_names]))
+        return [x for x in out if x and len(x) >= 4][:20]
+
+    def get_keywords_for_search(self, idea_text: str, structured: Dict[str, Any]) -> Tuple[List[str], bool]:
         src = structured.get("structured_idea", structured) if isinstance(structured, dict) else {}
         raw = src.get("keywords_for_search") if isinstance(src, dict) else None
         if not isinstance(raw, list):
-            return []
+            return self.keyword_fallback(idea_text, structured), False
         cleaned: List[str] = []
         for item in raw:
             if not isinstance(item, str):
@@ -370,7 +405,9 @@ class StageB:
             q = re.sub(r"\s+", " ", item.strip())
             if q:
                 cleaned.append(q)
-        return cleaned[:20]
+        if not cleaned:
+            return self.keyword_fallback(idea_text, structured), False
+        return cleaned[:20], True
 
     def build_boolean_query(self, terms: List[str]) -> str:
         uniq = [self.normalize_search_anchor(x) for x in terms if self.normalize_search_anchor(x)]
@@ -393,7 +430,11 @@ class StageB:
             if len(query) > 120 or len(terms) > 8:
                 bad.append(f"Слишком длинная строка: {query}")
                 continue
-            if re.fullmatch(r"[A-Z][a-z]{3,}", query) and not re.search(r"\d", query):
+            qtokens = [x.lower() for x in re.findall(r"[A-Za-z0-9\-]+", query)]
+            if len(qtokens) == 1 and qtokens[0] in GEO_HINTS:
+                bad.append(f"Geo-only запрос запрещён: {query}")
+                continue
+            if re.fullmatch(r"[A-Z][a-z]{3,}", query) and not re.search(r"\d", query) and qtokens and qtokens[0] in GEO_HINTS:
                 bad.append(f"Похоже на geo-only или одиночный термин: {query}")
                 continue
             if " AND " in query and " OR " not in query and query.count("AND") >= 2:
@@ -409,6 +450,17 @@ class StageB:
         queries: List[str] = []
         seen: Set[str] = set()
 
+        tokens: List[str] = []
+        for kw in keywords_for_search:
+            short = re.sub(r"[\"']", "", kw)
+            if len(short) > 160:
+                short = " ".join(re.findall(r"[A-Za-z0-9\-]{4,}", short)[:3])
+            tokens.extend(re.findall(r"[A-Za-z0-9\-]{3,}", short))
+        unique_tokens = [t for t in dict.fromkeys(tokens) if len(t) >= 3][:24]
+        object_term = unique_tokens[0] if unique_tokens else (search_anchors[0] if search_anchors else "")
+        method_terms = [t for t in unique_tokens if re.search(r"\d", t) or "-" in t or t.lower() in {"baypass", "lfmm2", "ddrad", "snp", "abba-baba", "hydrorivers", "hydroatlas"}][:4]
+        phenomenon_terms = [t for t in unique_tokens if t.lower() in {"adaptation", "gene", "flow", "genomics", "environment", "association", "riverscape"}][:4]
+
         def add_query(q: str) -> None:
             query = re.sub(r"\s+", " ", q.strip())
             key = query.lower()
@@ -417,12 +469,15 @@ class StageB:
             seen.add(key)
             queries.append(query)
 
-        for kw in keywords_for_search:
-            terms = [self.normalize_search_anchor(x) for x in re.split(r"[,:;]", kw)]
-            terms = [x for x in terms if x]
-            if not terms:
-                terms = [self.normalize_search_anchor(x) for x in kw.split() if len(x) >= 4][:3]
-            add_query(self.build_boolean_query(terms[:3]))
+        if object_term:
+            add_query(self.normalize_search_anchor(object_term))
+        for m in method_terms[:3]:
+            add_query(self.build_boolean_query([object_term, m]))
+        for p in phenomenon_terms[:2]:
+            add_query(self.build_boolean_query([object_term, p]))
+        for m in method_terms[:2]:
+            for p in phenomenon_terms[:2]:
+                add_query(self.build_boolean_query([m, p]))
 
         if not queries:
             for pack in packs:
@@ -687,6 +742,7 @@ class StageB:
         lines = [
             "Stage B: сбор корпуса литературы завершен." if not wait_llm else "Stage B: требуется дополнительная очистка якорей.",
             f"Идея: {self.idea_dir.name}",
+            f"run_id: {self.run_id}",
             f"Режим: {self.mode}",
             f"seed_queries: {stats.get('seed_queries', 0)}",
             f"seed_count: {stats.get('seed_count', 0)}",
@@ -696,6 +752,7 @@ class StageB:
             f"Количество после дедупликации: {stats.get('dedup_count', 0)}",
             f"final_count: {stats.get('final_count', 0)}",
             f"elapsed: {stats.get('elapsed_ms', 0)} мс",
+            f"drift_score: {stats.get('drift_score', 0)}",
             "Europe PubMed Central (PMC) не использовался: тема не определена как биомедицинская по быстрому признаку." if not used_europe else "Europe PubMed Central (PMC) использован из-за биомедицинского профиля.",
             f"Статус OpenAlex: {self.search_log['service_status']['openalex']}",
             f"Статус Semantic Scholar: {self.search_log['service_status']['semantic_scholar']}",
@@ -736,6 +793,7 @@ class StageB:
 
     def run(self) -> int:
         t0 = time.time()
+        self.archive_previous_outputs()
         self.log("Stage B start")
         self.log(f"Secrets: OPENALEX_MAILTO={'***' if self.mailto else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
 
@@ -750,7 +808,10 @@ class StageB:
 
         structured = self.load_structured()
         display_anchors, search_anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
-        keywords_for_search = self.load_keywords_for_search(structured)
+        keywords_for_search, keywords_used = self.get_keywords_for_search(idea_text, structured)
+        self.search_log["keywords_for_search_used"] = keywords_used
+        self.search_log["keywords_for_search_count"] = len(keywords_for_search)
+        self.search_log["keywords_for_search_preview"] = keywords_for_search[:5]
         packs = self.build_anchor_packs(search_anchors)
 
         llm = self.load_llm_anchor_response()
@@ -776,7 +837,7 @@ class StageB:
             self.search_log["errors"].append("query_preflight: нет валидных seed-запросов")
             self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "нет валидных seed-запросов после самопроверки")
             response_path = self.ensure_llm_response_template()
-            stats = {"seed_queries": 0, "seed_count": 0, "expanded_count": 0, "semanticscholar_count": 0, "crossref_count": 0, "dedup_count": 0, "final_count": 0, "elapsed_ms": int((time.time() - t0) * 1000)}
+            stats = {"seed_queries": 0, "seed_count": 0, "expanded_count": 0, "semanticscholar_count": 0, "crossref_count": 0, "dedup_count": 0, "final_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000), "stop_reason": "невалидные поисковые строки"}
             self.search_log["stats"] = stats
             self.search_log["finished_at"] = now_iso()
             self.write_corpus([], allow_replace=False)
@@ -817,7 +878,7 @@ class StageB:
         if not need_llm and not self.offline_fixtures:
             for p in packs[:2]:
                 semantic_rows.extend(self.semantic_scholar_search(p))
-            recommend_rows = self.semantic_recommend(seed_rows)
+            self.search_log["service_status"]["semantic_scholar"] = "degraded"
             expanded = self.expand_openalex(seed_rows, packs)
 
         if len(seed_rows) < 20:
@@ -827,20 +888,22 @@ class StageB:
         crossref_count = self.crossref_enrich(merged) if not self.offline_fixtures else 0
         ranked = self.score(merged, search_anchors, packs)
 
-        # drift estimation: first N rows must match at least one pack or keyword
-        if ranked:
+        # drift estimation: first N rows must match object term or >=2 keyword tokens
+        if seed_rows:
             drifted = 0
-            sample = ranked[:50]
+            sample = seed_rows[:100]
+            object_term = self.normalize_search_anchor(seed_query_list[0] if seed_query_list else "").lower()
+            token_pool = [self.normalize_search_anchor(x).lower() for x in keywords_for_search][:20]
             for p in sample:
                 txt = (p.get("title", "") + " " + p.get("venue", "")).lower()
-                pack_ok = any(sum(1 for a in pack if a.lower() in txt) >= 1 for pack in packs[:6])
-                kw_ok = any(self.normalize_search_anchor(k).lower() in txt for k in keywords_for_search[:8] if self.normalize_search_anchor(k))
-                if not (pack_ok or kw_ok):
+                object_ok = bool(object_term) and object_term in txt
+                tok_hits = sum(1 for tok in token_pool if tok and tok in txt)
+                if not (object_ok or tok_hits >= 2):
                     drifted += 1
             filtered_drift_share = drifted / max(len(sample), 1)
 
         drift_stop = filtered_drift_share > 0.7
-        if (need_llm and not self.offline_fixtures) or (drift_stop and not llm and not self.offline_fixtures):
+        if (need_llm and not self.offline_fixtures) or (drift_stop and not self.offline_fixtures):
             reason = "seed=0" if need_llm else f"сильный дрейф темы: доля нерелевантных {round(filtered_drift_share * 100,1)}%"
             self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason)
             response_path = self.ensure_llm_response_template()
@@ -852,12 +915,14 @@ class StageB:
                 "crossref_count": crossref_count,
                 "dedup_count": len(merged),
                 "final_count": len(ranked),
+                "drift_score": round(filtered_drift_share, 4),
                 "elapsed_ms": int((time.time() - t0) * 1000),
             }
-            stop_msg = f"Ничего не найдено (seed=0). Этап B остановлен и ждёт файл: {response_path}"
+            stop_msg = f"Этап B остановлен ({reason}) и ждёт файл: {response_path}"
             next_msg = "Открой файл out\\llm_prompt_B_anchors.txt, вставь его в ChatGPT, ответ сохрани в in\\llm_response_B_anchors.json, затем запусти RUN_B ещё раз."
             print(stop_msg)
             print(next_msg)
+            stats["stop_reason"] = reason
             self.search_log["stats"] = stats
             self.search_log["finished_at"] = now_iso()
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
@@ -876,6 +941,7 @@ class StageB:
             "crossref_count": crossref_count,
             "dedup_count": len(merged),
             "final_count": len(ranked),
+            "drift_score": round(filtered_drift_share, 4),
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
         self.search_log["stats"] = stats
