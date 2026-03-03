@@ -37,6 +37,15 @@ GENERIC_TOKEN_BLACKLIST = {
     "метод", "модель", "данные", "результаты", "результат", "обзор", "исследование", "подход",
 }
 
+GENERIC_WORDS = GENERIC_TOKEN_BLACKLIST | {
+    "models", "methods", "methodology", "paper", "dataset", "datasets", "genomic", "genomics",
+    "population", "populations", "algorithm", "framework", "review", "case", "cases", "science",
+}
+
+DATASET_DOMAIN_HINTS = {
+    "gbif.org", "zenodo.org", "figshare.com", "dryad", "datadryad", "pangaea", "kaggle.com",
+}
+
 SERVICE_LABELS = {
     "openalex": "OpenAlex",
     "semantic_scholar": "Semantic Scholar",
@@ -138,6 +147,9 @@ class StageB:
         self.abbr_full_map: Dict[str, str] = {}
         self.abbr_mentions: Set[str] = set()
         self.query_snippets: List[Dict[str, Any]] = []
+        self.dedup_before = 0
+        self.dedup_after = 0
+        self.dedup_merged_count = 0
 
     def archive_previous_outputs(self) -> None:
         run_dir = self.out_dir / "_runs" / self.run_id
@@ -279,7 +291,7 @@ class StageB:
             if ab not in self.abbr_mentions:
                 return ab
             full = self.abbr_full_map.get(ab)
-            return f"{full} ({ab})" if full else f"аббревиатура не раскрыта: {ab}"
+            return f"{full} ({ab})" if full else ab
         return re.sub(r"\b[A-Z]{2,6}\b", repl, text)
 
     def extract_abbr(self, text: str) -> Dict[str, str]:
@@ -292,6 +304,41 @@ class StageB:
 
     def tokenized(self, s: str) -> List[str]:
         return [t for t in re.split(r"[^A-Za-zА-Яа-я0-9\-]+", s.lower()) if t]
+
+    def is_geography_token(self, token: str) -> bool:
+        return token.lower() in GEO_HINTS
+
+    def token_strength(self, token: str) -> int:
+        t = token.strip()
+        if len(t) < 4:
+            return -99
+        score = 0
+        if re.search(r"\d", t):
+            score += 2
+        if re.search(r"[a-z]", t) and re.search(r"[A-Z]", t):
+            score += 2
+        if "-" in t:
+            score += 2
+        if len(t) >= 7:
+            score += 2
+        if t.lower() in GENERIC_WORDS:
+            score -= 3
+        if self.is_geography_token(t):
+            score -= 3
+        return score
+
+    def extract_strong_tokens(self, lines: List[str], limit: int = 40) -> List[str]:
+        weighted: Dict[str, int] = {}
+        for line in lines:
+            for tok in re.findall(r"[A-Za-z0-9\-]{4,}", self.normalize_search_anchor(line)):
+                tl = tok.lower()
+                if tl in EN_STOP or tl in RU_STOP:
+                    continue
+                sc = self.token_strength(tok)
+                if tl not in weighted or sc > weighted[tl]:
+                    weighted[tl] = sc
+        ranked = sorted(weighted.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+        return [t for t, _ in ranked[:limit]]
 
     def is_bad_anchor(self, a: str) -> Optional[str]:
         x = a.strip()
@@ -386,18 +433,48 @@ class StageB:
         self.search_log["anchor_top_search"] = search_top[:20]
         return top[:20], search_top[:20], ab_map, all_abbr
 
-    def build_anchor_packs(self, anchors: List[str]) -> List[List[str]]:
+    def build_anchor_packs(self, primary_token: str, keywords_tokens: List[str], user_packs: Optional[List[List[str]]] = None) -> List[List[str]]:
+        if user_packs:
+            cleaned: List[List[str]] = []
+            for pack in user_packs:
+                terms = [self.normalize_search_anchor(t).lower() for t in pack if isinstance(t, str)]
+                terms = [t for t in terms if t and t.lower() not in GENERIC_WORDS]
+                if len(terms) >= 2 and not all(self.is_geography_token(t) for t in terms):
+                    cleaned.append(terms[:3])
+            packs = cleaned[:6]
+            self.search_log["anchor_packs"] = packs
+            self.search_log["anchor_packs_search"] = packs
+            return packs
+
+        candidates = [t for t in keywords_tokens if t and t.lower() not in GENERIC_WORDS]
+        method_vocab = {"lfmm2", "baypass", "ddrad", "snp", "hydrorivers", "hydroatlas", "abba-baba", "genotype", "environment"}
+        phenomenon_vocab = {"adaptation", "gene", "flow", "geneflow", "riverscape", "association", "introgression", "selection"}
+        method_token = next((t for t in candidates if t in method_vocab or re.search(r"\d", t) or "-" in t), "")
+        context_token = next((t for t in candidates if t not in {primary_token, method_token} and not self.is_geography_token(t)), "")
+        phenomenon_token = next((t for t in candidates if t in phenomenon_vocab and t not in {primary_token, method_token}), "")
+        if not phenomenon_token:
+            phenomenon_token = next((t for t in candidates if t not in {primary_token, method_token, context_token}), "")
+
         packs: List[List[str]] = []
-        idx = 0
-        while idx < len(anchors) and len(packs) < 6:
-            pack = anchors[idx:idx + 3]
-            if len(pack) >= 2:
-                packs.append(pack)
-            idx += 3
-        if len(packs) < 4 and len(anchors) >= 8:
-            packs.append([anchors[0], anchors[3]])
-            packs.append([anchors[1], anchors[4]])
-        packs = packs[:6]
+        for proto in [
+            [primary_token, method_token],
+            [primary_token, context_token],
+            [primary_token, phenomenon_token],
+            [method_token, phenomenon_token],
+            [primary_token, method_token, phenomenon_token],
+            [primary_token, context_token, phenomenon_token],
+        ]:
+            terms = [t for t in proto if t]
+            terms = [t for t in dict.fromkeys(terms) if t.lower() not in GENERIC_WORDS]
+            if len(terms) < 2:
+                continue
+            if all(self.is_geography_token(t) for t in terms):
+                continue
+            if terms not in packs:
+                packs.append(terms)
+            if len(packs) >= 6:
+                break
+
         self.search_log["anchor_packs"] = packs
         self.search_log["anchor_packs_search"] = packs
         return packs
@@ -438,28 +515,27 @@ class StageB:
         return cleaned[:20], True
 
     def extract_keywords_tokens(self, keywords_for_search: List[str]) -> List[str]:
-        tokens: List[str] = []
-        for kw in keywords_for_search:
-            raw_tokens = re.findall(r"[A-Za-z0-9\-]{4,}", self.normalize_search_anchor(kw))
-            for t in raw_tokens:
-                tl = t.lower()
-                if tl in GENERIC_TOKEN_BLACKLIST:
-                    continue
-                tokens.append(t)
-        uniq = list(dict.fromkeys(tokens))
-        return uniq[:40]
+        return self.extract_strong_tokens(keywords_for_search, limit=50)
 
-    def detect_primary_token(self, structured: Dict[str, Any], keywords_tokens: List[str]) -> str:
-        src = structured.get("structured_idea", structured) if isinstance(structured, dict) else {}
-        for key in ("main_entity", "primary_entity", "object", "species", "target_entity"):
-            v = src.get(key) if isinstance(src, dict) else None
-            if isinstance(v, str):
-                parts = re.findall(r"[A-Za-z0-9\-]{4,}", self.normalize_search_anchor(v))
-                if parts:
-                    return parts[0].lower()
-        if keywords_tokens:
-            return min((t.lower() for t in keywords_tokens), key=lambda x: (len(x), x), default="")
-        return ""
+    def detect_primary_token(self, keywords_for_search: List[str], search_anchors: List[str]) -> str:
+        token_pool = self.extract_strong_tokens(keywords_for_search[:5], limit=20)
+        if not token_pool:
+            token_pool = self.extract_strong_tokens(search_anchors, limit=20)
+        for tok in token_pool:
+            if tok.lower() in GENERIC_WORDS or self.is_geography_token(tok):
+                continue
+            return tok.lower()
+        return token_pool[0].lower() if token_pool else ""
+
+    def build_must_have_tokens(self, keywords_for_search: List[str]) -> List[str]:
+        out: List[str] = []
+        for tok in self.extract_strong_tokens(keywords_for_search, limit=30):
+            if tok.lower() in GENERIC_WORDS or self.is_geography_token(tok):
+                continue
+            out.append(tok.lower())
+            if len(out) >= 10:
+                break
+        return out[:10]
 
     def build_boolean_query(self, terms: List[str]) -> str:
         uniq = [self.normalize_search_anchor(x) for x in terms if self.normalize_search_anchor(x)]
@@ -576,6 +652,8 @@ class StageB:
             "doi": normalize_doi(w.get("doi", "")),
             "openalex_id": w.get("id", ""),
             "venue": ((w.get("primary_location", {}).get("source") or {}).get("display_name") or ""),
+            "source_type": ((w.get("primary_location", {}).get("source") or {}).get("type") or ""),
+            "source_display_name": ((w.get("primary_location", {}).get("source") or {}).get("display_name") or ""),
             "authors_short": ", ".join([(a.get("author", {}) or {}).get("display_name", "") for a in (w.get("authorships") or [])[:4]]),
             "cited_by_count": w.get("cited_by_count", 0) or 0,
             "source_tags": {tag},
@@ -600,6 +678,7 @@ class StageB:
                     "openalex_id": "", "venue": p.get("venue", ""),
                     "authors_short": ", ".join([a.get("name", "") for a in p.get("authors", [])[:4]]),
                     "cited_by_count": p.get("citationCount", 0) or 0,
+                    "source_type": "", "source_display_name": p.get("venue", ""),
                     "source_tags": {"semanticscholar_search"}, "url": p.get("url", ""), "type": "",
                     "concepts": [], "referenced_works": [], "related_works": [], "abstract": "",
                 })
@@ -627,6 +706,7 @@ class StageB:
                     "openalex_id": "", "venue": p.get("venue", ""),
                     "authors_short": ", ".join([a.get("name", "") for a in p.get("authors", [])[:4]]),
                     "cited_by_count": p.get("citationCount", 0) or 0,
+                    "source_type": "", "source_display_name": p.get("venue", ""),
                     "source_tags": {"semanticscholar_recommendations"}, "url": f"https://www.semanticscholar.org/paper/{p.get('paperId', '')}",
                     "type": "", "concepts": [], "referenced_works": [], "related_works": [], "abstract": "",
                 })
@@ -678,61 +758,159 @@ class StageB:
         return out
 
     def dedup(self, papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        keep: Dict[str, Dict[str, Any]] = {}
-        for p in papers:
-            key = p.get("doi") or f"{norm_title(p.get('title', ''))}::{p.get('year', '')}"
-            if key == "::":
-                continue
-            old = keep.get(key)
-            if not old:
-                keep[key] = p
-                continue
-            old["source_tags"] = set(old.get("source_tags", set())) | set(p.get("source_tags", set()))
-            old["cited_by_count"] = max(old.get("cited_by_count", 0), p.get("cited_by_count", 0))
-            if old.get("type") == "preprint" and p.get("type") != "preprint":
-                keep[key] = p
-        return list(keep.values())
+        self.dedup_before = len(papers)
 
-    def apply_relevance_and_score(self, papers: List[Dict[str, Any]], primary_token: str, keywords_tokens: List[str], anchor_packs: List[List[str]], drift_blacklist: List[str], whitelist_terms: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float]:
+        def first_author_lastname(row: Dict[str, Any]) -> str:
+            first = (row.get("authors_short", "").split(",") or [""])[0].strip().lower()
+            return re.sub(r"[^a-zа-я0-9]+", "", first.split()[-1] if first else "")
+
+        def quality_score(row: Dict[str, Any]) -> float:
+            score = 0.0
+            if row.get("abstract"):
+                score += 3.0
+            if row.get("doi"):
+                score += 2.0
+            src_type = str(row.get("source_type", "")).lower()
+            if src_type == "journal":
+                score += 1.0
+            score += 0.5 * math.log1p(max(int(row.get("cited_by_count") or 0), 0))
+            if row.get("relevance_flag") == "PASS":
+                score += 1.0
+            return score
+
+        def choose_best(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+            best = max(rows, key=quality_score)
+            merged_tags: Set[str] = set()
+            max_cit = 0
+            for r in rows:
+                merged_tags |= set(r.get("source_tags", set()))
+                max_cit = max(max_cit, int(r.get("cited_by_count") or 0))
+            out = dict(best)
+            out["source_tags"] = merged_tags
+            out["cited_by_count"] = max_cit
+            return out
+
+        groups: List[List[Dict[str, Any]]] = []
+        doi_map: Dict[str, List[Dict[str, Any]]] = {}
+        no_doi: List[Dict[str, Any]] = []
+        for p in papers:
+            doi = normalize_doi(str(p.get("doi", "")))
+            p["doi"] = doi
+            if doi:
+                doi_map.setdefault(doi, []).append(p)
+            else:
+                no_doi.append(p)
+        groups.extend(list(doi_map.values()))
+
+        by_t2: Dict[str, List[Dict[str, Any]]] = {}
+        for p in no_doi:
+            k2 = f"{norm_title(p.get('title',''))}_{p.get('year','')}"
+            if k2 == "_":
+                continue
+            by_t2.setdefault(k2, []).append(p)
+        stage2: List[Dict[str, Any]] = [choose_best(v) for v in by_t2.values()]
+
+        by_t3: Dict[str, List[Dict[str, Any]]] = {}
+        for p in stage2:
+            k3 = f"{norm_title(p.get('title',''))}_{p.get('year','')}_{first_author_lastname(p)}"
+            by_t3.setdefault(k3, []).append(p)
+        groups.extend(list(by_t3.values()))
+
+        deduped = [choose_best(g) for g in groups if g]
+        self.dedup_after = len(deduped)
+        self.dedup_merged_count = max(self.dedup_before - self.dedup_after, 0)
+        return deduped
+
+    def is_dataset_candidate(self, p: Dict[str, Any], text: str) -> bool:
+        if str(p.get("type", "")).lower() == "dataset":
+            return True
+        if re.search(r"occurrence\s+download", text, flags=re.IGNORECASE):
+            return True
+        venue_blob = " ".join([str(p.get("venue", "")), str(p.get("source_display_name", "")), str(p.get("title", ""))]).lower()
+        if "gbif" in venue_blob:
+            return True
+        url = str(p.get("url", "")).lower()
+        return any(hint in url for hint in DATASET_DOMAIN_HINTS)
+
+    def apply_relevance_and_score(self, papers: List[Dict[str, Any]], primary_token: str, keywords_tokens: List[str], must_have_tokens: List[str], anchor_packs: List[List[str]], drift_blacklist: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, Dict[str, int]]:
         rows: List[Dict[str, Any]] = []
-        pack_terms = [" ".join([x.lower() for x in pack if x]).strip() for pack in anchor_packs]
-        for p in papers:
-            text = f"{p.get('title','')} {p.get('abstract','')}".lower().strip()
-            hit_primary = bool(primary_token) and primary_token in text
-            hits_kw = sum(1 for t in keywords_tokens if t.lower() in text)
-            hits_packs = sum(1 for pack in pack_terms if pack and pack in text)
-            black_hit = any(b.lower() in text for b in drift_blacklist if b)
-            white_hits = sum(1 for w in whitelist_terms if w and w.lower() in text)
-            pass_gate = hit_primary or hits_kw >= 2 or (hits_packs >= 1 if pack_terms else False)
-            reason = ""
-            if black_hit and not hit_primary:
-                pass_gate = False
-                reason = "drift blacklist hit without primary token"
-            elif whitelist_terms and white_hits == 0 and not hit_primary:
-                pass_gate = False
-                reason = "no whitelist term hit"
-            elif not pass_gate:
-                reason = "no primary token and <2 keyword hits"
+        eval_flags: List[bool] = []
+        metrics = {"primary_hit_count": 0, "packs_hit_count": 0, "dataset_low_count": 0}
 
+        for p in papers:
+            title = str(p.get("title", ""))
+            abstract = str(p.get("abstract", ""))
+            text = f"{title} {abstract}".lower().strip()
+            title_only = title.lower()
+            hit_primary = bool(primary_token) and (primary_token in text)
+            hits_kw = sum(1 for t in keywords_tokens if t and t in text)
+            hits_must = sum(1 for t in must_have_tokens if t and t in text)
+            hits_packs = 0
+            for pack in anchor_packs:
+                terms = [t.lower() for t in pack if t]
+                if len(terms) < 2:
+                    continue
+                in_text = all(t in text for t in terms)
+                in_title = (not abstract.strip()) and all(t in title_only for t in terms)
+                if in_text or in_title:
+                    hits_packs += 1
+
+            dataset_flag = self.is_dataset_candidate(p, text)
+            black_hit = any(b.lower() in text for b in drift_blacklist if b)
+            has_abstract = bool(abstract.strip())
+
+            if dataset_flag:
+                relevance_flag = "LOW"
+                reason = "low_dataset"
+                metrics["dataset_low_count"] += 1
+            elif black_hit and not hit_primary:
+                relevance_flag = "LOW"
+                reason = "low_drift_blacklist"
+            elif (not has_abstract) and (not hit_primary) and hits_packs < 1:
+                relevance_flag = "LOW"
+                reason = "low_missing_text"
+            elif hit_primary:
+                relevance_flag = "PASS"
+                reason = "pass_primary"
+            elif hits_packs >= 1:
+                relevance_flag = "PASS"
+                reason = "pass_pack"
+            elif hits_kw >= 3 and hits_must >= 1:
+                relevance_flag = "PASS"
+                reason = "pass_keywords"
+            else:
+                relevance_flag = "LOW"
+                reason = "low_no_primary_no_pack_low_kw"
+
+            if hit_primary:
+                metrics["primary_hit_count"] += 1
+            if hits_packs >= 1:
+                metrics["packs_hit_count"] += 1
+
+            relevance_score = (6 if hit_primary else 0) + (4 * hits_packs) + hits_kw + (2 * hits_must)
+            citation_score = math.log1p(max(int(p.get("cited_by_count") or 0), 0)) * 0.25
+            now_year = datetime.now().year
             year = int(p.get("year") or 0) if str(p.get("year") or "").isdigit() else 0
-            freshness = max(min(year - 2000, 25), 0) / 25 if year else 0
-            citation = math.log1p(max(int(p.get("cited_by_count") or 0), 0))
-            rel = (5.0 if hit_primary else 0.0) + 1.5 * hits_kw + 2.0 * hits_packs
-            score = rel + 0.2 * citation + 0.1 * freshness
+            freshness_score = 0.5 if (year and year >= (now_year - 5)) else 0.0
+            score = relevance_score + citation_score + freshness_score
+
             row = dict(p)
             row.update({
                 "score": round(score, 4),
-                "relevance_flag": "PASS" if pass_gate else "LOW",
+                "relevance_flag": relevance_flag,
                 "reason": reason,
-                "score_components": f"rel={round(rel,3)};cit={round(citation,3)};fresh={round(freshness,3)};primary={int(hit_primary)};kw={hits_kw};packs={hits_packs}",
+                "score_components": f"rel={round(relevance_score,3)}; primary={int(hit_primary)}; packs={hits_packs}; kw={hits_kw}; must={hits_must}; cit={round(citation_score,3)}; fresh={round(freshness_score,3)}",
             })
             rows.append(row)
-        rows.sort(key=lambda x: (-x["score"], -(x.get("cited_by_count", 0) or 0), x.get("title", "")))
-        n = min(50, len(rows))
-        pass_top_n = sum(1 for r in rows[:n] if r.get("relevance_flag") == "PASS")
+            eval_flags.append(relevance_flag == "PASS")
+
+        n = min(50, len(eval_flags))
+        pass_top_n = sum(1 for flag in eval_flags[:n] if flag)
         drift_score = 1.0 - (pass_top_n / n) if n else 1.0
+
+        rows.sort(key=lambda x: (-x["score"], -(x.get("cited_by_count", 0) or 0), x.get("title", "")))
         passed = [r for r in rows if r.get("relevance_flag") == "PASS"]
-        return passed, rows, round(drift_score, 4)
+        return passed, rows, round(drift_score, 4), metrics
 
     def write_corpus(self, passed_papers: List[Dict[str, Any]], all_papers: List[Dict[str, Any]], allow_replace: bool) -> None:
         common_fields = ["rank", "score", "title", "year", "doi", "openalex_id", "venue", "authors_short", "cited_by_count", "source_tags", "url"]
@@ -744,7 +922,7 @@ class StageB:
             target = self.out_dir / name
             tmp = self.out_dir / f"{name}.tmp"
             with tmp.open("w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=fields)
+                w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
                 w.writeheader()
                 for idx, p in enumerate(rows, 1):
                     w.writerow({
@@ -805,12 +983,12 @@ class StageB:
             f"Этап B остановлен: {reason}. Уточни фильтр релевантности и ограничения дрейфа. Верни только JSON:\n"
             "{\n"
             "  \"refined_primary_token\": \"...\",\n"
+            "  \"refined_must_have_tokens\": [\"...\"],\n"
             "  \"refined_keywords_tokens\": [\"...\"],\n"
             "  \"anchor_packs\": [[\"...\",\"...\"],[\"...\",\"...\",\"...\"]],\n"
-            "  \"drift_blacklist\": [\"...\"],\n"
-            "  \"whitelist_terms\": [\"...\"]\n"
+            "  \"drift_blacklist\": [\"...\"]\n"
             "}\n"
-            "Ограничения: refined_keywords_tokens 10-25 токенов, anchor_packs 4-6 по 2-3 термина, drift_blacklist 10-30, whitelist_terms (optional) 5-15.\n"
+            "Ограничения: refined_must_have_tokens 5-15, refined_keywords_tokens 10-25 токенов, anchor_packs 4-6 по 2-3 термина, drift_blacklist 10-30.\n"
             f"Текущие anchors: {anchors}\n"
             f"Текущие packs: {packs}\n"
         )
@@ -821,10 +999,10 @@ class StageB:
         if not p.exists():
             template = {
                 "refined_primary_token": "Phoxinus",
-                "refined_keywords_tokens": ["Phoxinus", "Balkhash", "cytochrome-b", "riverscape"],
-                "anchor_packs": [["Phoxinus", "Balkhash"], ["Phoxinus", "cytochrome-b"], ["Phoxinus", "riverscape genetics"], ["Balkhash", "population genomics"]],
+                "refined_must_have_tokens": ["phoxinus", "cytochrome-b", "riverscape"],
+                "refined_keywords_tokens": ["Phoxinus", "Balkhash", "cytochrome-b", "riverscape", "lfmm2"],
+                "anchor_packs": [["Phoxinus", "cytochrome-b"], ["Phoxinus", "riverscape"], ["lfmm2", "adaptation"], ["Phoxinus", "lfmm2", "adaptation"]],
                 "drift_blacklist": ["water scarcity", "urban water supply"],
-                "whitelist_terms": ["phoxinus", "population genetics"],
             }
             write_text(p, json.dumps(template, ensure_ascii=False, indent=2) + "\n")
         return p
@@ -842,19 +1020,26 @@ class StageB:
     def write_summary(self, stats: Dict[str, Any], used_europe: bool, wait_llm: bool, used_user_response: bool, corpus_updated: bool, stop_reason: str = "") -> None:
         sources = f"openalex={self.search_log['service_status']['openalex']}, semanticscholar={self.search_log['service_status']['semantic_scholar']}, crossref={self.search_log['service_status']['crossref']}"
         seed_queries = [q for q in self.search_log.get("queries", []) if q.get("source") == "openalex" and q.get("query_kind") == "seed"]
+        unresolved = sorted([ab for ab in self.abbr_mentions if ab not in self.abbr_full_map])
         lines = [
             f"run_id: {self.run_id}",
             f"sources status: {sources}",
-            f"seed_queries: {stats.get('seed_queries', 0)}",
-            f"seed_count: {stats.get('seed_count', 0)}",
-            f"total_candidates_before_gate: {stats.get('total_candidates', 0)}",
-            f"pass_count: {stats.get('pass_count', 0)}",
-            f"drift_score: {stats.get('drift_score', 0)}",
+            f"primary_token = {stats.get('primary_token', '')}",
+            f"primary_hit_count = {stats.get('primary_hit_count', 0)}",
+            f"packs_count = {stats.get('packs_count', 0)}",
+            f"packs_hit_count = {stats.get('packs_hit_count', 0)}",
+            f"must_have_count = {stats.get('must_have_count', 0)}",
+            f"dataset_low_count = {stats.get('dataset_low_count', 0)}",
+            f"pass_count / low_count = {stats.get('pass_count', 0)} / {stats.get('low_count', 0)}",
+            f"drift_score = {stats.get('drift_score', 0)}",
+            f"dedup_merged_count = {stats.get('dedup_merged_count', 0)}",
             f"elapsed: {stats.get('elapsed_ms', 0)} ms",
             "Первые 3 OpenAlex seed-запроса:",
         ]
         for q in seed_queries[:3]:
             lines.append(f"- {q.get('query_text','')} → {q.get('result_total', 0)}")
+        if unresolved:
+            lines.append(f"unresolved_abbreviations_count = {len(unresolved)}")
         if wait_llm:
             lines.append(f"STOP_REASON={stop_reason}; ждёт {self.in_dir / 'llm_response_B_anchors.json'}")
         write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines[:25]) + "\n")
@@ -883,43 +1068,55 @@ class StageB:
             return 0
 
         structured = self.load_structured()
-        display_anchors, search_anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
+        _, search_anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
         keywords_for_search, keywords_used = self.get_keywords_for_search(idea_text, structured)
         self.search_log["keywords_for_search_used"] = keywords_used
         self.search_log["keywords_for_search_count"] = len(keywords_for_search)
         self.search_log["keywords_for_search_preview"] = keywords_for_search[:5]
-        packs = self.build_anchor_packs(search_anchors)
+
+        base_tokens = [x.lower() for x in self.extract_keywords_tokens(keywords_for_search)]
+        primary_token = self.detect_primary_token(keywords_for_search, search_anchors)
+        must_have_tokens = self.build_must_have_tokens(keywords_for_search)
+        packs = self.build_anchor_packs(primary_token, base_tokens)
 
         llm = self.load_llm_anchor_response()
         used_user_response = False
         refined_primary = ""
         refined_tokens: List[str] = []
+        refined_must: List[str] = []
         drift_blacklist: List[str] = []
-        whitelist_terms: List[str] = []
         if isinstance(llm, dict) and llm:
             if isinstance(llm.get("refined_primary_token"), str):
                 refined_primary = self.normalize_search_anchor(llm.get("refined_primary_token", "")).lower()
             if isinstance(llm.get("refined_keywords_tokens"), list):
                 refined_tokens = [self.normalize_search_anchor(str(x)).lower() for x in llm.get("refined_keywords_tokens", []) if isinstance(x, str)]
                 refined_tokens = [x for x in refined_tokens if x]
+            if isinstance(llm.get("refined_must_have_tokens"), list):
+                refined_must = [self.normalize_search_anchor(str(x)).lower() for x in llm.get("refined_must_have_tokens", []) if isinstance(x, str)]
+                refined_must = [x for x in refined_must if x]
             if isinstance(llm.get("anchor_packs"), list):
-                packs = [[self.normalize_search_anchor(x) for x in p[:3] if isinstance(x, str)] for p in llm.get("anchor_packs", []) if isinstance(p, list)]
-                packs = [[x for x in p if x] for p in packs if len([x for x in p if x]) >= 1][:6]
+                packs = self.build_anchor_packs(refined_primary or primary_token, refined_tokens or base_tokens, llm.get("anchor_packs", []))
             if isinstance(llm.get("drift_blacklist"), list):
                 drift_blacklist = [str(x).strip().lower() for x in llm.get("drift_blacklist", []) if isinstance(x, str) and str(x).strip()]
-            if isinstance(llm.get("whitelist_terms"), list):
-                whitelist_terms = [str(x).strip().lower() for x in llm.get("whitelist_terms", []) if isinstance(x, str) and str(x).strip()]
-            used_user_response = bool(refined_primary or refined_tokens or drift_blacklist or whitelist_terms)
+            used_user_response = bool(refined_primary or refined_tokens or refined_must or drift_blacklist)
+
+        primary_token = refined_primary or primary_token
+        keywords_tokens = refined_tokens or base_tokens
+        must_have_tokens = refined_must or must_have_tokens
+
+        self.search_log["primary_token"] = primary_token
+        self.search_log["packs_count"] = len(packs)
+        self.search_log["must_have_tokens"] = must_have_tokens
 
         seed_rows: List[Dict[str, Any]] = []
         used_queries = 0
-
         seed_query_list = self.build_seed_queries(keywords_for_search, search_anchors, packs)
+
         if not seed_query_list and not self.offline_fixtures:
             self.search_log["errors"].append("query_preflight: нет валидных seed-запросов")
             self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "нет валидных seed-запросов после самопроверки")
             response_path = self.ensure_llm_response_template()
-            stats = {"seed_queries": 0, "seed_count": 0, "total_candidates": 0, "pass_count": 0, "low_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000), "stop_reason": "невалидные поисковые строки"}
+            stats = {"seed_queries": 0, "seed_count": 0, "total_candidates": 0, "pass_count": 0, "low_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000), "stop_reason": "невалидные поисковые строки", "primary_token": primary_token, "packs_count": len(packs), "must_have_count": len(must_have_tokens)}
             self.search_log["stats"] = stats
             self.search_log["finished_at"] = now_iso()
             self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(self.in_dir / "llm_response_B_anchors.json")]
@@ -941,39 +1138,36 @@ class StageB:
                     self.search_log["service_status"]["openalex"] = "degraded"
                     self.search_log["errors"].append(f"openalex_seed_error: {e}")
 
-        # abbreviation policy: only after strong seed and explicit expansion
         if len(seed_rows) >= 30:
             for ab in list(all_abbr):
                 if ab in ab_map:
                     search_anchors.append(f"{ab_map[ab]} {ab}")
 
-        need_llm = len(seed_rows) == 0
-        if self.offline_fixtures:
-            need_llm = False
-        filtered_drift_share = 0.0
-
+        need_llm = len(seed_rows) == 0 and not self.offline_fixtures
         semantic_rows: List[Dict[str, Any]] = []
         recommend_rows: List[Dict[str, Any]] = []
         expanded: List[Dict[str, Any]] = []
-        crossref_count = 0
 
         if not need_llm and not self.offline_fixtures:
             for p in packs[:2]:
                 semantic_rows.extend(self.semantic_scholar_search(p))
             expanded = self.expand_openalex(seed_rows, packs)
-
         if len(seed_rows) < 20:
             expanded = []
 
         merged = self.dedup(seed_rows + semantic_rows + recommend_rows + expanded)
-        crossref_count = self.crossref_enrich(merged) if not self.offline_fixtures else 0
-        keywords_tokens = refined_tokens or [x.lower() for x in self.extract_keywords_tokens(keywords_for_search)]
-        primary_token = refined_primary or self.detect_primary_token(structured, keywords_tokens)
-        passed_rows, ranked_all, filtered_drift_share = self.apply_relevance_and_score(merged, primary_token, keywords_tokens, packs, drift_blacklist, whitelist_terms)
+        if not self.offline_fixtures:
+            self.crossref_enrich(merged)
 
-        drift_stop = filtered_drift_share >= 0.40
-        if (need_llm and not self.offline_fixtures) or (drift_stop and not self.offline_fixtures):
-            reason = "seed=0" if need_llm else f"сильный дрейф темы: доля нерелевантных {round(filtered_drift_share * 100,1)}%"
+        passed_rows, ranked_all, drift_score, metrics = self.apply_relevance_and_score(merged, primary_token, keywords_tokens, must_have_tokens, packs, drift_blacklist)
+        self.search_log["primary_hit_count"] = metrics["primary_hit_count"]
+        self.search_log["packs_hit_count"] = metrics["packs_hit_count"]
+        self.search_log["stats"]["dedup_before"] = self.dedup_before
+        self.search_log["stats"]["dedup_after"] = self.dedup_after
+
+        drift_stop = drift_score >= 0.40
+        if need_llm or drift_stop:
+            reason = "seed=0" if need_llm else f"high drift: {round(drift_score * 100,1)}%"
             self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason)
             response_path = self.ensure_llm_response_template()
             stats = {
@@ -982,20 +1176,24 @@ class StageB:
                 "total_candidates": len(ranked_all),
                 "pass_count": len(passed_rows),
                 "low_count": max(len(ranked_all) - len(passed_rows), 0),
-                "drift_score": round(filtered_drift_share, 4),
+                "drift_score": round(drift_score, 4),
                 "elapsed_ms": int((time.time() - t0) * 1000),
+                "primary_token": primary_token,
+                "primary_hit_count": metrics["primary_hit_count"],
+                "packs_count": len(packs),
+                "packs_hit_count": metrics["packs_hit_count"],
+                "must_have_count": len(must_have_tokens),
+                "dataset_low_count": metrics["dataset_low_count"],
+                "dedup_merged_count": self.dedup_merged_count,
+                "stop_reason": reason,
             }
-            stop_msg = f"Этап B остановлен ({reason}) и ждёт файл: {response_path}"
-            next_msg = "Открой файл out\\llm_prompt_B_anchors.txt, вставь его в ChatGPT, ответ сохрани в in\\llm_response_B_anchors.json, затем запусти RUN_B ещё раз."
-            print(stop_msg)
-            print(next_msg)
-            stats["stop_reason"] = reason
             self.search_log["stop_files"] = [str(self.out_dir / "llm_prompt_B_anchors.txt"), str(self.in_dir / "llm_response_B_anchors.json")]
-            self.search_log["stats"] = stats
+            self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after}
             self.search_log["finished_at"] = now_iso()
             write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
             self.write_prisma(stats)
             self.write_summary(stats, used_europe=False, wait_llm=True, used_user_response=used_user_response, corpus_updated=False, stop_reason=reason)
+            print(f"Этап B остановлен ({reason}) и ждёт файл: {response_path}")
             return 2
 
         corpus_updated = len(passed_rows) > 0
@@ -1006,10 +1204,17 @@ class StageB:
             "total_candidates": len(ranked_all),
             "pass_count": len(passed_rows),
             "low_count": max(len(ranked_all) - len(passed_rows), 0),
-            "drift_score": round(filtered_drift_share, 4),
+            "drift_score": round(drift_score, 4),
             "elapsed_ms": int((time.time() - t0) * 1000),
+            "primary_token": primary_token,
+            "primary_hit_count": metrics["primary_hit_count"],
+            "packs_count": len(packs),
+            "packs_hit_count": metrics["packs_hit_count"],
+            "must_have_count": len(must_have_tokens),
+            "dataset_low_count": metrics["dataset_low_count"],
+            "dedup_merged_count": self.dedup_merged_count,
         }
-        self.search_log["stats"] = stats
+        self.search_log["stats"] = {**stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after}
         self.search_log["finished_at"] = now_iso()
         self.write_prisma(stats)
         self.write_summary(stats, used_europe=False, wait_llm=False, used_user_response=used_user_response, corpus_updated=corpus_updated)
