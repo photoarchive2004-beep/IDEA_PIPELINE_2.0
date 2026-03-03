@@ -67,6 +67,19 @@ GEO_HINTS = {
     "altai", "altaya", "kazakhstan", "siberia", "mongolia", "china", "russia", "balkhash", "ural", "volga",
 }
 
+PROBE_MAX = 12
+PROBE_TOO_BROAD = 20000
+PROBE_BROAD = 3000
+PROBE_OK = 50
+PROBE_NARROW = 2
+
+GENERIC_TOKEN_BLACKLIST = GENERIC_TOKEN_BLACKLIST | {
+    "technology", "application", "applications", "performance", "framework", "evaluation", "problem",
+    "objective", "discussion", "conclusion", "findings", "paper", "work", "works", "experiment",
+    "experiments", "case", "cases", "review", "reviews", "survey", "surveys",
+    "методы", "модели", "подходы", "обсуждение", "вывод", "выводы", "эксперимент", "эксперименты",
+}
+
 METHOD_HINTS = {
     "baypass", "lfmm2", "ddrad", "snp", "abba-baba", "hydrorivers", "hydroatlas", "genotype-environment",
     "genotype", "association", "regression", "meta-analysis", "machine-learning", "modeling",
@@ -170,6 +183,9 @@ class StageB:
         }
         self.search_log["llm"] = dict(self.llm_info)
         self.search_log["rejected_queries"] = []
+        self.search_log["planned_queries"] = []
+        self.search_log["token_probe"] = []
+        self.search_log["llm_effect"] = {}
 
     def archive_previous_outputs(self) -> None:
         run_dir = self.out_dir / "_runs" / self.run_id
@@ -621,100 +637,209 @@ class StageB:
             return f"({uniq[0]} AND {uniq[1]})"
         return f"({uniq[0]} AND ({uniq[1]} OR {uniq[2]}))"
 
-    def preflight_queries(self, queries: List[str], primary_token: str, method_terms: List[str]) -> Tuple[List[str], List[str]]:
+    def probe_category(self, total: int) -> str:
+        if total >= PROBE_TOO_BROAD:
+            return "TOO_BROAD"
+        if total >= PROBE_BROAD:
+            return "BROAD"
+        if total >= PROBE_OK:
+            return "OK"
+        if total >= PROBE_NARROW:
+            return "NARROW"
+        return "ZERO"
+
+    def is_valid_candidate_token(self, token: str) -> bool:
+        tok = self.normalize_search_anchor(token).strip().lower()
+        if not tok:
+            return False
+        if tok in GENERIC_TOKEN_BLACKLIST:
+            return False
+        if len(tok) < 4 and not re.search(r"\d", tok):
+            return False
+        if len(tok) < 3:
+            return False
+        return bool(re.search(r"[a-z0-9\-]", tok))
+
+    def gather_candidate_tokens(self, primary_token: str, keywords_tokens: List[str], search_anchors: List[str], llm_tokens: List[str], llm_used: bool) -> List[str]:
+        source = llm_tokens if llm_used else (keywords_tokens if keywords_tokens else search_anchors)
+        merged = [primary_token] + source + keywords_tokens + search_anchors
+        out: List[str] = []
+        seen: Set[str] = set()
+        for token in merged:
+            tok = self.normalize_search_anchor(token).lower()
+            if not self.is_valid_candidate_token(tok):
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            out.append(tok)
+            if len(out) >= 30:
+                break
+        return out
+
+    def openalex_probe_count(self, token: str) -> Tuple[int, int]:
+        params = {"search": token, "per-page": 1}
+        if self.mailto:
+            params["mailto"] = self.mailto
+        endpoint = "https://api.openalex.org/works"
+        try:
+            obj, _, elapsed = self.request_json("GET", endpoint, "openalex", params=params, query_kind="probe")
+            self.search_log["service_status"]["openalex"] = "ok"
+            total = int((obj.get("meta") or {}).get("count") or 0)
+            return max(total, 0), elapsed
+        except Exception as e:
+            self.search_log["service_status"]["openalex"] = "degraded"
+            self.search_log["errors"].append(f"openalex_probe_error: {e}")
+            return 0, 0
+
+    def run_token_probe(self, candidates: List[str], primary_token: str) -> Dict[str, Dict[str, Any]]:
+        selected: List[str] = []
+        if primary_token and primary_token in candidates:
+            selected.append(primary_token)
+        strong = sorted(candidates, key=lambda t: self.token_strength(t), reverse=True)
+        for tok in strong:
+            if tok not in selected and len(selected) < 6:
+                selected.append(tok)
+        for tok in candidates:
+            if tok not in selected and len(selected) < PROBE_MAX:
+                selected.append(tok)
+        selected = selected[:PROBE_MAX]
+
+        probe_map: Dict[str, Dict[str, Any]] = {}
+        for tok in selected:
+            total, elapsed = self.openalex_probe_count(tok) if not self.offline_fixtures else (120, 0)
+            category = self.probe_category(total)
+            decision = "use"
+            if category == "TOO_BROAD":
+                decision = "avoid_solo"
+            elif category == "BROAD":
+                decision = "pack_only"
+            elif category == "ZERO":
+                decision = "exclude"
+            probe_map[tok] = {
+                "token": tok,
+                "result_total": total,
+                "elapsed_ms": elapsed,
+                "category": category,
+                "decision": decision,
+                "geo_like": self.is_geography_token(tok) or self.is_geo_like_token(tok.capitalize()),
+            }
+        self.search_log["token_probe"] = list(probe_map.values())
+        return probe_map
+
+    def preflight_queries(self, queries: List[str], primary_token: str, method_terms: List[str], probe_map: Dict[str, Dict[str, Any]]) -> Tuple[List[str], List[str]]:
         ok: List[str] = []
         bad: List[str] = []
         method_set = {m.lower() for m in method_terms if m}
         ptoken = (primary_token or "").lower()
         for q in queries:
             query = re.sub(r"\s+", " ", q.strip())
-            terms = [t for t in re.findall(r"[A-Za-z0-9\-]+", query) if len(t) >= 3]
+            terms = [t.lower() for t in re.findall(r"[A-Za-z0-9\-]+", query) if len(t) >= 3]
             if not query:
                 bad.append("Пустая поисковая строка")
                 continue
-            if len(query) > 120 or len(terms) > 8:
-                bad.append(f"Слишком длинная строка: {query}")
-                continue
-            qtokens = [x.lower() for x in re.findall(r"[A-Za-z0-9\-]+", query)]
-            if len(qtokens) == 1 and qtokens[0] in GEO_HINTS:
-                bad.append(f"Geo-only запрос запрещён: {query}")
-                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_only_single_term"})
-                continue
-            if re.fullmatch(r"[A-Z][a-z]{3,}", query) and not re.search(r"\d", query) and qtokens and qtokens[0] in GEO_HINTS:
-                bad.append(f"Похоже на geo-only или одиночный термин: {query}")
-                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_only_title_case"})
-                continue
-            geo_terms = [t for t in terms if self.is_geography_token(t) or self.is_geo_like_token(t)]
+            if len(terms) == 1:
+                info = probe_map.get(terms[0], {})
+                if info.get("category") in {"TOO_BROAD", "BROAD"}:
+                    bad.append(f"Слишком общий одиночный токен: {query}")
+                    self.search_log["rejected_queries"].append({"query": query, "reason": "too_broad_solo"})
+                    continue
+            geo_terms = [t for t in terms if self.is_geography_token(t) or self.is_geo_like_token(t.capitalize())]
             if len(geo_terms) == len(terms):
                 bad.append(f"Geo-only запрос запрещён: {query}")
-                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_only_all_terms"})
+                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_only"})
                 continue
-            if geo_terms:
-                has_pair = any((t.lower() == ptoken) or (t.lower() in method_set) or ("-" in t) or bool(re.search(r"\d", t)) for t in terms)
-                if not has_pair:
-                    bad.append(f"География без объекта/метода запрещена: {query}")
-                    self.search_log["rejected_queries"].append({"query": query, "reason": "geo_without_pair"})
-                    continue
-            if " AND " in query and " OR " not in query and query.count("AND") >= 2:
-                bad.append(f"Риск нулевой выдачи (много AND без OR): {query}")
-                continue
-            if any(b in query.lower() for b in GENERIC_BLACKLIST):
-                bad.append(f"Мусорная/служебная фраза: {query}")
+            if geo_terms and not any((t == ptoken) or (t in method_set) for t in terms):
+                bad.append(f"География без пары primary/method запрещена: {query}")
+                self.search_log["rejected_queries"].append({"query": query, "reason": "geo_without_pair"})
                 continue
             ok.append(query)
         return ok[:8], bad
 
-    def build_seed_queries(self, keywords_for_search: List[str], search_anchors: List[str], packs: List[List[str]], primary_token: str, source_terms: List[str], source_mode: str) -> List[str]:
+    def classify_query_blocks(self, tokens: List[str]) -> Dict[str, List[str]]:
+        primary = []
+        method = []
+        phenomenon = []
+        context = []
+        for tok in tokens:
+            t = tok.lower()
+            if re.search(r"\d", t) or "-" in t or re.search(r"[a-z][A-Z]|[A-Z]{2,}", tok) or re.search(r"(net|graph|gan|bert|pcr)$", t):
+                method.append(t)
+            elif self.is_geography_token(t) or self.is_geo_like_token(tok.capitalize()):
+                context.append(t)
+            elif len(t.split()) >= 2:
+                phenomenon.append(t)
+            else:
+                primary.append(t)
+        return {"PRIMARY": primary, "METHOD": method, "PHENOMENON": phenomenon, "CONTEXT": context}
+
+    def build_seed_queries(self, keywords_for_search: List[str], search_anchors: List[str], packs: List[List[str]], primary_token: str, source_terms: List[str], source_mode: str, probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
         queries: List[str] = []
         seen: Set[str] = set()
+        tokens = self.normalize_token_list(source_terms + keywords_for_search + search_anchors)
+        blocks = self.classify_query_blocks(tokens)
+        method_terms = [t for t in blocks["METHOD"] if probe_map.get(t, {}).get("category") in {"OK", "NARROW"}]
+        phen_terms = [t for t in blocks["PHENOMENON"] if probe_map.get(t, {}).get("category") in {"OK", "NARROW"}]
+        context_terms = [t for t in blocks["CONTEXT"] if probe_map.get(t, {}).get("category") not in {"TOO_BROAD", "ZERO"}]
 
-        tokens: List[str] = []
-        for kw in keywords_for_search:
-            short = re.sub(r"[\"']", "", kw)
-            if len(short) > 160:
-                short = " ".join(re.findall(r"[A-Za-z0-9\-]{4,}", short)[:3])
-            tokens.extend(re.findall(r"[A-Za-z0-9\-]{3,}", short))
-        unique_tokens = [t for t in dict.fromkeys(tokens) if len(t) >= 3][:24]
-        object_term = primary_token or (unique_tokens[0] if unique_tokens else (search_anchors[0] if search_anchors else ""))
-        method_terms = [t for t in unique_tokens if re.search(r"\d", t) or "-" in t or t.lower() in {"baypass", "lfmm2", "ddrad", "snp", "abba-baba", "hydrorivers", "hydroatlas"}][:4]
-        phenomenon_terms = [t for t in unique_tokens if t.lower() in {"adaptation", "gene", "flow", "genomics", "environment", "association", "riverscape"}][:4]
-        source_terms_clean = self.normalize_token_list(source_terms)
-
-        def add_query(q: str) -> None:
-            query = re.sub(r"\s+", " ", q.strip())
-            key = query.lower()
-            if not query or key in seen:
+        def add_query(parts: List[str]) -> None:
+            parts = [p for p in parts if p]
+            if not parts:
                 return
-            seen.add(key)
-            queries.append(query)
+            q = self.build_boolean_query(parts[:3])
+            key = q.lower()
+            if q and key not in seen:
+                seen.add(key)
+                queries.append(q)
 
-        if source_mode == "llm":
-            for pack in packs[:6]:
-                add_query(self.build_boolean_query(pack[:3]))
-            for tok in source_terms_clean[:4]:
-                add_query(self.build_boolean_query([object_term, tok]))
-        else:
-            if object_term:
-                add_query(self.normalize_search_anchor(object_term))
+        pcat = probe_map.get(primary_token, {}).get("category", "OK")
+        if primary_token and pcat != "ZERO":
+            add_query([primary_token])
         for m in method_terms[:3]:
-            add_query(self.build_boolean_query([object_term, m]))
-        for p in phenomenon_terms[:2]:
-            add_query(self.build_boolean_query([object_term, p]))
-        for m in method_terms[:2]:
-            for p in phenomenon_terms[:2]:
-                add_query(self.build_boolean_query([m, p]))
+            add_query([primary_token, m])
+        for ph in phen_terms[:2]:
+            add_query([primary_token, ph])
+        if (not primary_token) or pcat == "ZERO":
+            for m in method_terms[:1]:
+                for ph in phen_terms[:1]:
+                    add_query([m, ph])
+        for c in context_terms[:1]:
+            add_query([primary_token, c])
+        for pack in packs[:6]:
+            add_query([x.lower() for x in pack])
 
-        if not queries:
-            for pack in packs:
-                add_query(self.build_boolean_query(pack[:3]))
-            fallback_anchors = search_anchors if source_mode != "keywords" else source_terms_clean
-            for a in fallback_anchors[:6]:
-                add_query(self.normalize_search_anchor(a))
-
-        good, bad = self.preflight_queries(queries[:8], object_term, method_terms + source_terms_clean)
+        good, bad = self.preflight_queries(queries[:8], primary_token, method_terms, probe_map)
         for item in bad:
             self.search_log["errors"].append(f"query_preflight: {item}")
+        self.search_log["planned_queries"] = good[:8]
         return good[:8]
+
+    def validate_seed_queries(self, queries: List[str], probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
+        alive: List[str] = []
+        ok_tokens = [x["token"] for x in self.search_log.get("token_probe", []) if x.get("category") == "OK"]
+        for query in queries:
+            attempts = 0
+            current = query
+            while attempts < 2:
+                attempts += 1
+                total = 1
+                if not self.offline_fixtures:
+                    total, _ = self.openalex_probe_count(current)
+                if total > 0:
+                    alive.append(current)
+                    break
+                self.search_log["rejected_queries"].append({"query": current, "reason": "zero_total"})
+                terms = [t.lower() for t in re.findall(r"[A-Za-z0-9\-]+", current)]
+                narrow = [t for t in terms if probe_map.get(t, {}).get("category") in {"ZERO", "NARROW"}]
+                if narrow and ok_tokens:
+                    repl = ok_tokens[0]
+                    current = self.build_boolean_query([t for t in terms if t not in narrow[:1]] + [repl])
+                else:
+                    current = self.build_boolean_query(terms[:2])
+            if len(alive) >= 8:
+                break
+        self.search_log["planned_queries"] = alive[:8]
+        return alive[:8]
 
     def openalex_search_pack(self, query: str) -> Tuple[List[Dict[str, Any]], int]:
         params = {"search": query, "per-page": 50}
@@ -1067,7 +1192,8 @@ class StageB:
                 "score_components": f"main={round(score_main,3)}; support={round(score_support,3)}; primary={int(hit_primary)}; packs={hits_packs}; kw={hits_kw}; must={hits_must}; support_hits={hits_support}; cit={round(citation_score,3)}; fresh={round(freshness_score,3)}",
             })
             rows.append(row)
-            eval_flags.append(relevance_flag == "PASS_MAIN")
+            drift_pass = hit_primary or hits_packs >= 1 or (hits_kw >= 3 and hits_support >= 1)
+            eval_flags.append(drift_pass)
 
         n = min(50, len(eval_flags))
         pass_top_n = sum(1 for flag in eval_flags[:n] if flag)
@@ -1152,17 +1278,23 @@ class StageB:
             "",
             "## Semantic Scholar queries",
             *[f"- {q.get('query_text','')} → {q.get('result_total', 0)}" for q in s2_q],
+            "",
+            "## Token probe",
+            *[f"- {i.get('token','')}: total={i.get('result_total',0)}, category={i.get('category','')}, decision={i.get('decision','')}" for i in self.search_log.get('token_probe', [])],
+            "",
+            "## Query planning",
+            *[f"- planned: {q}" for q in self.search_log.get('planned_queries', [])],
+            *[f"- rejected: {q.get('query','')} ({q.get('reason','')})" for q in self.search_log.get('rejected_queries', [])],
         ]
         if unresolved:
-            lines += ["", "## Аббревиатуры без расшифровки", *[f"- аббревиатура не раскрыта: {ab}" for ab in unresolved]]
+            lines += ["", "## Нераскрытые аббревиатуры", *[f"- {ab}" for ab in unresolved]]
         write_text(self.out_dir / "prisma_lite_B.md", "\n".join(lines) + "\n")
         write_text(self.out_dir / "search_strategy.md", "\n".join(lines) + "\n")
-
     def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> None:
         txt = f"""Этап B остановлен: {reason}.
 Нужен ответ для OpenAlex в виде КОРОТКИХ английских токенов/фраз (латиница), а не предложений.
 Примеры корректных токенов: Phoxinus, HydroRIVERS, genotype-environment association, BayPass.
-Запрещено давать географию одним словом (Altai/Balkhash и т.п.) без пары с объектом, темой или методом.
+Запрещено давать географию одним словом (Altai/Balkhash и т.п.) без пары с объектом, темой или методом. Убери слишком общие слова.
 Верни строго JSON в формате ниже, без комментариев и текста вокруг:
 {{
   "refined_primary_token": "Phoxinus",
@@ -1288,6 +1420,8 @@ class StageB:
             f"packs_count = {stats.get('packs_count', 0)}",
             f"packs_hit_count = {stats.get('packs_hit_count', 0)}",
             f"must_have_count = {stats.get('must_have_count', 0)}",
+            f"support_tokens_count = {stats.get('support_tokens_count', 0)}",
+            f"support_hit_count = {stats.get('support_count', 0)}",
             f"dataset_low_count = {stats.get('dataset_low_count', 0)}",
             f"drift_blacklist_raw_count = {stats.get('drift_blacklist_raw_count', 0)}",
             f"drift_blacklist_sanitized_count = {stats.get('drift_blacklist_sanitized_count', 0)}",
@@ -1302,11 +1436,21 @@ class StageB:
             f"llm_response_path = {llm_path}",
             f"llm_response_reason = {self.llm_info.get('reason', '')}",
             f"llm_response_schema = {self.llm_info.get('schema', 'invalid')}",
+            f"probe_tokens_tested = {len(self.search_log.get('token_probe', []))}",
+            f"too_broad_count = {stats.get('probe_counts', {}).get('TOO_BROAD', 0)}",
+            f"broad_count = {stats.get('probe_counts', {}).get('BROAD', 0)}",
+            f"ok_count = {stats.get('probe_counts', {}).get('OK', 0)}",
+            f"narrow_count = {stats.get('probe_counts', {}).get('NARROW', 0)}",
+            f"zero_count = {stats.get('probe_counts', {}).get('ZERO', 0)}",
             "support корпус — методические/общие работы без объекта.",
             "Первые 3 OpenAlex seed-запроса:",
         ]
         for q in seed_queries[:3]:
             lines.append(f"- {q.get('query_text','')} → {q.get('result_total', 0)}")
+        too_broad = [x.get('token','') for x in self.search_log.get('token_probe', []) if x.get('category') == 'TOO_BROAD'][:3]
+        zero = [x.get('token','') for x in self.search_log.get('token_probe', []) if x.get('category') == 'ZERO'][:3]
+        lines.append(f"top_too_broad_examples = {', '.join(too_broad)}")
+        lines.append(f"top_zero_examples = {', '.join(zero)}")
         for ab in unresolved:
             lines.append(f"аббревиатура не раскрыта: {ab}")
             self.log(f"аббревиатура не раскрыта: {ab}")
@@ -1355,6 +1499,7 @@ class StageB:
         support_tokens: List[str] = self.build_support_tokens(base_tokens, primary_token)
         source_mode = "keywords" if keywords_used else "anchors"
         source_terms = keywords_for_search if keywords_used else search_anchors
+        llm_token_source: List[str] = []
 
         llm_path = self.in_dir / "llm_response_B_anchors.json"
         llm_raw = self.load_llm_anchor_response()
@@ -1380,6 +1525,8 @@ class StageB:
                     "low_count": 0, "drift_score": 1.0, "elapsed_ms": int((time.time() - t0) * 1000),
                     "stop_reason": "llm_invalid", "primary_token": primary_token, "packs_count": len(packs),
                     "must_have_count": len(must_have_tokens),
+                    "support_tokens_count": len(support_tokens),
+                    "probe_counts": {},
                 }
                 self.search_log["stats"] = stats
                 self.search_log["finished_at"] = now_iso()
@@ -1403,6 +1550,22 @@ class StageB:
                 self.abbr_full_map.update(parsed_llm.get("abbreviation_map", {}))
             source_mode = "llm"
             source_terms = keywords_tokens
+            llm_token_source = [primary_token] + keywords_tokens + must_have_tokens + [x for p in packs for x in p] + support_tokens
+
+        candidate_tokens = self.gather_candidate_tokens(primary_token, keywords_tokens, search_anchors, llm_token_source, bool(self.llm_info.get("used")))
+        probe_map = self.run_token_probe(candidate_tokens, primary_token)
+        support_tokens = [
+            t for t, info in probe_map.items()
+            if t != primary_token and info.get("category") in {"OK", "NARROW"}
+            and not (info.get("geo_like") or self.is_geography_token(t))
+            and (re.search(r"\d", t) or "-" in t or len(t.split()) >= 2)
+        ][:15]
+        probe_stats = Counter([x.get("category", "") for x in self.search_log.get("token_probe", [])])
+        self.search_log["llm_effect"] = {
+            "from_llm_tokens": len(self.normalize_token_list(llm_token_source)),
+            "from_structured_tokens": len(self.normalize_token_list(base_tokens + search_anchors)),
+            "filtered_too_broad_or_zero": sum(1 for x in self.search_log.get("token_probe", []) if x.get("category") in {"TOO_BROAD", "ZERO"}),
+        }
 
         self.search_log["llm"] = dict(self.llm_info)
         self.search_log["primary_token"] = primary_token
@@ -1412,7 +1575,8 @@ class StageB:
 
         seed_rows: List[Dict[str, Any]] = []
         used_queries = 0
-        seed_query_list = self.build_seed_queries(keywords_for_search, search_anchors, packs, primary_token, source_terms, source_mode)
+        seed_query_list = self.build_seed_queries(keywords_for_search, search_anchors, packs, primary_token, source_terms, source_mode, probe_map)
+        seed_query_list = self.validate_seed_queries(seed_query_list, probe_map)
 
         if not seed_query_list and not self.offline_fixtures:
             self.search_log["errors"].append("query_preflight: нет валидных seed-запросов")
@@ -1490,6 +1654,8 @@ class StageB:
                 "packs_count": len(packs),
                 "packs_hit_count": metrics["packs_hit_count"],
                 "must_have_count": len(must_have_tokens),
+                "support_tokens_count": len(support_tokens),
+                "probe_counts": dict(probe_stats),
                 "dataset_low_count": metrics["dataset_low_count"],
                 "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0),
                 "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0),
@@ -1523,6 +1689,8 @@ class StageB:
             "packs_count": len(packs),
             "packs_hit_count": metrics["packs_hit_count"],
             "must_have_count": len(must_have_tokens),
+            "support_tokens_count": len(support_tokens),
+            "probe_counts": dict(probe_stats),
             "dataset_low_count": metrics["dataset_low_count"],
             "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0),
             "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0),
