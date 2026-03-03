@@ -78,6 +78,13 @@ Ok "no too_broad solo queries"
 if (-not ($searchLog.PSObject.Properties.Name -contains "rejected_queries")) { Fail "rejected_queries field missing" }
 Ok "rejected_queries logging exists"
 
+$llmPromptsCreated = 0
+if ($searchLog.stats -and ($searchLog.stats.PSObject.Properties.Name -contains "llm_prompts_created")) {
+  $llmPromptsCreated = [int]$searchLog.stats.llm_prompts_created
+}
+if ($llmPromptsCreated -gt 1) { Fail "llm_prompts_created must be <= 1, got $llmPromptsCreated" }
+Ok "llm prompt budget respected (<=1)"
+
 # Deterministic stop-check: no valid latin anchors => rc 2 + llm files
 $tempIdea = Join-Path $Root "ideas\IDEA-SELFTEST-B-SEED0"
 New-Item -ItemType Directory -Force -Path (Join-Path $tempIdea "in"),(Join-Path $tempIdea "out"),(Join-Path $tempIdea "logs") | Out-Null
@@ -149,5 +156,18 @@ foreach($required in @("probe_tokens_tested", "too_broad_count", "broad_count", 
   if ($summary -notmatch [regex]::Escape($required)) { Fail "stageB_summary missing $required" }
 }
 Ok "stageB_summary probe counters found"
+
+foreach($required in @("llm_budget", "drift_round0")){
+  if ($summary -notmatch [regex]::Escape($required)) { Fail "stageB_summary missing $required" }
+}
+Ok "stageB_summary includes llm/drift rounds"
+
+if ($summary -match "drift_round0 = ([0-9\.]+)") {
+  $d0 = [double]$matches[1]
+  if ($d0 -gt 0.30 -and $summary -notmatch "auto-fix rounds: [12]") {
+    Fail "Expected auto-fix rounds when drift_round0 > target"
+  }
+}
+Ok "auto-fix trigger check passed"
 
 Write-Host "Selfcheck B complete"
