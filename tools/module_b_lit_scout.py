@@ -320,7 +320,7 @@ class StageB:
         write_text(self.llm_budget_path, json.dumps(self.llm_budget_state, ensure_ascii=False, indent=2) + "\n")
 
     def archive_previous_outputs(self) -> str:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         archive_root = self.out_dir / "_archive"
         archive_dir = archive_root / stamp
         stage_artifacts = {
@@ -2117,7 +2117,11 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         seed_queries = [q for q in self.search_log.get("queries", []) if q.get("source") == "openalex" and q.get("query_kind") == "seed"]
         unresolved = sorted([ab for ab in self.abbr_mentions if ab not in self.abbr_full_map])
         llm_path = self.llm_info.get("path", str((self.in_dir / "llm_response_B1_anchors.json").resolve()))
+        status_line = "WAITING_FOR_LLM" if wait_llm else str(stats.get("status", "DEGRADED"))
+        stop_line = stop_reason or ("waiting_for_llm" if wait_llm else "completed")
         lines = [
+            f"STATUS = {status_line}",
+            f"STOP_REASON = {stop_line}",
             f"run_id: {self.run_id}",
             f"sources status: {sources}",
             f"primary_token = {stats.get('primary_token', '')}",
@@ -2138,10 +2142,13 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             f"main_count / support_count / low_count = {stats.get('main_count', 0)} / {stats.get('support_count', 0)} / {stats.get('low_count', 0)}",
             f"drift_score = {stats.get('drift_score', 0)}",
             f"drift_target = {self.drift_target}",
+            f"context_coverage = {stats.get('context_coverage', 0)}",
+            f"method_coverage = {stats.get('method_coverage', 0)}",
+            f"target_min_main = {stats.get('target_min_main', 0)}",
             f"drift_round0 = {stats.get('drift_round0', '')}",
             f"drift_round1 = {stats.get('drift_round1', '')}",
             f"drift_round2 = {stats.get('drift_round2', '')}",
-            f"go_nogo = {stats.get('go_nogo', '')}",
+            f"go_nogo_legacy = {stats.get('go_nogo', '')}",
             f"go_reasons = {', '.join(stats.get('go_reasons', []))}",
             f"pass_ratio = {stats.get('pass_ratio', 0)}",
             f"primary_signal = {stats.get('primary_signal', 0)}",
@@ -2191,7 +2198,6 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             lines.append(f"аббревиатура не раскрыта: {ab}")
             self.log(f"аббревиатура не раскрыта: {ab}")
         if wait_llm:
-            lines.append(f"STOP_REASON = {stop_reason}")
             lines.append(f"WAIT_FILE = {llm_path}")
             lines.append(f"PROMPT_FILE = {self.prompt_path.resolve()}")
             lines.append(f"llm_budget_used / llm_budget_limit = {self.llm_budget_used()}/{self.llm_budget}")
@@ -2300,6 +2306,8 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
 
     def run(self) -> int:
         t0 = time.time()
+        self.search_log["phase"] = "PHASE_0_CLEAN_LOAD"
+        write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2) + "\n")
         self.apply_cleaning()
         self.log("Stage B1 start")
         self.log(f"llm_budget_used / llm_budget_limit = {self.llm_budget_used()}/{self.llm_budget}")
@@ -2583,7 +2591,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         if self.offline_fixtures:
             alive_seed_queries = len(seed_query_list)
         go_eval = self.compute_go_metrics(ranked_all, alive_seed_queries)
-        go_nogo = go_eval.get("go_nogo", "NO-GO")
+        go_nogo = go_eval.get("go_nogo", "GO")
 
         if need_llm:
             stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]]}
@@ -2597,8 +2605,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             go_nogo = go_eval.get("go_nogo", "NO-GO")
 
         if (not go_eval.get("go")):
-            stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]], "go_nogo": go_nogo, "go_reasons": go_eval.get("reasons", [])}
-            return self.stop_for_llm("no_go", f"no-go: {', '.join(go_eval.get('reasons', []))}", search_anchors, packs, stats, t0, passed_rows, support_rows, ranked_all)
+            self.degraded_reasons.append("coverage_or_drift_below_target")
 
         self.write_corpus(passed_rows, support_rows, ranked_all, allow_replace=True)
         stats = {
@@ -2644,6 +2651,19 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             "primary_signal": go_eval.get("primary_signal", 0),
             "alive_seed_queries": alive_seed_queries,
         }
+        total_candidates = max(len(ranked_all), 1)
+        context_coverage = round(float(metrics.get("packs_hit_count", 0)) / total_candidates, 4)
+        method_coverage = round(float(metrics.get("support_hit_count", 0)) / total_candidates, 4)
+        target_by_mode = {"FOCUSED": 80, "BALANCED": 150, "WIDE": 300}
+        target_min_main = int(target_by_mode.get(self.mode, 150))
+        status = "OK"
+        if len(passed_rows) < target_min_main or drift_score > self.drift_target or context_coverage < 0.10 or method_coverage < 0.10:
+            status = "DEGRADED"
+            self.degraded_reasons.append("status_gate")
+        stats["target_min_main"] = target_min_main
+        stats["context_coverage"] = context_coverage
+        stats["method_coverage"] = method_coverage
+        stats["status"] = status
         self.search_log["stats"] = {**stats, "dedup_before": self.dedup_before, "dedup_after": self.dedup_after, "llm_budget_total": self.llm_budget, "llm_budget_used": self.llm_budget_used(), "llm_budget_remaining": self.llm_budget_remaining(), "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
         self.search_log["finished_at"] = now_iso()
         self.write_prisma(stats)
@@ -2651,8 +2671,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         log_text = json.dumps(self.search_log, ensure_ascii=False, indent=2)
         write_text(self.search_log_path, log_text)
         write_text(self.search_log_legacy_path, log_text)
-        status = "OK"
-        if (not self.openalex_key) or self.degraded_reasons or len(passed_rows) < 10:
+        if (not self.openalex_key) or self.degraded_reasons or status != "OK":
             status = "DEGRADED"
         self.save_checkpoint(input_hash, status, stats)
         self.log("Stage B1 done")

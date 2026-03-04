@@ -122,13 +122,15 @@ try {
   $rc = $LASTEXITCODE
 
   if ($rc -eq 0) {
+    $statusValue = Read-SummaryValue $SummaryPath "STATUS" "OK"
     Say ""
-    Say "✅ Stage B1 готова."
+    Say "✅ Stage B1 завершена ($statusValue)."
     Say "Файлы: out\corpus.csv, out\corpus_all.csv, out\stageB1_summary.txt, out\search_log.json"
     exit 0
   }
 
   if ($rc -eq 2) {
+    $statusValue = Read-SummaryValue $SummaryPath "STATUS" "WAITING_FOR_LLM"
     $stopReason = Read-SummaryValue $SummaryPath "STOP_REASON" ""
     $PromptPath = Read-SummaryValue $SummaryPath "PROMPT_FILE" $PromptPath
     $RespPath = Read-SummaryValue $SummaryPath "WAIT_FILE" $RespPath
@@ -136,6 +138,7 @@ try {
     if (-not (Test-Path $RespPath)) { New-Item -ItemType File -Force -Path $RespPath | Out-Null }
 
     Say ""
+    Say "⚠️ Stage B1 status: $statusValue"
     Say "⚠️ Stage B1 ждёт ручной шаг."
 
     if ($stopReason -eq "llm_limit_reached") {
