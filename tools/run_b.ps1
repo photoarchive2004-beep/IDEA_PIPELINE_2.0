@@ -83,6 +83,21 @@ function Ensure-IdeaLayout([string]$ideaDir){
   return $true
 }
 
+function Clear-StageBOutputs([string]$outDir) {
+  if (-not (Test-Path $outDir)) { return }
+  $files = @(
+    "corpus.csv","corpus_all.csv","corpus_support.csv","corpus_support_all.csv",
+    "corpus_background.csv","stageB_summary.txt","stageB1_summary.txt",
+    "search_log_B.json","search_log.json","search_strategy_B.md","prisma_lite.md","prisma_lite_B.md"
+  )
+  foreach ($name in $files) {
+    $p = Join-Path $outDir $name
+    if (Test-Path $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+  }
+  Get-ChildItem -LiteralPath $outDir -Filter "llm_prompt_B*_*.txt" -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
 try {
   $IdeaDir = Resolve-IdeaDir $IdeaDir
   $IdeaDir = (Resolve-Path $IdeaDir).Path
@@ -114,6 +129,7 @@ try {
 
   $cleanStamp = Get-Date -Format "yyyyMMdd-HHmmss"
   Say "Очистка предыдущих результатов Stage B1: out → out/_archive/$cleanStamp"
+  Clear-StageBOutputs $OutDir
   Say "Stage B1: выполняю (идея: $ideaName, mode: $Mode, N: $N)..."
   $cmdArgs = @("--idea-dir", $IdeaDir, "--scope", $($Mode.ToLowerInvariant()), "--n", "$N", "--clean-out")
   if ($CleanHard) { $cmdArgs += "--clean-hard" }
@@ -127,66 +143,6 @@ try {
     Say "✅ Stage B1 завершена ($statusValue)."
     Say "Файлы: out\corpus.csv, out\corpus_all.csv, out\stageB1_summary.txt, out\search_log.json"
     exit 0
-  }
-
-  if ($rc -eq 2) {
-    $statusValue = Read-SummaryValue $SummaryPath "STATUS" "WAITING_FOR_LLM"
-    $stopReason = Read-SummaryValue $SummaryPath "STOP_REASON" ""
-    $PromptPath = Read-SummaryValue $SummaryPath "PROMPT_FILE" $PromptPath
-    $RespPath = Read-SummaryValue $SummaryPath "WAIT_FILE" $RespPath
-
-    if (-not (Test-Path $RespPath)) { New-Item -ItemType File -Force -Path $RespPath | Out-Null }
-
-    Say ""
-    Say "⚠️ Stage B1 status: $statusValue"
-    Say "⚠️ Stage B1 ждёт ручной шаг."
-
-    if ($stopReason -eq "llm_limit_reached") {
-      Say "Лимит ChatGPT (10) уже использован для Stage B1."
-      Say "Шаг 1: Откроется файл in\llm_response_B1_anchors.json."
-      Say "Шаг 2: Вставь JSON-ответ из ChatGPT без пояснений."
-      Say "Шаг 3: Сохрани файл."
-      Say "Шаг 4: Прочитай подсказку в out\stageB_summary.txt."
-      Say "Шаг 5: Запусти RUN_B.bat снова (Этап B1)."
-      Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
-      if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
-      exit 2
-    }
-
-    if (-not (Test-Path $PromptPath)) {
-      Say "PROMPT не найден, пересоздаю..."
-      Log "[CMD] $py $module --idea-dir `"$IdeaDir`" --scope $($Mode.ToLowerInvariant()) --n $N --emit-anchors-prompt-only"
-      & $py $module --idea-dir $IdeaDir --scope $($Mode.ToLowerInvariant()) --n $N --emit-anchors-prompt-only --no-clean-out *>> $Log
-      if (Test-Path $SummaryPath) {
-        $match2 = Select-String -LiteralPath $SummaryPath -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
-        if ($match2) { $stopReason = $match2.Matches[0].Groups[1].Value.Trim() }
-      }
-      if ($stopReason -eq "llm_limit_reached") {
-        Say "Лимит исчерпан → отредактируй ideas\<IDEA>\in\llm_response_B1_anchors.json и запусти снова"
-        Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
-        if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
-        exit 2
-      }
-    }
-
-    if (Test-Path $PromptPath) {
-      Set-Clipboard -Value (Get-Content -Raw -LiteralPath $PromptPath)
-      Say "Шаг 1: Открой ChatGPT."
-      Say "Шаг 2: Prompt Stage B1 уже в буфере обмена. Вставь его в ChatGPT."
-      Say "Шаг 3: Скопируй обратно только JSON без текста."
-      Say "Шаг 4: Вставь JSON в in\llm_response_B1_anchors.json и сохрани."
-      Say "Шаг 5: Запусти RUN_B.bat снова (Этап B1)."
-      Start-Process notepad.exe -ArgumentList $PromptPath | Out-Null
-      Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
-      if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
-      exit 2
-    }
-
-    Say "Ошибка Stage B1: не найден файл prompt по пути $PromptPath"
-    Say "Открой ideas\<IDEA>\out\stageB_summary.txt и проверь STOP_REASON."
-    if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
-    Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
-    exit 1
   }
 
   Say ""
