@@ -24,6 +24,13 @@ $Log = Join-Path $LogDir "runB_last.log"
 function Say([string]$s){ Write-Host $s }
 function Log([string]$s){ $s | Out-File -FilePath $Log -Append -Encoding UTF8 }
 
+function Read-SummaryValue([string]$path, [string]$key, [string]$fallback="") {
+  if (-not (Test-Path $path)) { return $fallback }
+  $m = Select-String -LiteralPath $path -Pattern "^$key\s*=\s*(.+)$" | Select-Object -Last 1
+  if ($m) { return $m.Matches[0].Groups[1].Value.Trim() }
+  return $fallback
+}
+
 function Resolve-IdeaDir([string]$arg) {
   $ideas = Join-Path $Root "ideas"
   if (-not (Test-Path $ideas)) { throw "Нет папки ideas. Сначала запусти 1_NEW_IDEA.bat" }
@@ -80,9 +87,10 @@ try {
   $IdeaDir = (Resolve-Path $IdeaDir).Path
   $ideaName = Split-Path $IdeaDir -Leaf
   $OutDir = Join-Path $IdeaDir "out"
-  $PromptPath = Join-Path $OutDir "llm_prompt_B_anchors.txt"
-  $RespPath = Join-Path (Join-Path $IdeaDir "in") "llm_response_B_anchors.json"
-  $SummaryPath = Join-Path $OutDir "stageB_summary.txt"
+  $PromptPath = Join-Path $OutDir "llm_prompt_B1_anchors.txt"
+  $RespPath = Join-Path (Join-Path $IdeaDir "in") "llm_response_B1_anchors.json"
+  $SummaryPath = Join-Path $OutDir "stageB1_summary.txt"
+  if (-not (Test-Path $SummaryPath)) { $SummaryPath = Join-Path $OutDir "stageB_summary.txt" }
 
   $hasIdea = Ensure-IdeaLayout $IdeaDir
 
@@ -111,27 +119,24 @@ try {
   if ($rc -eq 0) {
     Say ""
     Say "✅ Stage B1 готова."
-    Say "Файлы: out\corpus.csv, out\corpus_all.csv, out\stageB_summary.txt, out\search_log_B.json"
+    Say "Файлы: out\corpus.csv, out\corpus_all.csv, out\stageB1_summary.txt, out\search_log.json"
     exit 0
   }
 
   if ($rc -eq 2) {
-    $stopReason = ""
-
-    if (Test-Path $SummaryPath) {
-      $match = Select-String -LiteralPath $SummaryPath -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
-      if ($match) { $stopReason = $match.Matches[0].Groups[1].Value.Trim() }
-    }
+    $stopReason = Read-SummaryValue $SummaryPath "STOP_REASON" ""
+    $PromptPath = Read-SummaryValue $SummaryPath "PROMPT_FILE" $PromptPath
+    $RespPath = Read-SummaryValue $SummaryPath "WAIT_FILE" $RespPath
 
     if (-not (Test-Path $RespPath)) { New-Item -ItemType File -Force -Path $RespPath | Out-Null }
 
     Say ""
     Say "⚠️ Stage B1 ждёт ручной шаг."
 
-    if ($stopReason -eq "llm_limit_reached_edit_json") {
-      Say "Лимит ChatGPT 3/3 уже использован для Stage B1."
-      Say "Шаг 1: Откроется файл in\llm_response_B_anchors.json."
-      Say "Шаг 2: Впиши или поправь JSON вручную."
+    if ($stopReason -eq "llm_limit_reached") {
+      Say "Лимит ChatGPT (10) уже использован для Stage B1."
+      Say "Шаг 1: Откроется файл in\llm_response_B1_anchors.json."
+      Say "Шаг 2: Вставь JSON-ответ из ChatGPT без пояснений."
       Say "Шаг 3: Сохрани файл."
       Say "Шаг 4: Прочитай подсказку в out\stageB_summary.txt."
       Say "Шаг 5: Запусти RUN_B.bat снова (Этап B1)."
@@ -148,8 +153,8 @@ try {
         $match2 = Select-String -LiteralPath $SummaryPath -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
         if ($match2) { $stopReason = $match2.Matches[0].Groups[1].Value.Trim() }
       }
-      if ($stopReason -eq "llm_limit_reached_edit_json") {
-        Say "Лимит исчерпан → отредактируй ideas\<IDEA>\in\llm_response_B_anchors.json и запусти снова"
+      if ($stopReason -eq "llm_limit_reached") {
+        Say "Лимит исчерпан → отредактируй ideas\<IDEA>\in\llm_response_B1_anchors.json и запусти снова"
         Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
         if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
         exit 2
@@ -161,7 +166,7 @@ try {
       Say "Шаг 1: Открой ChatGPT."
       Say "Шаг 2: Prompt Stage B1 уже в буфере обмена. Вставь его в ChatGPT."
       Say "Шаг 3: Скопируй обратно только JSON без текста."
-      Say "Шаг 4: Вставь JSON в in\llm_response_B_anchors.json и сохрани."
+      Say "Шаг 4: Вставь JSON в in\llm_response_B1_anchors.json и сохрани."
       Say "Шаг 5: Запусти RUN_B.bat снова (Этап B1)."
       Start-Process notepad.exe -ArgumentList $PromptPath | Out-Null
       Start-Process notepad.exe -ArgumentList $RespPath | Out-Null

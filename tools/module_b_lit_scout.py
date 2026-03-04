@@ -92,7 +92,7 @@ DRIFT_TARGET = 0.30
 DRIFT_HARD_STOP = 0.60
 PRIMARY_SIGNAL_MIN = 0.20
 TOPN_FOR_METRICS = 50
-LLM_BUDGET_PER_IDEA = 3
+LLM_BUDGET_PER_IDEA = 10
 CITATION_CHASE_ENABLE = True
 CITATION_TOPK = 20
 CITATION_MAX_ADD = 120
@@ -181,12 +181,12 @@ class StageB:
         repo = self.idea_dir.parents[1]
         self.repo_root = repo
         self.secrets = parse_env(repo / "config" / "secrets.env")
-        self.mailto = self.secrets.get("OPENALEX_MAILTO", "")
+        self.mailto = ""
         self.openalex_key = self.secrets.get("OPENALEX_API_KEY", "")
         self.s2_key = self.secrets.get("SEMANTIC_SCHOLAR_API_KEY", "")
 
         self.session = requests.Session() if requests else None
-        self.cache_root = self.repo_root / ".cache" / "stage_b"
+        self.cache_root = self.repo_root / ".cache" / "stage_b1"
         self.cache_ttl_sec = 7 * 24 * 3600
         self.request_caps = {"FOCUSED": 25, "BALANCED": 50, "WIDE": 90}
         self.request_count = 0
@@ -225,7 +225,7 @@ class StageB:
             "used": False,
             "schema": "invalid",
             "reason": "response_not_found",
-            "path": str((self.in_dir / "llm_response_B_anchors.json").resolve()),
+            "path": str((self.in_dir / "llm_response_B1_anchors.json").resolve()),
         }
         self.search_log["llm"] = dict(self.llm_info)
         self.search_log["rejected_queries"] = []
@@ -244,7 +244,7 @@ class StageB:
         }
         self.search_log["sanitation"] = {"stopwords_removed": 0, "examples": []}
         self.llm_budget = LLM_BUDGET_PER_IDEA
-        self.llm_budget_path = self.out_dir / "llm_requests_B.json"
+        self.llm_budget_path = self.out_dir / "llm_requests_B1.json"
         self.llm_budget_state = self.load_llm_budget_state()
         self.llm_prompts_created = 0
         self.llm_prompt_created = False
@@ -275,15 +275,15 @@ class StageB:
                 "STOPWORD_LIST_EN_RU_SIZE": len(STOPWORD_LIST_EN_RU),
             },
         }
-        self.prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
-        self.response_path = self.in_dir / "llm_response_B_anchors.json"
+        self.prompt_path = self.out_dir / "llm_prompt_B1_anchors.txt"
+        self.response_path = self.in_dir / "llm_response_B1_anchors.json"
 
     def archive_previous_outputs(self) -> None:
         run_dir = self.out_dir / "_runs" / self.run_id
         prev_dir = run_dir / "_prev"
         run_dir.mkdir(parents=True, exist_ok=True)
         move_targets = {
-            "corpus.csv", "corpus_all.csv", "corpus_support.csv", "corpus_support_all.csv", "search_log.json", "search_log_B.json", "stageB_summary.txt", "prisma_lite.md", "prisma_lite_B.md", "checkpoint.json", "runB.log", "llm_prompt_B_anchors.txt",
+            "corpus.csv", "corpus_all.csv", "corpus_support.csv", "corpus_support_all.csv", "search_log.json", "search_log_B.json", "stageB_summary.txt", "stageB1_summary.txt", "prisma_lite.md", "prisma_lite_B.md", "checkpoint.json", "runB.log", "llm_prompt_B1_anchors.txt",
         }
         for item in self.out_dir.iterdir():
             if item.name == "_runs":
@@ -489,7 +489,7 @@ class StageB:
             "input_hash": input_hash,
             "status": status,
             "stats": stats,
-            "outputs": ["corpus.csv", "corpus_all.csv", "search_log.json", "prisma_lite.md", "stageB_summary.txt"],
+            "outputs": ["corpus.csv", "corpus_all.csv", "search_log.json", "prisma_lite.md", "stageB_summary.txt", "stageB1_summary.txt"],
         }
         write_text(self.checkpoint_path, json.dumps(payload, ensure_ascii=False, indent=2))
 
@@ -947,8 +947,6 @@ class StageB:
 
     def openalex_probe_count(self, token: str) -> Tuple[int, int]:
         params = {"search": token, "per-page": 1}
-        if self.mailto:
-            params["mailto"] = self.mailto
         endpoint = "https://api.openalex.org/works"
         try:
             obj, _, elapsed = self.request_json("GET", endpoint, "openalex", params=params, query_kind="probe")
@@ -1702,8 +1700,6 @@ class StageB:
                     continue
             try:
                 params = {"filter": f"cites:{wid}", "per-page": CITATION_PER_SEED_CAP}
-                if self.mailto:
-                    params["mailto"] = self.mailto
                 obj, _, _ = self.request_json("GET", "https://api.openalex.org/works", "openalex", params=params, query_kind="citation")
                 for w in (obj.get("results") or [])[:CITATION_PER_SEED_CAP]:
                     added.append(self.paper_openalex(w, "openalex_forward"))
@@ -1816,6 +1812,8 @@ class StageB:
             "updated_at": now_iso(),
             "last_stop_reason": "",
             "last_run_id": "",
+            "last_response_hash": "",
+            "history": [],
         }
         if not self.llm_budget_path.exists():
             return defaults
@@ -1831,6 +1829,8 @@ class StageB:
                 "updated_at": str(raw.get("updated_at") or defaults["updated_at"]),
                 "last_stop_reason": str(raw.get("last_stop_reason") or ""),
                 "last_run_id": str(raw.get("last_run_id") or ""),
+                "last_response_hash": str(raw.get("last_response_hash") or ""),
+                "history": raw.get("history", []) if isinstance(raw.get("history", []), list) else [],
             }
         except Exception:
             return defaults
@@ -1841,14 +1841,24 @@ class StageB:
     def llm_budget_remaining(self) -> int:
         return max(self.llm_budget - self.llm_budget_used(), 0)
 
-    def save_llm_budget_state(self, stop_reason: str, increment_used: bool) -> None:
+    def save_llm_budget_state(self, stop_reason: str, increment_used: bool, response_hash: str = "") -> None:
         used = self.llm_budget_used() + (1 if increment_used else 0)
+        history = list(self.llm_budget_state.get("history", []))
+        history.append({
+            "ts": now_iso(),
+            "run_id": self.run_id,
+            "stop_reason": stop_reason,
+            "applied": bool(increment_used),
+            "response_hash": response_hash,
+        })
         self.llm_budget_state = {
             "limit": self.llm_budget,
             "used": max(used, 0),
             "updated_at": now_iso(),
             "last_stop_reason": stop_reason,
             "last_run_id": self.run_id,
+            "last_response_hash": response_hash or str(self.llm_budget_state.get("last_response_hash", "")),
+            "history": history[-50:],
         }
         write_text(self.llm_budget_path, json.dumps(self.llm_budget_state, ensure_ascii=False, indent=2) + "\n")
 
@@ -1856,34 +1866,71 @@ class StageB:
         prompt_path = self.prompt_path
         if self.llm_budget_remaining() <= 0:
             return False
-        safe_anchors = anchors or ["example anchor"]
-        safe_packs = packs or [["example anchor", "example method"]]
-        txt = f"""Этап B1 остановлен: {reason}.
-Нужен ответ для OpenAlex в виде КОРОТКИХ английских токенов/фраз (латиница), а не предложений.
-Примеры корректных токенов: Phoxinus, HydroRIVERS, genotype-environment association, BayPass.
-Запрещено давать географию одним словом (Altai/Balkhash и т.п.) без пары с объектом, темой или методом. Убери слишком общие слова.
-Верни строго JSON в формате ниже, без комментариев и текста вокруг:
+        idea_path = self.idea_dir / "in" / "idea.txt"
+        idea_text = read_text(idea_path) if idea_path.exists() else ""
+        metrics = self.search_log.get("stats", {})
+        payload = {
+            "object_terms": anchors[:8],
+            "context_terms": anchors[8:16],
+            "method_terms": [x for p in packs for x in p][:10],
+            "must_have": anchors[:4],
+            "negative_terms": [],
+            "query_templates": [
+                "({OBJECT}) AND ({CONTEXT}) AND ({METHOD}) AND ({MUST}) NOT ({NEG})",
+                "({OBJECT}) AND ({CONTEXT}) AND ({METHOD})",
+                "({OBJECT}) AND ({METHOD}) AND ({MUST})",
+            ],
+        }
+        txt = f"""SYSTEM:
+You are an expert research librarian and systematic-review search strategist.
+Return ONLY valid JSON. No prose. No markdown.
+
+USER:
+We are building Stage B1 (literature corpus builder). Current results show drift and weak context/method coverage.
+
+STRICT OUTPUT REQUIREMENTS:
+- Output ONLY JSON (no text, no explanations).
+- JSON must validate against the schema below.
+- Use ASCII quotes only (").
+
+CONTEXT:
+[IDEA_TEXT]
+<<<
+{idea_text}
+>>>
+
+CURRENT ANCHORS:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+
+QUALITY METRICS:
+{json.dumps({
+    "n_main": metrics.get("main_count", 0),
+    "n_low": metrics.get("low_count", 0),
+    "drift_score": metrics.get("drift_score", 1.0),
+    "context_coverage": metrics.get("context_coverage", 0.0),
+    "method_coverage": metrics.get("method_coverage", 0.0),
+    "top_sources": self.search_log.get("source_counts", {}),
+    "reason": reason,
+}, ensure_ascii=False, indent=2)}
+
+JSON SCHEMA (must match exactly; notes_for_user must be empty string):
 {{
-  "refined_primary_token": "Phoxinus",
-  "refined_keywords_tokens": ["riverscape genomics", "HydroRIVERS", "BayPass"],
-  "refined_must_have_tokens": ["Phoxinus", "riverscape"],
-  "anchor_packs": [["Phoxinus","BayPass"],["Phoxinus","HydroRIVERS"]],
-  "drift_blacklist": ["glaciology", "archaeology", "radiocarbon dating"],
-  "support_tokens": ["riverscape genetics", "genotype-environment association"],
-  "abbreviation_map": {{"SNP": "single nucleotide polymorphism"}}
+  "object_terms": ["..."],
+  "context_terms": ["..."],
+  "method_terms": ["..."],
+  "must_have": ["..."],
+  "negative_terms": ["..."],
+  "query_templates": ["..."],
+  "stopwords_add": ["..."],
+  "weights": {{
+    "w_text": 0.0,
+    "w_cite": 0.0,
+    "w_recent": 0.0,
+    "w_oa": 0.0
+  }},
+  "notes_for_user": ""
 }}
-Важно: drift_blacklist только на английском и только тематические направления/фразы длиной >= 5 символов.
-НЕ добавляй короткие куски вроде ob, ir, alt, gen: они ломают фильтр.
-Если сомневаешься в blacklist — лучше не добавляй элемент.
-5 шагов:
-1) Открой ChatGPT и вставь этот prompt.
-2) Попроси вернуть только JSON по схеме выше, без пояснений.
-3) Проверь JSON на валидность (скобки, кавычки, запятые).
-4) Скопируй JSON в файл ideas/<IDEA>/in/llm_response_B_anchors.json.
-5) Сохрани файл и снова запусти RUN_B.bat (Этап B1).
-Текущие anchors: {safe_anchors}
-Текущие packs: {safe_packs}
-        """
+"""
         write_text_atomic(prompt_path, txt)
         self.llm_prompt_created = True
         self.llm_prompts_created += 1
@@ -1906,13 +1953,18 @@ class StageB:
         p = self.response_path
         if force or not p.exists():
             template = {
-                "refined_primary_token": "Phoxinus",
-                "refined_keywords_tokens": ["riverscape genomics", "genotype-environment association", "HydroRIVERS", "HydroATLAS", "BayPass", "LFMM2", "ddRAD", "SNP"],
-                "refined_must_have_tokens": ["Phoxinus", "riverscape"],
-                "anchor_packs": [["Phoxinus", "BayPass"], ["Phoxinus", "HydroRIVERS"], ["Phoxinus", "genotype-environment association"], ["riverscape genomics", "gene flow"]],
-                "drift_blacklist": ["glaciology", "archaeology", "radiocarbon dating", "wheat breeding", "water scarcity"],
-                "support_tokens": ["riverscape genetics", "genotype-environment association", "gene flow", "landscape genomics"],
-                "abbreviation_map": {"SNP": "single nucleotide polymorphism"},
+                "object_terms": ["core object", "target entity", "system of interest"],
+                "context_terms": ["operational context", "environmental factor", "deployment setting"],
+                "method_terms": ["causal inference", "evaluation design", "statistical modeling"],
+                "must_have": ["target entity", "evaluation"],
+                "negative_terms": ["unrelated domain"],
+                "query_templates": [
+                    "({OBJECT}) AND ({CONTEXT}) AND ({METHOD}) AND ({MUST}) NOT ({NEG})",
+                    "({OBJECT}) AND ({CONTEXT}) AND ({METHOD})",
+                ],
+                "stopwords_add": [],
+                "weights": {"w_text": 0.65, "w_cite": 0.2, "w_recent": 0.1, "w_oa": 0.05},
+                "notes_for_user": "",
             }
             write_text(p, json.dumps(template, ensure_ascii=False, indent=2) + "\n")
         return p
@@ -1942,12 +1994,38 @@ class StageB:
         if not isinstance(llm, dict) or not llm:
             return out
 
-        schema = "invalid"
-        if isinstance(llm.get("refined_primary_token"), str) or isinstance(llm.get("refined_keywords_tokens"), list):
-            schema = "refined"
-        elif isinstance(llm.get("cleaned_search_anchors"), list) or isinstance(llm.get("cleaned_anchors"), list):
-            schema = "legacy"
+        is_b1 = all(k in llm for k in ["object_terms", "context_terms", "method_terms", "must_have", "negative_terms", "query_templates"])
+        schema = "b1" if is_b1 else ("refined" if (isinstance(llm.get("refined_primary_token"), str) or isinstance(llm.get("refined_keywords_tokens"), list)) else "legacy")
         out["schema"] = schema
+
+        if schema == "b1":
+            object_terms = self.normalize_token_list(llm.get("object_terms", []))
+            context_terms = self.normalize_token_list(llm.get("context_terms", []))
+            method_terms = self.normalize_token_list(llm.get("method_terms", []))
+            must_have = self.normalize_token_list(llm.get("must_have", []))
+            negative_terms = self.normalize_token_list(llm.get("negative_terms", []))
+            query_templates = [str(x).strip() for x in llm.get("query_templates", []) if str(x).strip()]
+            if len(object_terms) < 3 or len(context_terms) < 3 or len(method_terms) < 3:
+                out["reason"] = "invalid_too_few_terms_expand_terms"
+                return out
+            primary = (object_terms[0] if object_terms else "").lower()
+            keywords = (object_terms + context_terms + method_terms)[:24]
+            packs = []
+            for t in query_templates[:4]:
+                t2 = t.replace("{OBJECT}", " ".join(object_terms[:2])).replace("{CONTEXT}", " ".join(context_terms[:2])).replace("{METHOD}", " ".join(method_terms[:2])).replace("{MUST}", " ".join(must_have[:2])).replace("{NEG}", " ".join(negative_terms[:2]))
+                packs.append(self.normalize_token_list(re.findall(r"[A-Za-z0-9\-]+", t2))[:3])
+            out.update({
+                "schema": "b1",
+                "reason": "validated",
+                "primary": primary,
+                "keywords": [x.lower() for x in keywords],
+                "must_have": [x.lower() for x in must_have],
+                "packs": [p for p in packs if len(p) >= 2],
+                "drift_blacklist": [x.lower() for x in negative_terms],
+                "support_tokens": [x.lower() for x in context_terms + method_terms],
+                "abbreviation_map": {},
+            })
+            return out
 
         if schema == "refined":
             primary = self.normalize_search_anchor(str(llm.get("refined_primary_token") or ""))
@@ -1965,42 +2043,23 @@ class StageB:
             if len(clean_pack) >= 2:
                 packs.append(clean_pack[:3])
 
-        drift_blacklist = self.normalize_token_list(llm.get("drift_blacklist", []))
-        support_tokens = self.normalize_token_list(llm.get("support_tokens", []))
-        ab_map = llm.get("abbreviation_map") if isinstance(llm.get("abbreviation_map"), dict) else {}
-        ab_map_clean = {str(k): str(v).strip() for k, v in ab_map.items() if str(k).strip() and str(v).strip()}
-
-        token_pool = self.normalize_token_list([primary] + keywords + must_have + [x for p in packs for x in p])
-        latin_pool = [t for t in token_pool if self.has_latin_for_seed(t)]
-        latin_pack_count = sum(1 for p in packs if any(self.has_latin_for_seed(t) for t in p))
-        has_primary = bool(primary and self.has_latin_for_seed(primary))
-
         out.update({
             "primary": primary,
             "keywords": keywords,
             "must_have": must_have,
             "packs": packs,
-            "drift_blacklist": [x.lower() for x in drift_blacklist],
-            "support_tokens": [x.lower() for x in support_tokens],
-            "abbreviation_map": ab_map_clean,
+            "drift_blacklist": [x.lower() for x in self.normalize_token_list(llm.get("drift_blacklist", []))],
+            "support_tokens": [x.lower() for x in self.normalize_token_list(llm.get("support_tokens", []))],
+            "abbreviation_map": {},
+            "reason": "validated",
         })
-
-        if len(latin_pool) < 8:
-            out["reason"] = "invalid_non_latin_tokens"
-            out["schema"] = "invalid"
-            return out
-        if not has_primary and latin_pack_count < 2:
-            out["reason"] = "invalid_missing_primary_or_packs"
-            out["schema"] = "invalid"
-            return out
-        out["reason"] = "validated"
         return out
 
     def write_summary(self, stats: Dict[str, Any], wait_llm: bool, stop_reason: str = "") -> None:
         sources = f"openalex={self.search_log['service_status']['openalex']}, semanticscholar={self.search_log['service_status']['semantic_scholar']}, crossref={self.search_log['service_status']['crossref']}"
         seed_queries = [q for q in self.search_log.get("queries", []) if q.get("source") == "openalex" and q.get("query_kind") == "seed"]
         unresolved = sorted([ab for ab in self.abbr_mentions if ab not in self.abbr_full_map])
-        llm_path = self.llm_info.get("path", str((self.in_dir / "llm_response_B_anchors.json").resolve()))
+        llm_path = self.llm_info.get("path", str((self.in_dir / "llm_response_B1_anchors.json").resolve()))
         lines = [
             f"run_id: {self.run_id}",
             f"sources status: {sources}",
@@ -2078,11 +2137,13 @@ class StageB:
             lines.append(f"WAIT_FILE = {llm_path}")
             lines.append(f"PROMPT_FILE = {self.prompt_path.resolve()}")
             lines.append(f"LLM budget used: {self.llm_budget_used()} / {self.llm_budget}")
-            if stop_reason == "llm_limit_reached_edit_json":
-                lines.append("Лимит 3 обращения к ChatGPT исчерпан. Отредактируй ideas/<IDEA>/in/llm_response_B_anchors.json. Новый prompt не создаётся.")
+            if stop_reason == "llm_limit_reached":
+                lines.append("Лимит ChatGPT (10) исчерпан. Для улучшения: перезапусти в WIDE или уточни идею (добавь 1–2 предложения).")
             else:
                 lines.append("Этап B1 ждёт JSON-ответ от ChatGPT.")
-        write_text_atomic(self.out_dir / "stageB_summary.txt", "\n".join(lines) + "\n")
+        summary_text = "\n".join(lines) + "\n"
+        write_text_atomic(self.out_dir / "stageB_summary.txt", summary_text)
+        write_text_atomic(self.out_dir / "stageB1_summary.txt", summary_text)
 
     def emit_anchors_prompt_only(self) -> int:
         _, idea_text = self.ensure_idea_text()
@@ -2097,8 +2158,8 @@ class StageB:
         if self.llm_budget_remaining() <= 0:
             if self.prompt_path.exists():
                 self.prompt_path.unlink()
-            stop_reason = "llm_limit_reached_edit_json"
-            print("Лимит исчерпан → отредактируй ideas/<IDEA>/in/llm_response_B_anchors.json и запусти снова")
+            stop_reason = "llm_limit_reached"
+            print("Лимит ChatGPT (10) исчерпан. Stage B1 завершится в DEGRADED без падения.")
         else:
             created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "пересоздание prompt по запросу launcher")
             if not created:
@@ -2124,17 +2185,22 @@ class StageB:
         response_path = self.ensure_llm_response_template(force=False)
         prompt_path = self.prompt_path
         if self.llm_budget_remaining() <= 0:
-            stop_reason = "llm_limit_reached_edit_json"
+            stop_reason = "llm_limit_reached"
             if prompt_path.exists():
                 prompt_path.unlink()
-            self.save_llm_budget_state(stop_reason, increment_used=False)
+            self.save_llm_budget_state(stop_reason, increment_used=False, response_hash="")
         else:
             created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
-            self.save_llm_budget_state(stop_reason, increment_used=(created and self.user_response_present()))
+            resp_hash = ""
+            should_count = False
+            if self.user_response_present():
+                resp_hash = hashlib.sha256(read_text(self.response_path).encode("utf-8", errors="ignore")).hexdigest()
+                should_count = bool(created and resp_hash and resp_hash != str(self.llm_budget_state.get("last_response_hash", "")))
+            self.save_llm_budget_state(stop_reason, increment_used=should_count, response_hash=resp_hash)
             if not created:
                 stats["stop_reason"] = "internal_error_prompt_missing"
                 stats["elapsed_ms"] = int((time.time() - t0) * 1000)
-                self.search_log["errors"].append("internal_error_prompt_missing: rc2 requested without llm_prompt_B_anchors.txt")
+                self.search_log["errors"].append("internal_error_prompt_missing: rc2 requested without llm_prompt_B1_anchors.txt")
                 self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats}
                 self.search_log["finished_at"] = now_iso()
                 log_text = json.dumps(self.search_log, ensure_ascii=False, indent=2)
@@ -2143,7 +2209,7 @@ class StageB:
                 self.write_prisma(stats)
                 self.write_summary(stats, wait_llm=True, stop_reason="internal_error_prompt_missing")
                 self.save_checkpoint(self.search_log.get("input_hash", ""), "DEGRADED", stats)
-                print("Внутренняя ошибка: Stage B1 должна была создать ideas/<IDEA>/out/llm_prompt_B_anchors.txt, но файл отсутствует.")
+                print("Внутренняя ошибка: Stage B1 должна была создать ideas/<IDEA>/out/llm_prompt_B1_anchors.txt, но файл отсутствует.")
                 return 1
         stats["stop_reason"] = stop_reason
         stats["elapsed_ms"] = int((time.time() - t0) * 1000)
@@ -2159,9 +2225,9 @@ class StageB:
         self.write_prisma(stats)
         self.write_summary(stats, wait_llm=True, stop_reason=stop_reason)
         self.save_checkpoint(self.search_log.get("input_hash", ""), "DEGRADED", stats)
-        if stop_reason == "llm_limit_reached_edit_json":
-            print("Лимит 3 обращения к ChatGPT исчерпан. Новый prompt не создаётся.")
-            print("Отредактируй ideas/<IDEA>/in/llm_response_B_anchors.json вручную и запусти Stage B1 снова.")
+        if stop_reason == "llm_limit_reached":
+            print("Лимит 10 обращений к ChatGPT исчерпан. Новый prompt не создаётся.")
+            print("Для улучшения перезапусти в WIDE или уточни идею (добавь 1–2 предложения).")
         else:
             print(f"Этап B1 остановлен ({stop_reason}) и ждёт файл: {response_path}")
         return 2
@@ -2178,7 +2244,7 @@ class StageB:
         t0 = time.time()
         self.archive_previous_outputs()
         self.log("Stage B1 start")
-        self.log(f"Secrets: OPENALEX_MAILTO={'***' if self.mailto else '(missing)'}, OPENALEX_API_KEY={'***' if self.openalex_key else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
+        self.log(f"Secrets: OPENALEX_API_KEY={'***' if self.openalex_key else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
 
         ok, idea_text = self.ensure_idea_text()
         if not ok:
@@ -2262,7 +2328,7 @@ class StageB:
         source_terms = keywords_for_search if keywords_used else search_anchors
         llm_token_source: List[str] = []
 
-        llm_path = self.in_dir / "llm_response_B_anchors.json"
+        llm_path = self.in_dir / "llm_response_B1_anchors.json"
         llm_raw = self.load_llm_anchor_response()
         self.llm_info = {
             "found": llm_path.exists(),

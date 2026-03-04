@@ -38,8 +38,8 @@ def test_stage_b1_prompt_paths_and_response_template_preserved() -> None:
         first = run_emit(idea_dir)
         assert first.returncode == 0, first.stdout + "\n" + first.stderr
 
-        prompt_path = idea_dir / "out" / "llm_prompt_B_anchors.txt"
-        response_path = idea_dir / "in" / "llm_response_B_anchors.json"
+        prompt_path = idea_dir / "out" / "llm_prompt_B1_anchors.txt"
+        response_path = idea_dir / "in" / "llm_response_B1_anchors.json"
         summary_path = idea_dir / "out" / "stageB_summary.txt"
 
         assert prompt_path.exists()
