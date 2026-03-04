@@ -29,8 +29,8 @@ def test_emit_anchors_prompt_only_creates_prompt_and_summary_paths() -> None:
         cp = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False)
         assert cp.returncode == 0, cp.stdout + "\n" + cp.stderr
 
-        prompt_path = idea_dir / "out" / "llm_prompt_B_anchors.txt"
-        response_path = idea_dir / "in" / "llm_response_B_anchors.json"
+        prompt_path = idea_dir / "out" / "llm_prompt_B1_anchors.txt"
+        response_path = idea_dir / "in" / "llm_response_B1_anchors.json"
         summary_path = idea_dir / "out" / "stageB_summary.txt"
 
         assert prompt_path.exists(), "Prompt file must exist"
