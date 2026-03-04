@@ -1,0 +1,172 @@
+{
+  "results": [
+    {
+      "id": "https://openalex.org/WTEST1",
+      "title": "Fixture paper 1",
+      "doi": "https://doi.org/10.5555/fixture1",
+      "publication_year": 2020,
+      "cited_by_count": 21,
+      "host_venue": {
+        "display_name": "Marine Ecology"
+      },
+      "primary_location": {
+        "landing_page_url": "https://example.org/kelp1"
+      },
+      "authorships": [
+        {
+          "author": {
+            "display_name": "A. Ivanov"
+          }
+        }
+      ],
+      "concepts": [
+        {
+          "display_name": "Ecology"
+        },
+        {
+          "display_name": "Marine biology"
+        }
+      ]
+    },
+    {
+      "id": "https://openalex.org/WTEST2",
+      "title": "Fixture paper 2",
+      "doi": "https://doi.org/10.5555/fixture2",
+      "publication_year": 2021,
+      "cited_by_count": 15,
+      "host_venue": {
+        "display_name": "Ocean Monitoring"
+      },
+      "primary_location": {
+        "landing_page_url": "https://example.org/kelp2"
+      },
+      "authorships": [
+        {
+          "author": {
+            "display_name": "B. Smirnov"
+          }
+        }
+      ],
+      "concepts": [
+        {
+          "display_name": "Ecology"
+        },
+        {
+          "display_name": "Remote sensing"
+        }
+      ]
+    },
+    {
+      "id": "https://openalex.org/WTEST3",
+      "title": "Fixture paper 3",
+      "doi": "https://doi.org/10.5555/fixture3",
+      "publication_year": 2022,
+      "cited_by_count": 21,
+      "host_venue": {
+        "display_name": "Marine Ecology"
+      },
+      "primary_location": {
+        "landing_page_url": "https://example.org/kelp1"
+      },
+      "authorships": [
+        {
+          "author": {
+            "display_name": "A. Ivanov"
+          }
+        }
+      ],
+      "concepts": [
+        {
+          "display_name": "Ecology"
+        },
+        {
+          "display_name": "Marine biology"
+        }
+      ]
+    },
+    {
+      "id": "https://openalex.org/WTEST4",
+      "title": "Fixture paper 4",
+      "doi": "https://doi.org/10.5555/fixture4",
+      "publication_year": 2023,
+      "cited_by_count": 15,
+      "host_venue": {
+        "display_name": "Ocean Monitoring"
+      },
+      "primary_location": {
+        "landing_page_url": "https://example.org/kelp2"
+      },
+      "authorships": [
+        {
+          "author": {
+            "display_name": "B. Smirnov"
+          }
+        }
+      ],
+      "concepts": [
+        {
+          "display_name": "Ecology"
+        },
+        {
+          "display_name": "Remote sensing"
+        }
+      ]
+    },
+    {
+      "id": "https://openalex.org/WTEST5",
+      "title": "Fixture paper 5",
+      "doi": "https://doi.org/10.5555/fixture5",
+      "publication_year": 2024,
+      "cited_by_count": 21,
+      "host_venue": {
+        "display_name": "Marine Ecology"
+      },
+      "primary_location": {
+        "landing_page_url": "https://example.org/kelp1"
+      },
+      "authorships": [
+        {
+          "author": {
+            "display_name": "A. Ivanov"
+          }
+        }
+      ],
+      "concepts": [
+        {
+          "display_name": "Ecology"
+        },
+        {
+          "display_name": "Marine biology"
+        }
+      ]
+    },
+    {
+      "id": "https://openalex.org/WTEST6",
+      "title": "Fixture paper 6",
+      "doi": "https://doi.org/10.5555/fixture6",
+      "publication_year": 2025,
+      "cited_by_count": 15,
+      "host_venue": {
+        "display_name": "Ocean Monitoring"
+      },
+      "primary_location": {
+        "landing_page_url": "https://example.org/kelp2"
+      },
+      "authorships": [
+        {
+          "author": {
+            "display_name": "B. Smirnov"
+          }
+        }
+      ],
+      "concepts": [
+        {
+          "display_name": "Ecology"
+        },
+        {
+          "display_name": "Remote sensing"
+        }
+      ]
+    }
+  ]
+}
