@@ -158,7 +158,7 @@ def norm_title(title: str) -> str:
 
 
 class StageB:
-    def __init__(self, idea_dir: Path, mode: str, offline_fixtures: Optional[Path]):
+    def __init__(self, idea_dir: Path, mode: str, offline_fixtures: Optional[Path], clean_out: bool = True, clean_hard: bool = False):
         self.idea_dir = idea_dir
         self.mode = mode.upper()
         self.offline_fixtures = offline_fixtures
@@ -243,7 +243,10 @@ class StageB:
             "examples_punct": [],
         }
         self.search_log["sanitation"] = {"stopwords_removed": 0, "examples": []}
-        self.llm_budget = LLM_BUDGET_PER_IDEA
+        self.stage_config = self.load_stage_b1_config()
+        self.clean_out = bool(clean_out)
+        self.clean_hard = bool(clean_hard)
+        self.llm_budget = self.resolve_llm_budget_limit()
         self.llm_budget_path = self.out_dir / "llm_requests_B1.json"
         self.llm_budget_state = self.load_llm_budget_state()
         self.llm_prompts_created = 0
@@ -278,25 +281,76 @@ class StageB:
         self.prompt_path = self.out_dir / "llm_prompt_B1_anchors.txt"
         self.response_path = self.in_dir / "llm_response_B1_anchors.json"
 
-    def archive_previous_outputs(self) -> None:
-        run_dir = self.out_dir / "_runs" / self.run_id
-        prev_dir = run_dir / "_prev"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        move_targets = {
-            "corpus.csv", "corpus_all.csv", "corpus_support.csv", "corpus_support_all.csv", "search_log.json", "search_log_B.json", "stageB_summary.txt", "stageB1_summary.txt", "prisma_lite.md", "prisma_lite_B.md", "checkpoint.json", "runB.log", "llm_prompt_B1_anchors.txt",
-        }
-        for item in self.out_dir.iterdir():
-            if item.name == "_runs":
+    def load_stage_b1_config(self) -> Dict[str, Any]:
+        config_paths = [
+            self.repo_root / "config" / "stage_b1_sources.json",
+            self.repo_root / "config" / "stage_b_sources.json",
+        ]
+        for path in config_paths:
+            if not path.exists():
                 continue
-            is_stageb_md = item.is_file() and item.name.endswith(".md") and "B" in item.name
-            is_cache = item.name in {"cache_openalex", "cache_semanticscholar"}
-            if item.name in move_targets or is_stageb_md or is_cache:
-                prev_dir.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(item), str(prev_dir / item.name))
-        runs_root = self.out_dir / "_runs"
-        run_dirs = sorted([x for x in runs_root.iterdir() if x.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True) if runs_root.exists() else []
-        for old in run_dirs[20:]:
-            shutil.rmtree(old, ignore_errors=True)
+            try:
+                raw = json.loads(read_text(path))
+                if isinstance(raw, dict):
+                    return raw
+            except Exception:
+                continue
+        return {}
+
+    def resolve_llm_budget_limit(self) -> int:
+        cfg_limit = int(self.stage_config.get("llm_limit_default", LLM_BUDGET_PER_IDEA) or LLM_BUDGET_PER_IDEA)
+        env_limit = os.environ.get("STAGE_B1_LLM_LIMIT", "").strip()
+        if env_limit:
+            try:
+                return max(int(env_limit), 1)
+            except Exception:
+                return max(cfg_limit, 1)
+        return max(cfg_limit, 1)
+
+    def reset_llm_budget_state(self) -> None:
+        self.llm_budget_state = {
+            "limit": self.llm_budget,
+            "used": 0,
+            "updated_at": now_iso(),
+            "last_stop_reason": "",
+            "last_run_id": self.run_id,
+            "last_response_hash": "",
+            "history": [],
+        }
+        write_text(self.llm_budget_path, json.dumps(self.llm_budget_state, ensure_ascii=False, indent=2) + "\n")
+
+    def archive_previous_outputs(self) -> str:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        archive_root = self.out_dir / "_archive"
+        archive_dir = archive_root / stamp
+        stage_artifacts = {
+            "corpus.csv", "corpus_all.csv", "corpus_support.csv", "corpus_support_all.csv",
+            "stageB_summary.txt", "stageB1_summary.txt", "search_log.json", "search_log_B.json",
+            "prisma_lite.md", "prisma_lite_B.md", "checkpoint.json", "runB.log", "llm_prompt_B1_anchors.txt",
+        }
+        candidates = [x for x in self.out_dir.iterdir() if x.name != "_archive"]
+        for item in candidates:
+            if item.name in stage_artifacts or item.name.startswith("search_log") or item.name.startswith("llm_prompt_"):
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(item), str(archive_dir / item.name))
+        if archive_root.exists():
+            archives = sorted([x for x in archive_root.iterdir() if x.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in archives[30:]:
+                shutil.rmtree(old, ignore_errors=True)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        return stamp
+
+    def apply_cleaning(self) -> None:
+        if not self.clean_out:
+            return
+        stamp = self.archive_previous_outputs()
+        print(f"Очистка предыдущих результатов Stage B1: out → out/_archive/{stamp}")
+        if self.clean_hard:
+            self.reset_llm_budget_state()
+            if self.response_path.exists():
+                response_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                archived = self.response_path.with_name(f"llm_response_B1_anchors.{response_stamp}.json")
+                shutil.move(str(self.response_path), str(archived))
 
     def log(self, msg: str) -> None:
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -1823,7 +1877,7 @@ class StageB:
                 return defaults
             budget_total = int(raw.get("limit", raw.get("budget_total", self.llm_budget)) or self.llm_budget)
             used = int(raw.get("used", 0) or 0)
-            return {
+            state = {
                 "limit": max(budget_total, self.llm_budget),
                 "used": max(used, 0),
                 "updated_at": str(raw.get("updated_at") or defaults["updated_at"]),
@@ -1832,6 +1886,9 @@ class StageB:
                 "last_response_hash": str(raw.get("last_response_hash") or ""),
                 "history": raw.get("history", []) if isinstance(raw.get("history", []), list) else [],
             }
+            if state["limit"] != budget_total:
+                write_text(self.llm_budget_path, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+            return state
         except Exception:
             return defaults
 
@@ -2101,6 +2158,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             f"llm_budget_total = {self.llm_budget}",
             f"llm_budget_used = {self.llm_budget_used()}",
             f"llm_budget_remaining = {self.llm_budget_remaining()}",
+            f"llm_budget_used / llm_budget_limit = {self.llm_budget_used()}/{self.llm_budget}",
             f"llm_prompt_created = {'YES' if self.llm_prompt_created else 'NO'}",
             f"llm_prompts_created = {self.llm_prompts_created}",
             f"llm_used = {'YES' if self.llm_info.get('used') else 'NO'}",
@@ -2136,7 +2194,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             lines.append(f"STOP_REASON = {stop_reason}")
             lines.append(f"WAIT_FILE = {llm_path}")
             lines.append(f"PROMPT_FILE = {self.prompt_path.resolve()}")
-            lines.append(f"LLM budget used: {self.llm_budget_used()} / {self.llm_budget}")
+            lines.append(f"llm_budget_used / llm_budget_limit = {self.llm_budget_used()}/{self.llm_budget}")
             if stop_reason == "llm_limit_reached":
                 lines.append("Лимит ChatGPT (10) исчерпан. Для улучшения: перезапусти в WIDE или уточни идею (добавь 1–2 предложения).")
             else:
@@ -2242,8 +2300,9 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
 
     def run(self) -> int:
         t0 = time.time()
-        self.archive_previous_outputs()
+        self.apply_cleaning()
         self.log("Stage B1 start")
+        self.log(f"llm_budget_used / llm_budget_limit = {self.llm_budget_used()}/{self.llm_budget}")
         self.log(f"Secrets: OPENALEX_API_KEY={'***' if self.openalex_key else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
 
         ok, idea_text = self.ensure_idea_text()
@@ -2609,13 +2668,16 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--offline-fixtures", default="")
     ap.add_argument("--emit-anchors-prompt-only", action="store_true")
+    ap.add_argument("--clean-out", dest="clean_out", action="store_true", default=True)
+    ap.add_argument("--no-clean-out", dest="clean_out", action="store_false")
+    ap.add_argument("--clean-hard", action="store_true")
     args = ap.parse_args()
     idea = args.idea_dir or args.idea
     if not idea:
         raise SystemExit("--idea-dir (или --idea) обязателен")
     mode = args.mode or (args.scope.upper() if args.scope else "BALANCED")
     offline = Path(args.offline_fixtures) if args.offline_fixtures else None
-    stage = StageB(Path(idea), mode, offline)
+    stage = StageB(Path(idea), mode, offline, clean_out=args.clean_out, clean_hard=args.clean_hard)
     if args.emit_anchors_prompt_only:
         return stage.emit_anchors_prompt_only()
     return stage.run()

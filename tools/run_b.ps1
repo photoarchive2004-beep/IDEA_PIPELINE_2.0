@@ -3,7 +3,8 @@ param(
   [ValidateSet("BALANCED","FOCUSED","WIDE")]
   [string]$Mode = "BALANCED",
   [ValidateSet("balanced","wide","focused")][string]$Scope = "",
-  [int]$N = 300
+  [int]$N = 300,
+  [switch]$CleanHard
 )
 
 if ($Scope -and $Scope.Trim()) { $Mode = $Scope.ToUpperInvariant() }
@@ -111,9 +112,13 @@ try {
     exit 0
   }
 
+  $cleanStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+  Say "Очистка предыдущих результатов Stage B1: out → out/_archive/$cleanStamp"
   Say "Stage B1: выполняю (идея: $ideaName, mode: $Mode, N: $N)..."
-  Log "[CMD] $py $module --idea-dir `"$IdeaDir`" --scope $($Mode.ToLowerInvariant()) --n $N"
-  & $py $module --idea-dir $IdeaDir --scope $($Mode.ToLowerInvariant()) --n $N *>> $Log
+  $cmdArgs = @("--idea-dir", $IdeaDir, "--scope", $($Mode.ToLowerInvariant()), "--n", "$N", "--clean-out")
+  if ($CleanHard) { $cmdArgs += "--clean-hard" }
+  Log "[CMD] $py $module $($cmdArgs -join ' ')"
+  & $py $module @cmdArgs *>> $Log
   $rc = $LASTEXITCODE
 
   if ($rc -eq 0) {
@@ -148,7 +153,7 @@ try {
     if (-not (Test-Path $PromptPath)) {
       Say "PROMPT не найден, пересоздаю..."
       Log "[CMD] $py $module --idea-dir `"$IdeaDir`" --scope $($Mode.ToLowerInvariant()) --n $N --emit-anchors-prompt-only"
-      & $py $module --idea-dir $IdeaDir --scope $($Mode.ToLowerInvariant()) --n $N --emit-anchors-prompt-only *>> $Log
+      & $py $module --idea-dir $IdeaDir --scope $($Mode.ToLowerInvariant()) --n $N --emit-anchors-prompt-only --no-clean-out *>> $Log
       if (Test-Path $SummaryPath) {
         $match2 = Select-String -LiteralPath $SummaryPath -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
         if ($match2) { $stopReason = $match2.Matches[0].Groups[1].Value.Trim() }
