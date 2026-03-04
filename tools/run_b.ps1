@@ -1,8 +1,12 @@
 param(
   [string]$IdeaDir = "",
   [ValidateSet("BALANCED","FOCUSED","WIDE")]
-  [string]$Mode = "BALANCED"
+  [string]$Mode = "BALANCED",
+  [ValidateSet("balanced","wide","focused")][string]$Scope = "",
+  [int]$N = 300
 )
+
+if ($Scope -and $Scope.Trim()) { $Mode = $Scope.ToUpperInvariant() }
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
@@ -75,7 +79,8 @@ try {
   $hasIdea = Ensure-IdeaLayout $IdeaDir
 
   $py = Join-Path $Root ".venv\Scripts\python.exe"
-  $module = Join-Path $Root "tools\module_b_lit_scout.py"
+  $module = Join-Path $Root "tools\b_lit_scout.py"
+  if (-not (Test-Path $module)) { $module = Join-Path $Root "tools\module_b_lit_scout.py" }
   $req = Join-Path $Root "tools\requirements_b.txt"
   if (-not (Test-Path $py))     { throw "Не найден .venv. Сначала запусти 0_SETUP.bat" }
   if (-not (Test-Path $module)) { throw "Не найден tools\module_b_lit_scout.py" }
@@ -90,9 +95,9 @@ try {
     exit 0
   }
 
-  Say "Stage B: выполняю (идея: $ideaName, mode: $Mode)..."
-  Log "[CMD] $py $module --idea `"$IdeaDir`" --mode $Mode"
-  & $py $module --idea $IdeaDir --mode $Mode *>> $Log
+  Say "Stage B: выполняю (идея: $ideaName, mode: $Mode, N: $N)..."
+  Log "[CMD] $py $module --idea-dir `"$IdeaDir`" --scope $($Mode.ToLowerInvariant()) --n $N"
+  & $py $module --idea-dir $IdeaDir --scope $($Mode.ToLowerInvariant()) --n $N *>> $Log
   $rc = $LASTEXITCODE
 
   if ($rc -eq 0) {

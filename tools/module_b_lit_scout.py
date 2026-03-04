@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -162,17 +163,27 @@ class StageB:
             d.mkdir(parents=True, exist_ok=True)
 
         self.run_log = self.out_dir / "runB.log"
-        self.search_log_path = self.out_dir / "search_log_B.json"
+        self.search_log_path = self.out_dir / "search_log.json"
+        self.search_log_legacy_path = self.out_dir / "search_log_B.json"
+        self.prisma_path = self.out_dir / "prisma_lite.md"
+        self.prisma_legacy_path = self.out_dir / "prisma_lite_B.md"
+        self.checkpoint_path = self.out_dir / "checkpoint.json"
         self.module_log = self.logs_dir / f"moduleB_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         self.run_id = f"B_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         repo = self.idea_dir.parents[1]
+        self.repo_root = repo
         self.secrets = parse_env(repo / "config" / "secrets.env")
         self.mailto = self.secrets.get("OPENALEX_MAILTO", "")
         self.openalex_key = self.secrets.get("OPENALEX_API_KEY", "")
         self.s2_key = self.secrets.get("SEMANTIC_SCHOLAR_API_KEY", "")
 
         self.session = requests.Session() if requests else None
+        self.cache_root = self.repo_root / ".cache" / "stage_b"
+        self.cache_ttl_sec = 7 * 24 * 3600
+        self.request_caps = {"FOCUSED": 25, "BALANCED": 50, "WIDE": 90}
+        self.request_count = 0
+        self.degraded_reasons: List[str] = []
         self.search_log: Dict[str, Any] = {
             "run_id": self.run_id,
             "started_at": now_iso(),
@@ -263,7 +274,7 @@ class StageB:
         prev_dir = run_dir / "_prev"
         run_dir.mkdir(parents=True, exist_ok=True)
         move_targets = {
-            "corpus.csv", "corpus_all.csv", "corpus_support.csv", "corpus_support_all.csv", "search_log_B.json", "stageB_summary.txt", "prisma_lite_B.md", "runB.log", "llm_prompt_B_anchors.txt",
+            "corpus.csv", "corpus_all.csv", "corpus_support.csv", "corpus_support_all.csv", "search_log.json", "search_log_B.json", "stageB_summary.txt", "prisma_lite.md", "prisma_lite_B.md", "checkpoint.json", "runB.log", "llm_prompt_B_anchors.txt",
         }
         for item in self.out_dir.iterdir():
             if item.name == "_runs":
@@ -284,15 +295,51 @@ class StageB:
             with p.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
 
+    def _cache_path(self, source: str, method: str, url: str, params: Dict[str, Any]) -> Path:
+        qp = urllib.parse.urlencode(sorted([(str(k), str(v)) for k, v in (params or {}).items()]))
+        key = hashlib.sha256(f"{method}|{url}|{qp}".encode("utf-8")).hexdigest()
+        return self.cache_root / source / f"{key}.json"
+
+    def _cache_get(self, source: str, method: str, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        fp = self._cache_path(source, method, url, params)
+        if not fp.exists():
+            return None
+        age = time.time() - fp.stat().st_mtime
+        if age > self.cache_ttl_sec:
+            return None
+        try:
+            return json.loads(read_text(fp))
+        except Exception:
+            return None
+
+    def _cache_set(self, source: str, method: str, url: str, params: Dict[str, Any], body: Dict[str, Any]) -> None:
+        fp = self._cache_path(source, method, url, params)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        write_text(fp, json.dumps(body, ensure_ascii=False))
+
+    def _request_budget_exceeded(self) -> bool:
+        return self.request_count >= int(self.request_caps.get(self.mode, 50))
+
     def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None, query_kind: str = "seed") -> Tuple[Dict[str, Any], int, int]:
         if self.offline_fixtures:
             raise RuntimeError("offline")
         params = dict(params or {})
+        if method.upper() == "GET":
+            cached = self._cache_get(source, method, url, params)
+            if cached is not None:
+                self.search_log.setdefault("cache", {"hits": 0, "misses": 0})
+                self.search_log["cache"]["hits"] += 1
+                return cached, 200, 0
+            self.search_log.setdefault("cache", {"hits": 0, "misses": 0})
+            self.search_log["cache"]["misses"] += 1
+        if self._request_budget_exceeded():
+            self.degraded_reasons.append("request_cap_reached")
+            raise RuntimeError("request_cap_reached")
         if source == "openalex":
-            if self.mailto:
-                params.setdefault("mailto", self.mailto)
             if self.openalex_key:
                 params.setdefault("api_key", self.openalex_key)
+            else:
+                self.degraded_reasons.append("missing_openalex_api_key")
 
         t0 = time.time()
         headers = {"User-Agent": "IDEA_PIPELINE_2.0-StageB/3.0", "Content-Type": "application/json"}
@@ -316,7 +363,7 @@ class StageB:
                     ms = int((time.time() - t0) * 1000)
                     status_code = resp.status_code
                     body_text = resp.text
-                    if status_code in (429, 502, 503) and attempt < len(retry_waits):
+                    if status_code in (409, 429, 502, 503) and attempt < len(retry_waits):
                         retry_after = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
                         delay = int(retry_after) if str(retry_after or "").isdigit() else wait_seconds
                         self.search_log["errors"].append(f"{source}_{query_kind}_retry_http_{status_code}_attempt_{attempt}")
@@ -389,7 +436,11 @@ class StageB:
             "result_total": 0,
             "result_items": 0,
         })
-        return json.loads(body_text or "{}"), status_code, ms
+        body = json.loads(body_text or "{}")
+        self.request_count += 1
+        if method.upper() == "GET":
+            self._cache_set(source, method, url, params, body)
+        return body, status_code, ms
 
     def decode_openalex_abstract(self, w: Dict[str, Any]) -> str:
         inv = w.get("abstract_inverted_index") or {}
@@ -409,6 +460,29 @@ class StageB:
                 if isinstance(pos, int) and 0 <= pos <= max_pos:
                     words[pos] = str(token)
         return re.sub(r"\s+", " ", " ".join([w for w in words if w])).strip()
+
+    def input_hash(self, idea_text: str, structured: Dict[str, Any]) -> str:
+        blob = json.dumps({"idea": idea_text, "structured": structured}, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def load_checkpoint(self) -> Dict[str, Any]:
+        if not self.checkpoint_path.exists():
+            return {}
+        try:
+            return json.loads(read_text(self.checkpoint_path))
+        except Exception:
+            return {}
+
+    def save_checkpoint(self, input_hash: str, status: str, stats: Dict[str, Any]) -> None:
+        payload = {
+            "saved_at": now_iso(),
+            "mode": self.mode,
+            "input_hash": input_hash,
+            "status": status,
+            "stats": stats,
+            "outputs": ["corpus.csv", "corpus_all.csv", "search_log.json", "prisma_lite.md", "stageB_summary.txt"],
+        }
+        write_text(self.checkpoint_path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def ensure_idea_text(self) -> Tuple[bool, str]:
         top = self.idea_dir / "idea.txt"
@@ -1721,7 +1795,9 @@ class StageB:
         ]
         if unresolved:
             lines += ["", "## Нераскрытые аббревиатуры", *[f"- {ab}" for ab in unresolved]]
-        write_text(self.out_dir / "prisma_lite_B.md", "\n".join(lines) + "\n")
+        prisma_text = "\n".join(lines) + "\n"
+        write_text(self.prisma_path, prisma_text)
+        write_text(self.prisma_legacy_path, prisma_text)
         self.write_search_strategy(stats)
 
     def load_llm_budget_state(self) -> Dict[str, Any]:
@@ -2000,11 +2076,14 @@ class StageB:
                 stats["stop_reason"] = "internal_error_prompt_missing"
                 stats["elapsed_ms"] = int((time.time() - t0) * 1000)
                 self.search_log["errors"].append("internal_error_prompt_missing: rc2 requested without llm_prompt_B_anchors.txt")
-                self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats, "llm_budget_total": self.llm_budget, "llm_budget_used": self.llm_budget_used(), "llm_budget_remaining": self.llm_budget_remaining(), "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
+                self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats}
                 self.search_log["finished_at"] = now_iso()
-                write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+                log_text = json.dumps(self.search_log, ensure_ascii=False, indent=2)
+                write_text(self.search_log_path, log_text)
+                write_text(self.search_log_legacy_path, log_text)
                 self.write_prisma(stats)
                 self.write_summary(stats, wait_llm=True, stop_reason="internal_error_prompt_missing")
+                self.save_checkpoint(self.search_log.get("input_hash", ""), "DEGRADED", stats)
                 print("Внутренняя ошибка: Stage B должна была создать out/llm_prompt_B_anchors.txt, но файл отсутствует.")
                 return 1
         stats["stop_reason"] = stop_reason
@@ -2013,11 +2092,14 @@ class StageB:
         if prompt_path.exists():
             stop_files.insert(0, str(prompt_path))
         self.search_log["stop_files"] = stop_files
-        self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats, "llm_budget_total": self.llm_budget, "llm_budget_used": self.llm_budget_used(), "llm_budget_remaining": self.llm_budget_remaining(), "llm_prompts_created": self.llm_prompts_created, "llm_used": bool(self.llm_info.get("used"))}
+        self.search_log["stats"] = {**self.search_log.get("stats", {}), **stats}
         self.search_log["finished_at"] = now_iso()
-        write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+        log_text = json.dumps(self.search_log, ensure_ascii=False, indent=2)
+        write_text(self.search_log_path, log_text)
+        write_text(self.search_log_legacy_path, log_text)
         self.write_prisma(stats)
         self.write_summary(stats, wait_llm=True, stop_reason=stop_reason)
+        self.save_checkpoint(self.search_log.get("input_hash", ""), "DEGRADED", stats)
         if stop_reason == "llm_limit_reached_edit_json":
             print("Лимит 3 обращения к ChatGPT исчерпан. Новый prompt не создаётся.")
             print("Отредактируй in/llm_response_B_anchors.json вручную и запусти Stage B снова.")
@@ -2045,10 +2127,46 @@ class StageB:
             self.write_corpus([], [], [], allow_replace=False)
             self.write_prisma({})
             self.write_summary({}, wait_llm=False)
-            write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+            log_text = json.dumps(self.search_log, ensure_ascii=False, indent=2)
+            write_text(self.search_log_path, log_text)
+            write_text(self.search_log_legacy_path, log_text)
+            self.save_checkpoint("", "DEGRADED", {})
             return 0
 
         structured = self.load_structured()
+        input_hash = self.input_hash(idea_text, structured)
+        if self.offline_fixtures:
+            fixture_rows = self.load_fixture()
+            ded = self.dedup(fixture_rows)
+            self.write_corpus(ded, [], ded, allow_replace=True)
+            stats = {"seed_queries": 1, "seed_count": len(fixture_rows), "total_candidates": len(ded), "main_count": len(ded), "support_count": 0, "low_count": 0}
+            self.write_prisma(stats)
+            self.write_summary(stats, wait_llm=False)
+            self.search_log["stats"] = stats
+            log_text = json.dumps(self.search_log, ensure_ascii=False, indent=2)
+            write_text(self.search_log_path, log_text)
+            write_text(self.search_log_legacy_path, log_text)
+            self.save_checkpoint(input_hash, "OK", stats)
+            return 0
+        self.search_log["input_hash"] = input_hash
+        cp = self.load_checkpoint()
+        if cp.get("input_hash") == input_hash and cp.get("mode") == self.mode:
+            required = [self.out_dir / "corpus.csv", self.out_dir / "corpus_all.csv", self.out_dir / "search_log.json", self.out_dir / "prisma_lite.md", self.out_dir / "stageB_summary.txt"]
+            if all(x.exists() for x in required):
+                self.log("Checkpoint hit: network skipped")
+                return 0
+        if (not self.openalex_key) and (not self.offline_fixtures):
+            self.search_log["service_status"]["openalex"] = "degraded"
+            self.search_log["errors"].append("missing_openalex_api_key")
+            self.write_corpus([], [], [], allow_replace=True)
+            stats = {"main_count": 0, "support_count": 0, "low_count": 0, "seed_queries": 0, "seed_count": 0, "total_candidates": 0}
+            self.write_prisma(stats)
+            self.write_summary(stats, wait_llm=False)
+            log_text = json.dumps(self.search_log, ensure_ascii=False, indent=2)
+            write_text(self.search_log_path, log_text)
+            write_text(self.search_log_legacy_path, log_text)
+            self.save_checkpoint(input_hash, "DEGRADED", stats)
+            return 0
         self.geo_terms = self.detect_geo_terms(idea_text, structured)
         _, search_anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
         keywords_for_search, keywords_used = self.get_keywords_for_search(idea_text, structured)
@@ -2346,19 +2464,32 @@ class StageB:
         self.search_log["finished_at"] = now_iso()
         self.write_prisma(stats)
         self.write_summary(stats, wait_llm=False)
-        write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2))
+        log_text = json.dumps(self.search_log, ensure_ascii=False, indent=2)
+        write_text(self.search_log_path, log_text)
+        write_text(self.search_log_legacy_path, log_text)
+        status = "OK"
+        if (not self.openalex_key) or self.degraded_reasons or len(passed_rows) < 10:
+            status = "DEGRADED"
+        self.save_checkpoint(input_hash, status, stats)
         self.log("Stage B done")
         return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--idea", required=True)
-    ap.add_argument("--mode", default="BALANCED", choices=["BALANCED", "FOCUSED", "WIDE"])
+    ap.add_argument("--idea", default="")
+    ap.add_argument("--idea-dir", default="")
+    ap.add_argument("--mode", default="", choices=["", "BALANCED", "FOCUSED", "WIDE"])
+    ap.add_argument("--scope", default="", choices=["", "balanced", "focused", "wide"])
+    ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--offline-fixtures", default="")
     args = ap.parse_args()
+    idea = args.idea_dir or args.idea
+    if not idea:
+        raise SystemExit("--idea-dir (или --idea) обязателен")
+    mode = args.mode or (args.scope.upper() if args.scope else "BALANCED")
     offline = Path(args.offline_fixtures) if args.offline_fixtures else None
-    return StageB(Path(args.idea), args.mode, offline).run()
+    return StageB(Path(idea), mode, offline).run()
 
 
 if __name__ == "__main__":
