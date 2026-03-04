@@ -1725,7 +1725,7 @@ class StageB:
     def write_search_strategy(self, stats: Dict[str, Any]) -> None:
         rows = self.search_log.get("executed_queries", [])
         lines = [
-            "# Search strategy for Stage B",
+            "# Search strategy for Stage B1",
             "",
             f"- run_id: {self.run_id}",
             f"- started_at: {self.search_log.get('started_at', '')}",
@@ -1858,7 +1858,7 @@ class StageB:
             return False
         safe_anchors = anchors or ["example anchor"]
         safe_packs = packs or [["example anchor", "example method"]]
-        txt = f"""Этап B остановлен: {reason}.
+        txt = f"""Этап B1 остановлен: {reason}.
 Нужен ответ для OpenAlex в виде КОРОТКИХ английских токенов/фраз (латиница), а не предложений.
 Примеры корректных токенов: Phoxinus, HydroRIVERS, genotype-environment association, BayPass.
 Запрещено давать географию одним словом (Altai/Balkhash и т.п.) без пары с объектом, темой или методом. Убери слишком общие слова.
@@ -1880,7 +1880,7 @@ class StageB:
 2) Попроси вернуть только JSON по схеме выше, без пояснений.
 3) Проверь JSON на валидность (скобки, кавычки, запятые).
 4) Скопируй JSON в файл ideas/<IDEA>/in/llm_response_B_anchors.json.
-5) Сохрани файл и снова запусти RUN_B.bat.
+5) Сохрани файл и снова запусти RUN_B.bat (Этап B1).
 Текущие anchors: {safe_anchors}
 Текущие packs: {safe_packs}
         """
@@ -2060,6 +2060,7 @@ class StageB:
             f"zero_count = {stats.get('probe_counts', {}).get('ZERO', 0)}",
             "support корпус — методические/общие работы без объекта.",
             "Первые 3 OpenAlex seed-запроса:",
+            "Этап: Stage B1",
         ]
         for q in seed_queries[:3]:
             lines.append(f"- {q.get('query_text','')} → {q.get('result_total', 0)}")
@@ -2078,7 +2079,9 @@ class StageB:
             lines.append(f"PROMPT_FILE = {self.prompt_path.resolve()}")
             lines.append(f"LLM budget used: {self.llm_budget_used()} / {self.llm_budget}")
             if stop_reason == "llm_limit_reached_edit_json":
-                lines.append("Лимит 3 обращения к ChatGPT исчерпан. Отредактируй in/llm_response_B_anchors.json. Новый prompt не создаётся.")
+                lines.append("Лимит 3 обращения к ChatGPT исчерпан. Отредактируй ideas/<IDEA>/in/llm_response_B_anchors.json. Новый prompt не создаётся.")
+            else:
+                lines.append("Этап B1 ждёт JSON-ответ от ChatGPT.")
         write_text_atomic(self.out_dir / "stageB_summary.txt", "\n".join(lines) + "\n")
 
     def emit_anchors_prompt_only(self) -> int:
@@ -2090,12 +2093,20 @@ class StageB:
         primary_token = self.detect_primary_token(keywords_for_search, search_anchors)
         packs = self.build_anchor_packs(primary_token, base_tokens)
         self.ensure_llm_response_template(force=False)
-        created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "пересоздание prompt по запросу launcher")
-        if not created:
-            print("Ожидался prompt, но не создан: лимит ChatGPT исчерпан.")
+        stop_reason = "emit_anchors_prompt_only"
+        if self.llm_budget_remaining() <= 0:
+            if self.prompt_path.exists():
+                self.prompt_path.unlink()
+            stop_reason = "llm_limit_reached_edit_json"
+            print("Лимит исчерпан → отредактируй ideas/<IDEA>/in/llm_response_B_anchors.json и запусти снова")
+        else:
+            created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "пересоздание prompt по запросу launcher")
+            if not created:
+                stop_reason = "internal_error_prompt_missing"
+                print("PROMPT Stage B1 не удалось создать автоматически.")
         self.search_log["llm"] = dict(self.llm_info)
-        self.write_summary({"primary_token": primary_token, "packs_count": len(packs)}, wait_llm=True, stop_reason="emit_anchors_prompt_only")
-        return 0 if self.prompt_path.exists() else 1
+        self.write_summary({"primary_token": primary_token, "packs_count": len(packs)}, wait_llm=True, stop_reason=stop_reason)
+        return 0
 
     def round_metrics(self, round_id: int, drift_score: float, planned_queries_count: int, passed: List[Dict[str, Any]], support: List[Dict[str, Any]], ranked: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {
@@ -2132,7 +2143,7 @@ class StageB:
                 self.write_prisma(stats)
                 self.write_summary(stats, wait_llm=True, stop_reason="internal_error_prompt_missing")
                 self.save_checkpoint(self.search_log.get("input_hash", ""), "DEGRADED", stats)
-                print("Внутренняя ошибка: Stage B должна была создать out/llm_prompt_B_anchors.txt, но файл отсутствует.")
+                print("Внутренняя ошибка: Stage B1 должна была создать ideas/<IDEA>/out/llm_prompt_B_anchors.txt, но файл отсутствует.")
                 return 1
         stats["stop_reason"] = stop_reason
         stats["elapsed_ms"] = int((time.time() - t0) * 1000)
@@ -2150,9 +2161,9 @@ class StageB:
         self.save_checkpoint(self.search_log.get("input_hash", ""), "DEGRADED", stats)
         if stop_reason == "llm_limit_reached_edit_json":
             print("Лимит 3 обращения к ChatGPT исчерпан. Новый prompt не создаётся.")
-            print("Отредактируй in/llm_response_B_anchors.json вручную и запусти Stage B снова.")
+            print("Отредактируй ideas/<IDEA>/in/llm_response_B_anchors.json вручную и запусти Stage B1 снова.")
         else:
-            print(f"Этап B остановлен ({stop_reason}) и ждёт файл: {response_path}")
+            print(f"Этап B1 остановлен ({stop_reason}) и ждёт файл: {response_path}")
         return 2
 
     def load_fixture(self) -> List[Dict[str, Any]]:
@@ -2166,7 +2177,7 @@ class StageB:
     def run(self) -> int:
         t0 = time.time()
         self.archive_previous_outputs()
-        self.log("Stage B start")
+        self.log("Stage B1 start")
         self.log(f"Secrets: OPENALEX_MAILTO={'***' if self.mailto else '(missing)'}, OPENALEX_API_KEY={'***' if self.openalex_key else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
 
         ok, idea_text = self.ensure_idea_text()
@@ -2519,7 +2530,7 @@ class StageB:
         if (not self.openalex_key) or self.degraded_reasons or len(passed_rows) < 10:
             status = "DEGRADED"
         self.save_checkpoint(input_hash, status, stats)
-        self.log("Stage B done")
+        self.log("Stage B1 done")
         return 0
 
 

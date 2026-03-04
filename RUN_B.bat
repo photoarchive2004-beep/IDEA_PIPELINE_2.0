@@ -6,7 +6,7 @@ set "PYTHONIOENCODING=utf-8"
 
 set "SCOPE=balanced"
 set "N=300"
-echo Stage B search mode? [B]ALANCED / [F]OCUSED / [W]IDE (auto B in 8s)
+echo Stage B1 search mode? [B]ALANCED / [F]OCUSED / [W]IDE (auto B in 8s)
 choice /C BFW /N /T 8 /D B >nul
 if errorlevel 3 (
   set "SCOPE=wide"
