@@ -85,7 +85,7 @@ PROBE_NARROW = 2
 
 SEED_QUERIES_MAX = 8
 SEED_QUERIES_MIN_ALIVE = 3
-MAX_PER_QUERY = 40
+MAX_PER_QUERY = 200
 MAX_SEED_ITEMS_TOTAL = 300
 AUTO_FIX_ROUNDS = 2
 DRIFT_TARGET = 0.30
@@ -93,10 +93,16 @@ DRIFT_HARD_STOP = 0.60
 PRIMARY_SIGNAL_MIN = 0.20
 TOPN_FOR_METRICS = 50
 LLM_BUDGET_PER_IDEA = 10
-CITATION_CHASE_ENABLE = True
+CITATION_CHASE_ENABLE = False
 CITATION_TOPK = 20
-CITATION_MAX_ADD = 120
+OPENALEX_EXPAND_ENABLE = False
+CROSSREF_ENRICH_ENABLE = False
+SEMANTIC_SEARCH_ENABLE = False
+REQUIRE_LLM = False
+CITATION_MAX_ADD = 30
 CITATION_PER_SEED_CAP = 10
+CONCEPT_FILTER_ENABLE = True
+CONCEPT_FILTER_MAX_TERMS = 3
 STOPWORD_LIST_EN_RU = sorted(CORE_STOPWORDS | EN_STOP | RU_STOP)
 
 DRIFT_TARGET_DEFAULT = DRIFT_TARGET
@@ -1108,58 +1114,37 @@ class StageB:
         return {"PRIMARY": primary, "METHOD": method, "PHENOMENON": phenomenon, "CONTEXT": context}
 
     def build_seed_queries(self, keywords_for_search: List[str], search_anchors: List[str], packs: List[List[str]], primary_token: str, source_terms: List[str], source_mode: str, probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
-        queries: List[Dict[str, Any]] = []
-        seen: Set[str] = set()
-        tokens = self.normalize_token_list(source_terms + keywords_for_search + search_anchors)
+        tokens = self.normalize_token_list(source_terms + keywords_for_search + search_anchors + [x for p in packs for x in p])
+        tokens = [t for t in tokens if probe_map.get(t, {}).get("category") != "ZERO"]
         blocks = self.classify_query_blocks(tokens)
-        method_terms = [t for t in blocks["METHOD"] if probe_map.get(t, {}).get("category") in {"OK", "NARROW", "BROAD"}]
-        phen_terms = [t for t in blocks["PHENOMENON"] if probe_map.get(t, {}).get("category") in {"OK", "NARROW", "BROAD"}]
-        context_terms = [t for t in blocks["CONTEXT"] if probe_map.get(t, {}).get("category") not in {"TOO_BROAD", "ZERO"}]
+        block_a = [t for t in [primary_token] + blocks["PRIMARY"] if t][:3]
+        block_b = [t for t in (blocks["PHENOMENON"] + blocks["CONTEXT"]) if t and t not in block_a][:5]
+        block_c = [t for t in blocks["METHOD"] if t and t not in block_a and t not in block_b][:5]
 
-        def add_query(parts: List[str], reason: str) -> None:
-            parts = [p for p in self.sanitize_tokens(parts, context="planned_query_parts") if p]
-            if len(parts) < 1:
-                self.search_log["rejected_queries"].append({"query_text": " ".join(parts), "reason": "empty_after_sanitize"})
-                return
-            if len(parts) >= 2 and primary_token in [x.lower() for x in parts]:
-                second = next((x for x in parts if x.lower() != primary_token.lower()), "")
-                if second and not self.is_selective_term(second, probe_map):
-                    self.search_log["rejected_queries"].append({"query_text": self.build_boolean_query(parts[:3]), "reason": "non_significant_second_term", "details": {"term": second}})
-                    return
-            q = self.build_boolean_query(parts[:3])
-            nq = self.normalize_query_text(q).lower()
-            if q and nq and nq not in seen:
-                seen.add(nq)
-                queries.append({"query_text": self.normalize_query_text(q), "terms": parts[:3], "reason": reason, "round": 0})
+        def q(parts: List[str]) -> str:
+            return self.normalize_query_text(self.build_boolean_query(self.sanitize_tokens(parts, context="seed_blocks")[:3]))
 
-        pcat = probe_map.get(primary_token, {}).get("category", "OK")
-        if primary_token and pcat != "ZERO":
-            add_query([primary_token], "primary_seed")
-        for m in method_terms[:3]:
-            add_query([primary_token, m], "primary_method")
-        for ph in phen_terms[:2]:
-            add_query([primary_token, ph], "primary_phenomenon")
-        if (not primary_token) or pcat == "ZERO":
-            for m in method_terms[:1]:
-                for ph in phen_terms[:1]:
-                    add_query([m, ph], "fallback_method_phenomenon")
-        for c in context_terms[:1]:
-            add_query([primary_token, c], "primary_context")
-        for pack in packs[:6]:
-            add_query([x.lower() for x in pack], "anchor_pack")
+        queries: List[str] = []
+        if block_a and block_b:
+            queries.append(q([block_a[0], block_b[0]]))
+        if block_a and block_c:
+            queries.append(q([block_a[0], block_c[0]]))
+        if block_a and (block_b or block_c):
+            queries.append(q([block_a[0], (block_b or [""])[0], (block_c or [""])[0]]))
+        if block_b and block_c:
+            queries.append(q([block_b[0], block_c[0]]))
+        if block_a:
+            queries.append(q([block_a[0]]))
+        if block_b:
+            queries.append(q([block_b[0]]))
 
-        raw_queries = [q["query_text"] for q in queries]
-        good, bad = self.preflight_queries(raw_queries[:SEED_QUERIES_MAX], primary_token, method_terms, probe_map)
+        queries = [x for x in self.dedup_planned_queries(queries) if x][:6]
+        good, bad = self.preflight_queries(queries, primary_token, block_c, probe_map)
         for item in bad:
             self.search_log["errors"].append(f"query_preflight: {item}")
-        self.search_log["planner"] = {
-            "planned_queries": [q for q in queries if q["query_text"] in good][:SEED_QUERIES_MAX],
-            "rejected_queries": self.search_log.get("rejected_queries", []),
-            "removed_duplicates": self.search_log.get("removed_duplicate_queries_count", 0),
-        }
-        self.search_log["planned_queries"] = good[:SEED_QUERIES_MAX]
-        self.search_log["planned_queries_detail"] = [q for q in queries if q["query_text"] in good][:SEED_QUERIES_MAX]
-        return good[:SEED_QUERIES_MAX]
+        self.search_log["query_blocks"] = {"A_primary": block_a, "B_phenomenon": block_b, "C_method": block_c}
+        self.search_log["planned_queries"] = good[:6]
+        return good[:6]
 
 
     def plan_seed_queries(self, keywords_for_search: List[str], search_anchors: List[str], packs: List[List[str]], primary_token: str, source_terms: List[str], source_mode: str, probe_map: Dict[str, Dict[str, Any]]) -> List[str]:
@@ -1200,8 +1185,30 @@ class StageB:
         self.search_log.setdefault("planner", {})["removed_duplicates"] = self.search_log.get("removed_duplicate_queries_count", 0)
         return alive
 
-    def openalex_search_pack(self, query: str) -> Tuple[List[Dict[str, Any]], int]:
-        params = {"search": query, "per-page": MAX_PER_QUERY, "filter": "has_abstract:true"}
+    def resolve_openalex_concepts(self, terms: List[str]) -> List[str]:
+        if (not CONCEPT_FILTER_ENABLE) or self.offline_fixtures:
+            return []
+        concept_ids: List[str] = []
+        for term in [t for t in terms if t][:CONCEPT_FILTER_MAX_TERMS]:
+            try:
+                params = {"search": term, "per-page": 1}
+                obj, _, _ = self.request_json("GET", "https://api.openalex.org/concepts", "openalex", params=params, query_kind="concept")
+                top = (obj.get("results") or [])[:1]
+                if top and top[0].get("id"):
+                    cid = str(top[0]["id"]).strip()
+                    if cid and cid not in concept_ids:
+                        concept_ids.append(cid)
+            except Exception as e:
+                self.search_log["errors"].append(f"openalex_concepts_error: {e}")
+        self.search_log["concept_ids"] = concept_ids
+        return concept_ids
+
+    def openalex_search_pack(self, query: str, concept_ids: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], int]:
+        concept_ids = concept_ids or []
+        filters = ["has_abstract:true"]
+        if concept_ids:
+            filters.append("concept.id:" + "|".join(concept_ids[:3]))
+        params = {"search": query, "per-page": MAX_PER_QUERY, "filter": ",".join(filters)}
         endpoint = "https://api.openalex.org/works"
         try:
             obj, status, elapsed = self.request_json("GET", endpoint, "openalex", params=params, query_kind="seed")
@@ -1306,7 +1313,7 @@ class StageB:
 
     def crossref_enrich(self, papers: List[Dict[str, Any]]) -> int:
         count = 0
-        for p in papers[:120]:
+        for p in papers[:20]:
             if p.get("doi") or not p.get("title"):
                 continue
             try:
@@ -1774,6 +1781,7 @@ class StageB:
 
     def write_search_strategy(self, stats: Dict[str, Any]) -> None:
         rows = self.search_log.get("executed_queries", [])
+        query_blocks = self.search_log.get("query_blocks", {})
         lines = [
             "# Search strategy for Stage B1",
             "",
@@ -1785,6 +1793,15 @@ class StageB:
             f"- OpenAlex: {self.search_log.get('service_status', {}).get('openalex', 'offline')}",
             f"- Semantic Scholar: {self.search_log.get('service_status', {}).get('semantic_scholar', 'offline')}",
             f"- Crossref: {self.search_log.get('service_status', {}).get('crossref', 'offline')}",
+            "",
+            "## Strategy",
+            "- Blocks: A(primary/object) + B(phenomenon/effect) + C(method/data)",
+            f"- Block A: {', '.join(query_blocks.get('A_primary', [])[:3])}",
+            f"- Block B: {', '.join(query_blocks.get('B_phenomenon', [])[:5])}",
+            f"- Block C: {', '.join(query_blocks.get('C_method', [])[:5])}",
+            f"- has_abstract filter: enabled",
+            f"- concept filter ids: {', '.join(self.search_log.get('concept_ids', [])[:3]) or 'not used'}",
+            f"- semantic search: {'enabled' if SEMANTIC_SEARCH_ENABLE else 'disabled by default (paid endpoint)'}",
             "",
             "## Queries",
             "| query_text | result_total | cap_used | items_added |",
@@ -2119,6 +2136,12 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         llm_path = self.llm_info.get("path", str((self.in_dir / "llm_response_B1_anchors.json").resolve()))
         status_line = "WAITING_FOR_LLM" if wait_llm else str(stats.get("status", "DEGRADED"))
         stop_line = stop_reason or ("waiting_for_llm" if wait_llm else "completed")
+        warnings: List[str] = []
+        go_reasons = stats.get("go_reasons", []) if isinstance(stats.get("go_reasons", []), list) else []
+        warnings.extend([f"go_metric:{x}" for x in go_reasons])
+        for err in self.search_log.get("errors", []):
+            if any(key in str(err) for key in ["missing_openalex_api_key", "llm_invalid", "seed_zero", "query_preflight"]):
+                warnings.append(str(err))
         lines = [
             f"STATUS = {status_line}",
             f"STOP_REASON = {stop_line}",
@@ -2183,9 +2206,13 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             f"narrow_count = {stats.get('probe_counts', {}).get('NARROW', 0)}",
             f"zero_count = {stats.get('probe_counts', {}).get('ZERO', 0)}",
             "support корпус — методические/общие работы без объекта.",
+            "Semantic search default = OFF (OpenAlex paid endpoint safety).",
+            "WARNING:",
             "Первые 3 OpenAlex seed-запроса:",
             "Этап: Stage B1",
         ]
+        for w in list(dict.fromkeys(warnings))[:12]:
+            lines.append(f"- {w}")
         for q in seed_queries[:3]:
             lines.append(f"- {q.get('query_text','')} → {q.get('result_total', 0)}")
         too_broad = [x.get('token','') for x in self.search_log.get('token_probe', []) if x.get('category') == 'TOO_BROAD'][:3]
@@ -2205,6 +2232,8 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
                 lines.append("Лимит ChatGPT (10) исчерпан. Для улучшения: перезапусти в WIDE или уточни идею (добавь 1–2 предложения).")
             else:
                 lines.append("Этап B1 ждёт JSON-ответ от ChatGPT.")
+        else:
+            lines.append("Optional улучшение: можно положить in/llm_response_B1_anchors.json и перезапустить для более точных anchor-терминов.")
         summary_text = "\n".join(lines) + "\n"
         write_text_atomic(self.out_dir / "stageB_summary.txt", summary_text)
         write_text_atomic(self.out_dir / "stageB1_summary.txt", summary_text)
@@ -2412,39 +2441,23 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
                 self.llm_info["used"] = False
                 self.llm_info["reason"] = parsed_llm.get("reason", "llm_invalid")
                 self.search_log["llm"] = dict(self.llm_info)
-                stats = {
-                    "seed_queries": 0, "seed_count": 0, "total_candidates": 0, "main_count": 0,
-                    "support_count": 0, "low_count": 0, "drift_score": 1.0,
-                    "stop_reason": "llm_invalid", "primary_token": primary_token, "packs_count": len(packs),
-                    "must_have_count": len(must_have_tokens),
-                    "support_tokens_count": len(support_tokens),
-                    "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0),
-                    "probe_counts": {},
-                    "planned_queries_round0": 0,
-                    "planned_queries_round1": 0,
-                    "planned_queries_round2": 0,
-                    "drift_round0": "",
-                    "drift_round1": "",
-                    "drift_round2": "",
-                    "auto_fix_rounds_used": 0,
-                }
-                return self.stop_for_llm("llm_already_used_need_edit", parsed_llm.get("reason", "llm_invalid"), search_anchors, packs, stats, t0)
-
-            self.llm_info["used"] = True
-            self.llm_info["reason"] = "validated_and_applied"
-            self.llm_info["schema"] = parsed_llm.get("schema", "invalid")
-            primary_token = (parsed_llm.get("primary") or primary_token).lower()
-            keywords_tokens = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("keywords", []), context="llm_keywords")] or base_tokens
-            must_have_tokens = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("must_have", []), context="llm_must_have")] or must_have_tokens
-            packs = self.build_anchor_packs(primary_token, keywords_tokens, parsed_llm.get("packs", []))
-            drift_blacklist = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("drift_blacklist", []), context="drift_blacklist")]
-            llm_support_raw = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("support_tokens", []), context="llm_support_tokens")]
-            support_tokens = self.build_support_tokens(keywords_tokens, primary_token, llm_support_raw)
-            if parsed_llm.get("abbreviation_map"):
-                self.abbr_full_map.update(parsed_llm.get("abbreviation_map", {}))
-            source_mode = "llm"
-            source_terms = keywords_tokens
-            llm_token_source = [primary_token] + keywords_tokens + must_have_tokens + [x for p in packs for x in p] + support_tokens
+                self.search_log["errors"].append(f"llm_invalid_response_warning: {parsed_llm.get('reason', 'invalid')}")
+            else:
+                self.llm_info["used"] = True
+                self.llm_info["reason"] = "validated_and_applied"
+                self.llm_info["schema"] = parsed_llm.get("schema", "invalid")
+                primary_token = (parsed_llm.get("primary") or primary_token).lower()
+                keywords_tokens = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("keywords", []), context="llm_keywords")] or base_tokens
+                must_have_tokens = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("must_have", []), context="llm_must_have")] or must_have_tokens
+                packs = self.build_anchor_packs(primary_token, keywords_tokens, parsed_llm.get("packs", []))
+                drift_blacklist = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("drift_blacklist", []), context="drift_blacklist")]
+                llm_support_raw = [x.lower() for x in self.sanitize_tokens(parsed_llm.get("support_tokens", []), context="llm_support_tokens")]
+                support_tokens = self.build_support_tokens(keywords_tokens, primary_token, llm_support_raw)
+                if parsed_llm.get("abbreviation_map"):
+                    self.abbr_full_map.update(parsed_llm.get("abbreviation_map", {}))
+                source_mode = "llm"
+                source_terms = keywords_tokens
+                llm_token_source = [primary_token] + keywords_tokens + must_have_tokens + [x for p in packs for x in p] + support_tokens
 
         candidate_tokens = self.gather_candidate_tokens(primary_token, keywords_tokens, search_anchors, llm_token_source, bool(self.llm_info.get("used")))
         probe_map = self.run_token_probe(candidate_tokens, primary_token)
@@ -2479,11 +2492,14 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         used_queries = 0
         seed_query_list = self.plan_seed_queries(keywords_for_search, search_anchors, packs, primary_token, source_terms, source_mode, probe_map)
         seed_query_list = self.validate_seed_queries(seed_query_list, probe_map)
+        concept_terms = (self.search_log.get("query_blocks", {}).get("B_phenomenon", []) + self.search_log.get("query_blocks", {}).get("C_method", []))[:CONCEPT_FILTER_MAX_TERMS]
+        concept_ids = self.resolve_openalex_concepts(concept_terms)
 
         if not seed_query_list and not self.offline_fixtures:
             self.search_log["errors"].append("query_preflight: нет валидных seed-запросов")
-            stats = {"seed_queries": 0, "seed_count": 0, "total_candidates": 0, "main_count": 0, "support_count": 0, "low_count": 0, "drift_score": 1.0, "primary_token": primary_token, "packs_count": len(packs), "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": {}, "planned_queries_round0": 0, "planned_queries_round1": 0, "planned_queries_round2": 0, "drift_round0": 1.0, "drift_round1": "", "drift_round2": "", "auto_fix_rounds_used": 0}
-            return self.stop_for_llm("llm_invalid", "невалидные поисковые строки", search_anchors, packs, stats, t0)
+            fallback_query = self.normalize_query_text(self.build_boolean_query([primary_token] if primary_token else keywords_tokens[:1]))
+            if fallback_query:
+                seed_query_list = [fallback_query]
 
         if self.offline_fixtures:
             seed_rows = self.load_fixture()
@@ -2491,7 +2507,9 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             for q in seed_query_list:
                 used_queries += 1
                 try:
-                    rows, total = self.openalex_search_pack(q)
+                    rows, total = self.openalex_search_pack(q, concept_ids=concept_ids)
+                    if concept_ids and total < 5:
+                        rows, total = self.openalex_search_pack(q, concept_ids=[])
                     rows = rows[:MAX_PER_QUERY]
                     self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "total": total, "cap_used": MAX_PER_QUERY, "items_added": len(rows), "round": 0})
                     seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
@@ -2507,20 +2525,21 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
                 if ab in ab_map:
                     search_anchors.append(f"{ab_map[ab]} {ab}")
 
-        need_llm = len(seed_rows) == 0 and not self.offline_fixtures
+        need_llm = REQUIRE_LLM and len(seed_rows) == 0 and not self.offline_fixtures
         semantic_rows: List[Dict[str, Any]] = []
         recommend_rows: List[Dict[str, Any]] = []
         expanded: List[Dict[str, Any]] = []
 
-        if not need_llm and not self.offline_fixtures:
+        if SEMANTIC_SEARCH_ENABLE and not need_llm and not self.offline_fixtures:
             for p in packs[:2]:
                 semantic_rows.extend(self.semantic_scholar_search(p))
+        if OPENALEX_EXPAND_ENABLE and (not need_llm) and (not self.offline_fixtures):
             expanded = self.expand_openalex(seed_rows, packs)
         if len(seed_rows) < 20:
             expanded = []
 
         merged = self.dedup(seed_rows + semantic_rows + recommend_rows + expanded)
-        if not self.offline_fixtures:
+        if CROSSREF_ENRICH_ENABLE and not self.offline_fixtures:
             self.crossref_enrich(merged)
 
         passed_rows, support_rows, ranked_all, drift_score, metrics, blacklist_stats = self.apply_relevance_and_score(
@@ -2594,8 +2613,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         go_nogo = go_eval.get("go_nogo", "GO")
 
         if need_llm:
-            stats = {"seed_queries": used_queries, "seed_count": len(seed_rows), "total_candidates": len(ranked_all), "main_count": len(passed_rows), "support_count": len(support_rows), "low_count": max(len(ranked_all) - len(passed_rows) - len(support_rows), 0), "drift_score": round(drift_score, 4), "primary_token": primary_token, "primary_hit_count": metrics["primary_hit_count"], "packs_count": len(packs), "packs_hit_count": metrics["packs_hit_count"], "must_have_count": len(must_have_tokens), "support_tokens_count": len(support_tokens), "support_hit_count": metrics["support_hit_count"], "removed_duplicate_queries_count": self.search_log.get("removed_duplicate_queries_count", 0), "probe_counts": dict(probe_stats), "dataset_low_count": metrics["dataset_low_count"], "drift_blacklist_raw_count": blacklist_stats.get("raw_count", 0), "drift_blacklist_sanitized_count": blacklist_stats.get("sanitized_count", 0), "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])), "drift_blacklist_low_count": metrics["blacklist_low_count"], "dedup_merged_count": self.dedup_merged_count, "planned_queries_round0": planned_round_counts[0], "planned_queries_round1": planned_round_counts[1], "planned_queries_round2": planned_round_counts[2], "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0, "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "", "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "", "auto_fix_rounds_used": auto_fix_rounds_used, "must_have_selected_preview": [x.get("token", "") for x in auto_selected[:3]]}
-            return self.stop_for_llm("seed_zero", "seed=0", search_anchors, packs, stats, t0, passed_rows, support_rows, ranked_all)
+            self.search_log["errors"].append("seed_zero_warning: require_llm enabled but seed is empty; continuing in auto mode")
 
         if go_eval.get("go"):
             passed_rows, support_rows, ranked_all, drift_score, _ = self.maybe_add_citation_chasing(
