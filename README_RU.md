@@ -25,3 +25,15 @@ Stage B собирает корпус статей и всегда пишет а
 1. Запустите `RUN_B.bat`.
 2. Убедитесь, что в `ideas/<IDEA>/out` появились файлы выше.
 3. Откройте `stageB_summary.txt` и проверьте причины DEGRADED/OK.
+
+## Stage B: интерактивный шаг ANCHORS via ChatGPT
+Если Stage B остановился для уточнения anchors, он создаёт:
+- `ideas/<IDEA>/out/llm_prompt_B_anchors.txt`
+- `ideas/<IDEA>/in/llm_response_B_anchors.json`
+
+Что делать:
+1. Откройте `llm_prompt_B_anchors.txt` (он также копируется в буфер обмена из launcher).
+2. Вставьте prompt в ChatGPT.
+3. Получите ответ строго в формате JSON, без поясняющего текста.
+4. Вставьте JSON в `ideas/<IDEA>/in/llm_response_B_anchors.json` и сохраните файл.
+5. Снова запустите `RUN_B.bat` для продолжения Stage B.
