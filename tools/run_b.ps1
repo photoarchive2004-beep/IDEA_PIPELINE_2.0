@@ -93,7 +93,7 @@ try {
   if (-not (Test-Path $py))     { throw "Не найден .venv. Сначала запусти 0_SETUP.bat" }
   if (-not (Test-Path $module)) { throw "Не найден tools\module_b_lit_scout.py" }
 
-  Say "Stage B: проверяю зависимости..."
+  Say "Stage B1: проверяю зависимости..."
   Log "[CMD] $py -m pip install -r $req"
   & $py -m pip install -r $req *>> $Log
 
@@ -103,14 +103,14 @@ try {
     exit 0
   }
 
-  Say "Stage B: выполняю (идея: $ideaName, mode: $Mode, N: $N)..."
+  Say "Stage B1: выполняю (идея: $ideaName, mode: $Mode, N: $N)..."
   Log "[CMD] $py $module --idea-dir `"$IdeaDir`" --scope $($Mode.ToLowerInvariant()) --n $N"
   & $py $module --idea-dir $IdeaDir --scope $($Mode.ToLowerInvariant()) --n $N *>> $Log
   $rc = $LASTEXITCODE
 
   if ($rc -eq 0) {
     Say ""
-    Say "✅ Stage B готова."
+    Say "✅ Stage B1 готова."
     Say "Файлы: out\corpus.csv, out\corpus_all.csv, out\stageB_summary.txt, out\search_log_B.json"
     exit 0
   }
@@ -126,54 +126,64 @@ try {
     if (-not (Test-Path $RespPath)) { New-Item -ItemType File -Force -Path $RespPath | Out-Null }
 
     Say ""
-    Say "⚠️ Stage B ждёт ручной шаг."
+    Say "⚠️ Stage B1 ждёт ручной шаг."
 
     if ($stopReason -eq "llm_limit_reached_edit_json") {
-      Say "Лимит ChatGPT 3/3 уже использован."
+      Say "Лимит ChatGPT 3/3 уже использован для Stage B1."
       Say "Шаг 1: Откроется файл in\llm_response_B_anchors.json."
       Say "Шаг 2: Впиши или поправь JSON вручную."
       Say "Шаг 3: Сохрани файл."
       Say "Шаг 4: Прочитай подсказку в out\stageB_summary.txt."
-      Say "Шаг 5: Запусти RUN_B.bat снова."
+      Say "Шаг 5: Запусти RUN_B.bat снова (Этап B1)."
       Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
       if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
       exit 2
     }
 
     if (-not (Test-Path $PromptPath)) {
-      Say "Ожидался prompt, но не создан. Пересоздаю..."
+      Say "PROMPT не найден, пересоздаю..."
       Log "[CMD] $py $module --idea-dir `"$IdeaDir`" --scope $($Mode.ToLowerInvariant()) --n $N --emit-anchors-prompt-only"
       & $py $module --idea-dir $IdeaDir --scope $($Mode.ToLowerInvariant()) --n $N --emit-anchors-prompt-only *>> $Log
+      if (Test-Path $SummaryPath) {
+        $match2 = Select-String -LiteralPath $SummaryPath -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
+        if ($match2) { $stopReason = $match2.Matches[0].Groups[1].Value.Trim() }
+      }
+      if ($stopReason -eq "llm_limit_reached_edit_json") {
+        Say "Лимит исчерпан → отредактируй ideas\<IDEA>\in\llm_response_B_anchors.json и запусти снова"
+        Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
+        if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
+        exit 2
+      }
     }
 
     if (Test-Path $PromptPath) {
       Set-Clipboard -Value (Get-Content -Raw -LiteralPath $PromptPath)
       Say "Шаг 1: Открой ChatGPT."
-      Say "Шаг 2: Prompt Stage B уже в буфере обмена. Вставь его в ChatGPT."
+      Say "Шаг 2: Prompt Stage B1 уже в буфере обмена. Вставь его в ChatGPT."
       Say "Шаг 3: Скопируй обратно только JSON без текста."
       Say "Шаг 4: Вставь JSON в in\llm_response_B_anchors.json и сохрани."
-      Say "Шаг 5: Запусти RUN_B.bat снова."
+      Say "Шаг 5: Запусти RUN_B.bat снова (Этап B1)."
       Start-Process notepad.exe -ArgumentList $PromptPath | Out-Null
       Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
       if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
       exit 2
     }
 
-    Say "Ошибка Stage B: не найден файл prompt по пути $PromptPath"
-    Say "Открой out\stageB_summary.txt и проверь STOP_REASON."
+    Say "Ошибка Stage B1: не найден файл prompt по пути $PromptPath"
+    Say "Открой ideas\<IDEA>\out\stageB_summary.txt и проверь STOP_REASON."
     if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
     Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
     exit 1
   }
 
   Say ""
-  Say "❌ Stage B: ошибка. Открою лог."
+  Say "❌ Stage B1: ошибка. Открою лог."
   Start-Process notepad.exe -ArgumentList $Log | Out-Null
   exit 1
 }
 catch {
   Say ""
-  Say "❌ Stage B: ошибка запуска. Открою лог."
+  Say "❌ Stage B1: ошибка запуска. Открою лог."
   $_ | Out-String | Out-File -FilePath $Log -Append -Encoding UTF8
   Start-Process notepad.exe -ArgumentList $Log | Out-Null
   exit 1
