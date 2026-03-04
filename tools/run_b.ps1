@@ -88,7 +88,7 @@ function Clear-StageBOutputs([string]$outDir) {
   $files = @(
     "corpus.csv","corpus_all.csv","corpus_support.csv","corpus_support_all.csv",
     "corpus_background.csv","stageB_summary.txt","stageB1_summary.txt",
-    "search_log_B.json","search_log.json","search_strategy_B.md","prisma_lite.md","prisma_lite_B.md"
+    "search_log_B.json","search_log.json","search_strategy_B.md","prisma_lite.md","prisma_lite_B.md","llm_requests_B1.json"
   )
   foreach ($name in $files) {
     $p = Join-Path $outDir $name

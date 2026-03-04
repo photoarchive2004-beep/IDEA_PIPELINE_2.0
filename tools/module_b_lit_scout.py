@@ -83,16 +83,17 @@ PROBE_BROAD = 3000
 PROBE_OK = 50
 PROBE_NARROW = 2
 
-SEED_QUERIES_MAX = 8
+SEED_QUERIES_MAX = 9999
 SEED_QUERIES_MIN_ALIVE = 3
-MAX_PER_QUERY = 200
-MAX_SEED_ITEMS_TOTAL = 300
-AUTO_FIX_ROUNDS = 2
+OPENALEX_PER_PAGE = 200
+MAX_PER_QUERY = OPENALEX_PER_PAGE
+MAX_SEED_ITEMS_TOTAL = 1000000
+AUTO_FIX_ROUNDS = 9999
 DRIFT_TARGET = 0.30
 DRIFT_HARD_STOP = 0.60
 PRIMARY_SIGNAL_MIN = 0.20
 TOPN_FOR_METRICS = 50
-LLM_BUDGET_PER_IDEA = 10
+LLM_BUDGET_PER_IDEA = 0
 CITATION_CHASE_ENABLE = False
 CITATION_TOPK = 20
 OPENALEX_EXPAND_ENABLE = False
@@ -164,7 +165,7 @@ def norm_title(title: str) -> str:
 
 
 class StageB:
-    def __init__(self, idea_dir: Path, mode: str, offline_fixtures: Optional[Path], clean_out: bool = True, clean_hard: bool = False):
+    def __init__(self, idea_dir: Path, mode: str, offline_fixtures: Optional[Path], clean_out: bool = True, clean_hard: bool = False, target_n: int = 300):
         self.idea_dir = idea_dir
         self.mode = mode.upper()
         self.offline_fixtures = offline_fixtures
@@ -194,9 +195,10 @@ class StageB:
         self.session = requests.Session() if requests else None
         self.cache_root = self.repo_root / ".cache" / "stage_b1"
         self.cache_ttl_sec = 7 * 24 * 3600
-        self.request_caps = {"FOCUSED": 25, "BALANCED": 50, "WIDE": 90}
+        self.request_caps = {"FOCUSED": 0, "BALANCED": 0, "WIDE": 0}
         self.request_count = 0
         self.degraded_reasons: List[str] = []
+        self.openalex_unreachable = False
         self.search_log: Dict[str, Any] = {
             "run_id": self.run_id,
             "started_at": now_iso(),
@@ -252,6 +254,7 @@ class StageB:
         self.stage_config = self.load_stage_b1_config()
         self.clean_out = bool(clean_out)
         self.clean_hard = bool(clean_hard)
+        self.target_n = max(int(target_n or 300), 1)
         self.llm_budget = self.resolve_llm_budget_limit()
         self.llm_budget_path = self.out_dir / "llm_requests_B1.json"
         self.llm_budget_state = self.load_llm_budget_state()
@@ -270,13 +273,14 @@ class StageB:
                 "SEED_QUERIES_MAX": SEED_QUERIES_MAX,
                 "SEED_QUERIES_MIN_ALIVE": SEED_QUERIES_MIN_ALIVE,
                 "MAX_PER_QUERY": MAX_PER_QUERY,
+                "OPENALEX_PER_PAGE": OPENALEX_PER_PAGE,
                 "MAX_SEED_ITEMS_TOTAL": MAX_SEED_ITEMS_TOTAL,
                 "AUTO_FIX_ROUNDS": AUTO_FIX_ROUNDS,
                 "DRIFT_TARGET": DRIFT_TARGET,
                 "DRIFT_HARD_STOP": DRIFT_HARD_STOP,
                 "PRIMARY_SIGNAL_MIN": PRIMARY_SIGNAL_MIN,
                 "TOPN_FOR_METRICS": TOPN_FOR_METRICS,
-                "LLM_BUDGET_PER_IDEA": LLM_BUDGET_PER_IDEA,
+                "LLM_BUDGET_PER_IDEA": "disabled",
                 "CITATION_CHASE_ENABLE": CITATION_CHASE_ENABLE,
                 "CITATION_TOPK": CITATION_TOPK,
                 "CITATION_MAX_ADD": CITATION_MAX_ADD,
@@ -304,14 +308,7 @@ class StageB:
         return {}
 
     def resolve_llm_budget_limit(self) -> int:
-        cfg_limit = int(self.stage_config.get("llm_limit_default", LLM_BUDGET_PER_IDEA) or LLM_BUDGET_PER_IDEA)
-        env_limit = os.environ.get("STAGE_B1_LLM_LIMIT", "").strip()
-        if env_limit:
-            try:
-                return max(int(env_limit), 1)
-            except Exception:
-                return max(cfg_limit, 1)
-        return max(cfg_limit, 1)
+        return 0
 
     def reset_llm_budget_state(self) -> None:
         self.llm_budget_state = {
@@ -325,38 +322,30 @@ class StageB:
         }
         write_text(self.llm_budget_path, json.dumps(self.llm_budget_state, ensure_ascii=False, indent=2) + "\n")
 
-    def archive_previous_outputs(self) -> str:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_root = self.out_dir / "_archive"
-        archive_dir = archive_root / stamp
-        stage_artifacts = {
-            "corpus.csv", "corpus_all.csv", "corpus_support.csv", "corpus_support_all.csv",
-            "stageB_summary.txt", "stageB1_summary.txt", "search_log.json", "search_log_B.json",
-            "prisma_lite.md", "prisma_lite_B.md", "checkpoint.json", "runB.log", "llm_prompt_B1_anchors.txt",
-        }
-        candidates = [x for x in self.out_dir.iterdir() if x.name != "_archive"]
-        for item in candidates:
-            if item.name in stage_artifacts or item.name.startswith("search_log") or item.name.startswith("llm_prompt_"):
-                archive_dir.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(item), str(archive_dir / item.name))
-        if archive_root.exists():
-            archives = sorted([x for x in archive_root.iterdir() if x.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
-            for old in archives[30:]:
-                shutil.rmtree(old, ignore_errors=True)
+    def clear_stage_b_outputs(self) -> None:
+        targets = [
+            "corpus.csv", "corpus_all.csv", "corpus_support.csv", "corpus_support_all.csv", "corpus_background.csv",
+            "stageB_summary.txt", "stageB1_summary.txt", "search_log.json", "search_log_B.json", "search_strategy_B.md",
+            "prisma_lite.md", "prisma_lite_B.md", "checkpoint.json", "runB.log", "llm_prompt_B1_anchors.txt", "llm_requests_B1.json",
+        ]
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        return stamp
+        for name in targets:
+            fp = self.out_dir / name
+            if fp.exists():
+                fp.unlink()
+        for fp in self.out_dir.glob("llm_prompt_B*_*.txt"):
+            try:
+                fp.unlink()
+            except Exception:
+                pass
 
     def apply_cleaning(self) -> None:
         if not self.clean_out:
             return
-        stamp = self.archive_previous_outputs()
-        print(f"Очистка предыдущих результатов Stage B1: out → out/_archive/{stamp}")
+        self.clear_stage_b_outputs()
+        print("Очистка предыдущих результатов Stage B1: удалены старые Stage B outputs")
         if self.clean_hard:
             self.reset_llm_budget_state()
-            if self.response_path.exists():
-                response_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                archived = self.response_path.with_name(f"llm_response_B1_anchors.{response_stamp}.json")
-                shutil.move(str(self.response_path), str(archived))
 
     def log(self, msg: str) -> None:
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -387,11 +376,13 @@ class StageB:
         write_text(fp, json.dumps(body, ensure_ascii=False))
 
     def _request_budget_exceeded(self) -> bool:
-        return self.request_count >= int(self.request_caps.get(self.mode, 50))
+        return False
 
     def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None, query_kind: str = "seed") -> Tuple[Dict[str, Any], int, int]:
         if self.offline_fixtures:
             raise RuntimeError("offline")
+        if source == "openalex" and self.openalex_unreachable:
+            raise RuntimeError("OPENALEX unreachable")
         params = dict(params or {})
         if method.upper() == "GET":
             cached = self._cache_get(source, method, url, params)
@@ -401,9 +392,6 @@ class StageB:
                 return cached, 200, 0
             self.search_log.setdefault("cache", {"hits": 0, "misses": 0})
             self.search_log["cache"]["misses"] += 1
-        if self._request_budget_exceeded():
-            self.degraded_reasons.append("request_cap_reached")
-            raise RuntimeError("request_cap_reached")
         if source == "openalex":
             if self.openalex_key:
                 params.setdefault("api_key", self.openalex_key)
@@ -419,7 +407,7 @@ class StageB:
         if isinstance(params, dict):
             qtxt = str(params.get("search") or params.get("query") or params.get("query.title") or "")
 
-        retry_waits = [1, 2, 4]
+        retry_waits = [1, 2, 4, 8, 16, 32, 60]
         status_code = 0
         body_text = ""
         ms = 0
@@ -428,15 +416,16 @@ class StageB:
             try:
                 t0 = time.time()
                 if self.session:
-                    resp = self.session.request(method, url, params=params, json=payload, timeout=25, headers=headers)
+                    resp = self.session.request(method, url, params=params, json=payload, timeout=8, headers=headers)
                     ms = int((time.time() - t0) * 1000)
                     status_code = resp.status_code
                     body_text = resp.text
-                    if status_code in (409, 429, 502, 503) and attempt < len(retry_waits):
+                    if status_code in (409, 429, 500, 502, 503, 504) and attempt < len(retry_waits):
                         retry_after = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
                         delay = int(retry_after) if str(retry_after or "").isdigit() else wait_seconds
-                        self.search_log["errors"].append(f"{source}_{query_kind}_retry_http_{status_code}_attempt_{attempt}")
-                        time.sleep(max(delay, 1))
+                        delay = min(max(delay, 1), 60)
+                        self.search_log["errors"].append(f"{source}_{query_kind}_retry_http_{status_code}_attempt_{attempt}_sleep_{delay}s")
+                        time.sleep(delay)
                         continue
                 else:
                     final_url = url
@@ -446,7 +435,7 @@ class StageB:
                     if payload is not None:
                         data = json.dumps(payload).encode("utf-8")
                     req = urllib.request.Request(final_url, data=data, headers=headers, method=method)
-                    with urllib.request.urlopen(req, timeout=25) as r:
+                    with urllib.request.urlopen(req, timeout=8) as r:
                         status_code = int(getattr(r, "status", 200))
                         body_text = r.read().decode("utf-8", errors="ignore")
                     ms = int((time.time() - t0) * 1000)
@@ -471,6 +460,9 @@ class StageB:
                     "result_items": 0,
                     "error": str(e),
                 })
+                if source == "openalex":
+                    self.openalex_unreachable = True
+                    self.search_log["errors"].append("OPENALEX unreachable")
                 raise
 
         if last_error and status_code == 0:
@@ -1006,6 +998,8 @@ class StageB:
         return out
 
     def openalex_probe_count(self, token: str) -> Tuple[int, int]:
+        if self.openalex_unreachable:
+            return 0, 0
         params = {"search": token, "per-page": 1}
         endpoint = "https://api.openalex.org/works"
         try:
@@ -1092,7 +1086,7 @@ class StageB:
                 continue
             ok.append(query)
         ok = self.dedup_planned_queries(ok)
-        return ok[:SEED_QUERIES_MAX], bad
+        return ok, bad
 
     def classify_query_blocks(self, tokens: List[str]) -> Dict[str, List[str]]:
         primary = []
@@ -1178,9 +1172,7 @@ class StageB:
                     current = self.build_boolean_query(rebuilt[:3])
                 else:
                     break
-            if len(alive) >= SEED_QUERIES_MAX:
-                break
-        alive = self.dedup_planned_queries(alive)[:SEED_QUERIES_MAX]
+        alive = self.dedup_planned_queries(alive)
         self.search_log["planned_queries"] = alive
         self.search_log.setdefault("planner", {})["removed_duplicates"] = self.search_log.get("removed_duplicate_queries_count", 0)
         return alive
@@ -1203,42 +1195,50 @@ class StageB:
         self.search_log["concept_ids"] = concept_ids
         return concept_ids
 
-    def openalex_search_pack(self, query: str, concept_ids: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], int]:
+    def openalex_search_pack(self, query: str, concept_ids: Optional[List[str]] = None, target_remaining: int = 300) -> Tuple[List[Dict[str, Any]], int]:
         concept_ids = concept_ids or []
         filters = ["has_abstract:true"]
         if concept_ids:
             filters.append("concept.id:" + "|".join(concept_ids[:3]))
-        params = {"search": query, "per-page": MAX_PER_QUERY, "filter": ",".join(filters)}
         endpoint = "https://api.openalex.org/works"
-        try:
-            obj, status, elapsed = self.request_json("GET", endpoint, "openalex", params=params, query_kind="seed")
-            total = int((obj.get("meta") or {}).get("count") or 0)
-            items = obj.get("results", [])
-            if total < 5:
-                fallback_params = {"search": query, "per-page": MAX_PER_QUERY}
-                fallback_obj, _, _ = self.request_json("GET", endpoint, "openalex", params=fallback_params, query_kind="seed")
-                fallback_total = int((fallback_obj.get("meta") or {}).get("count") or 0)
-                if fallback_total > total:
-                    total = fallback_total
-                    items = fallback_obj.get("results", [])
-            if self.search_log["queries"]:
-                self.search_log["queries"][-1].update({
-                    "query_text": query,
-                    "anchor_pack_used": [query],
-                    "result_total": total,
-                    "total": total,
-                    "result_items": len(items),
-                })
-            if len(self.query_snippets) < 3:
-                self.query_snippets.append({"query_text": query, "result_total": total})
-            self.search_log["service_status"]["openalex"] = "ok"
-            return items, total
-        except Exception:
-            if self.search_log["queries"]:
-                self.search_log["queries"][-1].update({"query_text": query, "anchor_pack_used": [query]})
-            if len(self.query_snippets) < 3:
-                self.query_snippets.append({"query_text": query, "result_total": 0})
-            raise
+        all_items: List[Dict[str, Any]] = []
+        total = 0
+        page = 1
+        seen_page_keys: Set[str] = set()
+        while len(all_items) < max(target_remaining, 1):
+            params = {"search": query, "per-page": OPENALEX_PER_PAGE, "page": page, "filter": ",".join(filters)}
+            obj, _, _ = self.request_json("GET", endpoint, "openalex", params=params, query_kind="seed")
+            total = int((obj.get("meta") or {}).get("count") or total)
+            items = obj.get("results", []) or []
+            if not items:
+                break
+            new_on_page = 0
+            for w in items:
+                k = str(w.get("id") or normalize_doi(str(w.get("doi") or "")) or norm_title(str(w.get("title") or "")))
+                if not k or k in seen_page_keys:
+                    continue
+                seen_page_keys.add(k)
+                all_items.append(w)
+                new_on_page += 1
+                if len(all_items) >= max(target_remaining, 1):
+                    break
+            if new_on_page == 0:
+                break
+            page += 1
+
+        if self.search_log["queries"]:
+            self.search_log["queries"][-1].update({
+                "query_text": query,
+                "anchor_pack_used": [query],
+                "result_total": total,
+                "total": total,
+                "result_items": len(all_items),
+                "pages_fetched": page,
+            })
+        if len(self.query_snippets) < 3:
+            self.query_snippets.append({"query_text": query, "result_total": total})
+        self.search_log["service_status"]["openalex"] = "ok"
+        return all_items, total
 
     def paper_openalex(self, w: Dict[str, Any], tag: str) -> Dict[str, Any]:
         return {
@@ -1910,10 +1910,10 @@ class StageB:
             return defaults
 
     def llm_budget_used(self) -> int:
-        return int(self.llm_budget_state.get("used", 0) or 0)
+        return int(self.llm_prompts_created or 0)
 
     def llm_budget_remaining(self) -> int:
-        return max(self.llm_budget - self.llm_budget_used(), 0)
+        return 999999999
 
     def save_llm_budget_state(self, stop_reason: str, increment_used: bool, response_hash: str = "") -> None:
         used = self.llm_budget_used() + (1 if increment_used else 0)
@@ -2134,13 +2134,13 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         seed_queries = [q for q in self.search_log.get("queries", []) if q.get("source") == "openalex" and q.get("query_kind") == "seed"]
         unresolved = sorted([ab for ab in self.abbr_mentions if ab not in self.abbr_full_map])
         llm_path = self.llm_info.get("path", str((self.in_dir / "llm_response_B1_anchors.json").resolve()))
-        status_line = "WAITING_FOR_LLM" if wait_llm else str(stats.get("status", "DEGRADED"))
-        stop_line = stop_reason or ("waiting_for_llm" if wait_llm else "completed")
+        status_line = str(stats.get("status", "DEGRADED"))
+        stop_line = stop_reason or "completed"
         warnings: List[str] = []
         go_reasons = stats.get("go_reasons", []) if isinstance(stats.get("go_reasons", []), list) else []
         warnings.extend([f"go_metric:{x}" for x in go_reasons])
         for err in self.search_log.get("errors", []):
-            if any(key in str(err) for key in ["missing_openalex_api_key", "llm_invalid", "seed_zero", "query_preflight"]):
+            if any(key in str(err) for key in ["missing_openalex_api_key", "llm_invalid", "seed_zero", "query_preflight", "OPENALEX unreachable"]):
                 warnings.append(str(err))
         lines = [
             f"STATUS = {status_line}",
@@ -2167,6 +2167,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             f"drift_target = {self.drift_target}",
             f"context_coverage = {stats.get('context_coverage', 0)}",
             f"method_coverage = {stats.get('method_coverage', 0)}",
+            f"target_n = {stats.get('target_n', self.target_n)}",
             f"target_min_main = {stats.get('target_min_main', 0)}",
             f"drift_round0 = {stats.get('drift_round0', '')}",
             f"drift_round1 = {stats.get('drift_round1', '')}",
@@ -2185,10 +2186,8 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             f"llm_prompt_path = {self.prompt_path.resolve()}",
             f"llm_response_reason = {self.llm_info.get('reason', '')}",
             f"llm_response_schema = {self.llm_info.get('schema', 'invalid')}",
-            f"llm_budget_total = {self.llm_budget}",
-            f"llm_budget_used = {self.llm_budget_used()}",
-            f"llm_budget_remaining = {self.llm_budget_remaining()}",
-            f"llm_budget_used / llm_budget_limit = {self.llm_budget_used()}/{self.llm_budget}",
+            "llm_budget = disabled",
+            f"llm_prompt_requests_total = {self.llm_budget_used()}",
             f"llm_prompt_created = {'YES' if self.llm_prompt_created else 'NO'}",
             f"llm_prompts_created = {self.llm_prompts_created}",
             f"llm_used = {'YES' if self.llm_info.get('used') else 'NO'}",
@@ -2227,11 +2226,8 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         if wait_llm:
             lines.append(f"WAIT_FILE = {llm_path}")
             lines.append(f"PROMPT_FILE = {self.prompt_path.resolve()}")
-            lines.append(f"llm_budget_used / llm_budget_limit = {self.llm_budget_used()}/{self.llm_budget}")
-            if stop_reason == "llm_limit_reached":
-                lines.append("Лимит ChatGPT (10) исчерпан. Для улучшения: перезапусти в WIDE или уточни идею (добавь 1–2 предложения).")
-            else:
-                lines.append("Этап B1 ждёт JSON-ответ от ChatGPT.")
+            lines.append(f"llm_prompt_requests_total = {self.llm_budget_used()}")
+            lines.append("Этап B1 может использовать JSON-ответ от ChatGPT при наличии, но не требует его.")
         else:
             lines.append("Optional улучшение: можно положить in/llm_response_B1_anchors.json и перезапустить для более точных anchor-терминов.")
         summary_text = "\n".join(lines) + "\n"
@@ -2248,16 +2244,10 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         packs = self.build_anchor_packs(primary_token, base_tokens)
         self.ensure_llm_response_template(force=False)
         stop_reason = "emit_anchors_prompt_only"
-        if self.llm_budget_remaining() <= 0:
-            if self.prompt_path.exists():
-                self.prompt_path.unlink()
-            stop_reason = "llm_limit_reached"
-            print("Лимит ChatGPT (10) исчерпан. Stage B1 завершится в DEGRADED без падения.")
-        else:
-            created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "пересоздание prompt по запросу launcher")
-            if not created:
-                stop_reason = "internal_error_prompt_missing"
-                print("PROMPT Stage B1 не удалось создать автоматически.")
+        created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "пересоздание prompt по запросу launcher")
+        if not created:
+            stop_reason = "internal_error_prompt_missing"
+            print("PROMPT Stage B1 не удалось создать автоматически.")
         self.search_log["llm"] = dict(self.llm_info)
         self.write_summary({"primary_token": primary_token, "packs_count": len(packs)}, wait_llm=True, stop_reason=stop_reason)
         return 0
@@ -2277,20 +2267,14 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         self.write_corpus(passed_rows or [], support_rows or [], ranked_all or [], allow_replace=True)
         response_path = self.ensure_llm_response_template(force=False)
         prompt_path = self.prompt_path
-        if self.llm_budget_remaining() <= 0:
-            stop_reason = "llm_limit_reached"
-            if prompt_path.exists():
-                prompt_path.unlink()
-            self.save_llm_budget_state(stop_reason, increment_used=False, response_hash="")
-        else:
-            created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
-            resp_hash = ""
-            should_count = False
-            if self.user_response_present():
-                resp_hash = hashlib.sha256(read_text(self.response_path).encode("utf-8", errors="ignore")).hexdigest()
-                should_count = bool(created and resp_hash and resp_hash != str(self.llm_budget_state.get("last_response_hash", "")))
-            self.save_llm_budget_state(stop_reason, increment_used=should_count, response_hash=resp_hash)
-            if not created:
+        created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
+        resp_hash = ""
+        should_count = False
+        if self.user_response_present():
+            resp_hash = hashlib.sha256(read_text(self.response_path).encode("utf-8", errors="ignore")).hexdigest()
+            should_count = bool(created and resp_hash and resp_hash != str(self.llm_budget_state.get("last_response_hash", "")))
+        self.save_llm_budget_state(stop_reason, increment_used=should_count, response_hash=resp_hash)
+        if not created:
                 stats["stop_reason"] = "internal_error_prompt_missing"
                 stats["elapsed_ms"] = int((time.time() - t0) * 1000)
                 self.search_log["errors"].append("internal_error_prompt_missing: rc2 requested without llm_prompt_B1_anchors.txt")
@@ -2318,12 +2302,8 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         self.write_prisma(stats)
         self.write_summary(stats, wait_llm=True, stop_reason=stop_reason)
         self.save_checkpoint(self.search_log.get("input_hash", ""), "DEGRADED", stats)
-        if stop_reason == "llm_limit_reached":
-            print("Лимит 10 обращений к ChatGPT исчерпан. Новый prompt не создаётся.")
-            print("Для улучшения перезапусти в WIDE или уточни идею (добавь 1–2 предложения).")
-        else:
-            print(f"Этап B1 остановлен ({stop_reason}) и ждёт файл: {response_path}")
-        return 2
+        print(f"Этап B1 остановлен ({stop_reason}) и ждёт файл: {response_path}")
+        return 0
 
     def load_fixture(self) -> List[Dict[str, Any]]:
         fp = self.offline_fixtures / "openalex_seed.json" if self.offline_fixtures else None
@@ -2339,7 +2319,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2) + "\n")
         self.apply_cleaning()
         self.log("Stage B1 start")
-        self.log(f"llm_budget_used / llm_budget_limit = {self.llm_budget_used()}/{self.llm_budget}")
+        self.log(f"llm_prompt_requests_total = {self.llm_budget_used()}")
         self.log(f"Secrets: OPENALEX_API_KEY={'***' if self.openalex_key else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
 
         ok, idea_text = self.ensure_idea_text()
@@ -2370,24 +2350,6 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             self.save_checkpoint(input_hash, "OK", stats)
             return 0
         self.search_log["input_hash"] = input_hash
-        cp = self.load_checkpoint()
-        if cp.get("input_hash") == input_hash and cp.get("mode") == self.mode:
-            required = [self.out_dir / "corpus.csv", self.out_dir / "corpus_all.csv", self.out_dir / "search_log.json", self.out_dir / "prisma_lite.md", self.out_dir / "stageB_summary.txt"]
-            if all(x.exists() for x in required):
-                self.log("Checkpoint hit: network skipped")
-                return 0
-        if (not self.openalex_key) and (not self.offline_fixtures):
-            self.search_log["service_status"]["openalex"] = "degraded"
-            self.search_log["errors"].append("missing_openalex_api_key")
-            self.write_corpus([], [], [], allow_replace=True)
-            stats = {"main_count": 0, "support_count": 0, "low_count": 0, "seed_queries": 0, "seed_count": 0, "total_candidates": 0}
-            self.write_prisma(stats)
-            self.write_summary(stats, wait_llm=False)
-            log_text = json.dumps(self.search_log, ensure_ascii=False, indent=2)
-            write_text(self.search_log_path, log_text)
-            write_text(self.search_log_legacy_path, log_text)
-            self.save_checkpoint(input_hash, "DEGRADED", stats)
-            return 0
         self.geo_terms = self.detect_geo_terms(idea_text, structured)
         _, search_anchors, ab_map, all_abbr = self.build_anchors(idea_text, structured)
         keywords_for_search, keywords_used = self.get_keywords_for_search(idea_text, structured)
@@ -2505,20 +2467,21 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             seed_rows = self.load_fixture()
         else:
             for q in seed_query_list:
+                if len(self.dedup(seed_rows)) >= self.target_n:
+                    break
                 used_queries += 1
                 try:
-                    rows, total = self.openalex_search_pack(q, concept_ids=concept_ids)
+                    remaining = max(self.target_n - len(self.dedup(seed_rows)), 1)
+                    rows, total = self.openalex_search_pack(q, concept_ids=concept_ids, target_remaining=remaining)
                     if concept_ids and total < 5:
-                        rows, total = self.openalex_search_pack(q, concept_ids=[])
-                    rows = rows[:MAX_PER_QUERY]
-                    self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "total": total, "cap_used": MAX_PER_QUERY, "items_added": len(rows), "round": 0})
+                        rows, total = self.openalex_search_pack(q, concept_ids=[], target_remaining=remaining)
+                    self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "total": total, "cap_used": OPENALEX_PER_PAGE, "items_added": len(rows), "round": 0})
                     seed_rows.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
-                    if len(seed_rows) >= MAX_SEED_ITEMS_TOTAL:
-                        seed_rows = seed_rows[:MAX_SEED_ITEMS_TOTAL]
-                        break
                 except Exception as e:
                     self.search_log["service_status"]["openalex"] = "degraded"
                     self.search_log["errors"].append(f"openalex_seed_error: {e}")
+                    if self.openalex_unreachable:
+                        break
 
         if len(seed_rows) >= 30:
             for ab in list(all_abbr):
@@ -2557,13 +2520,15 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         auto_fix_rounds_used = 0
         planned_round_counts = {0: len(seed_query_list), 1: 0, 2: 0}
         if (not need_llm) and drift_score > self.drift_target:
-            for round_id in (1, 2):
+            round_id = 0
+            prev_drift = drift_score
+            while drift_score > self.drift_target:
+                round_id += 1
                 auto_fix_rounds_used = round_id
                 top_queries = [q for q in seed_query_list if any(self.token_match(t, self.normalize_text_for_match(q)) for t in must_have_tokens[:6])]
                 if not top_queries:
                     top_queries = seed_query_list[:]
-                limit = 6 if round_id == 1 else 5
-                seed_query_round = self.dedup_planned_queries(top_queries)[:limit]
+                seed_query_round = self.dedup_planned_queries(top_queries)
                 planned_round_counts[round_id] = len(seed_query_round)
                 if not seed_query_round:
                     break
@@ -2573,16 +2538,19 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
                 else:
                     for q in seed_query_round:
                         try:
-                            rows, total = self.openalex_search_pack(q)
-                            rows = rows[:MAX_PER_QUERY]
-                            self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "total": total, "cap_used": MAX_PER_QUERY, "items_added": len(rows), "round": round_id})
+                            remaining = max(self.target_n - len(self.dedup(seed_rows_round)), 1)
+                            rows, total = self.openalex_search_pack(q, target_remaining=remaining)
+                            self.search_log["executed_queries"].append({"query_text": q, "result_total": total, "total": total, "cap_used": OPENALEX_PER_PAGE, "items_added": len(rows), "round": round_id})
                             seed_rows_round.extend([self.paper_openalex(r, "openalex_seed") for r in rows])
-                            if len(seed_rows_round) >= MAX_SEED_ITEMS_TOTAL:
-                                seed_rows_round = seed_rows_round[:MAX_SEED_ITEMS_TOTAL]
+                            if len(self.dedup(seed_rows_round)) >= self.target_n:
                                 break
                         except Exception as e:
                             self.search_log["errors"].append(f"openalex_seed_error_round{round_id}: {e}")
+                            if self.openalex_unreachable:
+                                break
                 merged_round = self.dedup(seed_rows_round)
+                if len(merged_round) <= 0:
+                    break
                 passed_round, support_round, ranked_round, drift_round, _, _ = self.apply_relevance_and_score(
                     merged_round, primary_token, keywords_tokens, must_have_tokens, packs, drift_blacklist, support_tokens
                 )
@@ -2596,8 +2564,9 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
                 drift_score = drift_round
                 passed_rows, support_rows, ranked_all = passed_round, support_round, ranked_round
                 round_history.append(self.round_metrics(round_id, drift_score, len(seed_query_round), passed_rows, support_rows, ranked_all))
-                if drift_score <= self.drift_target:
+                if drift_score <= self.drift_target or drift_score >= prev_drift:
                     break
+                prev_drift = drift_score
 
         self.search_log["rounds"] = round_history
         self.search_log["blacklist"] = blacklist_stats
@@ -2625,6 +2594,9 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         if (not go_eval.get("go")):
             self.degraded_reasons.append("coverage_or_drift_below_target")
 
+        ranked_all = ranked_all[:self.target_n]
+        passed_rows = passed_rows[:self.target_n]
+        support_rows = support_rows[:max(self.target_n - len(passed_rows), 0)]
         self.write_corpus(passed_rows, support_rows, ranked_all, allow_replace=True)
         stats = {
             "seed_queries": used_queries,
@@ -2650,9 +2622,9 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             "drift_blacklist_dropped_count": len(blacklist_stats.get("dropped", [])),
             "drift_blacklist_low_count": metrics["blacklist_low_count"],
             "dedup_merged_count": self.dedup_merged_count,
-            "planned_queries_round0": planned_round_counts[0],
-            "planned_queries_round1": planned_round_counts[1],
-            "planned_queries_round2": planned_round_counts[2],
+            "planned_queries_round0": planned_round_counts.get(0, 0),
+            "planned_queries_round1": planned_round_counts.get(1, 0),
+            "planned_queries_round2": planned_round_counts.get(2, 0),
             "drift_round0": round_history[0]["drift_score"] if round_history else drift_round0,
             "drift_round1": round_history[1]["drift_score"] if len(round_history) > 1 else "",
             "drift_round2": round_history[2]["drift_score"] if len(round_history) > 2 else "",
@@ -2668,6 +2640,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             "pass_ratio": go_eval.get("pass_ratio", 0),
             "primary_signal": go_eval.get("primary_signal", 0),
             "alive_seed_queries": alive_seed_queries,
+            "target_n": self.target_n,
         }
         total_candidates = max(len(ranked_all), 1)
         context_coverage = round(float(metrics.get("packs_hit_count", 0)) / total_candidates, 4)
@@ -2714,7 +2687,7 @@ def main() -> int:
         raise SystemExit("--idea-dir (или --idea) обязателен")
     mode = args.mode or (args.scope.upper() if args.scope else "BALANCED")
     offline = Path(args.offline_fixtures) if args.offline_fixtures else None
-    stage = StageB(Path(idea), mode, offline, clean_out=args.clean_out, clean_hard=args.clean_hard)
+    stage = StageB(Path(idea), mode, offline, clean_out=args.clean_out, clean_hard=args.clean_hard, target_n=args.n)
     if args.emit_anchors_prompt_only:
         return stage.emit_anchors_prompt_only()
     return stage.run()
