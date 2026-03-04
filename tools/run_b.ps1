@@ -9,6 +9,10 @@ param(
 if ($Scope -and $Scope.Trim()) { $Mode = $Scope.ToUpperInvariant() }
 
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Text.UTF8Encoding]::new($false)
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
@@ -75,6 +79,10 @@ try {
   $IdeaDir = Resolve-IdeaDir $IdeaDir
   $IdeaDir = (Resolve-Path $IdeaDir).Path
   $ideaName = Split-Path $IdeaDir -Leaf
+  $OutDir = Join-Path $IdeaDir "out"
+  $PromptPath = Join-Path $OutDir "llm_prompt_B_anchors.txt"
+  $RespPath = Join-Path (Join-Path $IdeaDir "in") "llm_response_B_anchors.json"
+  $SummaryPath = Join-Path $OutDir "stageB_summary.txt"
 
   $hasIdea = Ensure-IdeaLayout $IdeaDir
 
@@ -108,18 +116,14 @@ try {
   }
 
   if ($rc -eq 2) {
-    $outDir = Join-Path $IdeaDir "out"
-    $prompt = Join-Path $outDir "llm_prompt_B_anchors.txt"
-    $resp = Join-Path $IdeaDir "in\llm_response_B_anchors.json"
-    $summary = Join-Path $outDir "stageB_summary.txt"
     $stopReason = ""
 
-    if (Test-Path $summary) {
-      $match = Select-String -LiteralPath $summary -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
+    if (Test-Path $SummaryPath) {
+      $match = Select-String -LiteralPath $SummaryPath -Pattern '^STOP_REASON\s*=\s*(.+)$' | Select-Object -Last 1
       if ($match) { $stopReason = $match.Matches[0].Groups[1].Value.Trim() }
     }
 
-    if (-not (Test-Path $resp)) { New-Item -ItemType File -Force -Path $resp | Out-Null }
+    if (-not (Test-Path $RespPath)) { New-Item -ItemType File -Force -Path $RespPath | Out-Null }
 
     Say ""
     Say "⚠️ Stage B ждёт ручной шаг."
@@ -131,28 +135,34 @@ try {
       Say "Шаг 3: Сохрани файл."
       Say "Шаг 4: Прочитай подсказку в out\stageB_summary.txt."
       Say "Шаг 5: Запусти RUN_B.bat снова."
-      Start-Process notepad.exe -ArgumentList $resp | Out-Null
-      if (Test-Path $summary) { Start-Process notepad.exe -ArgumentList $summary | Out-Null }
+      Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
+      if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
       exit 2
     }
 
-    if (Test-Path $prompt) {
-      Set-Clipboard -Value (Get-Content -Raw -LiteralPath $prompt)
+    if (-not (Test-Path $PromptPath)) {
+      Say "Ожидался prompt, но не создан. Пересоздаю..."
+      Log "[CMD] $py $module --idea-dir `"$IdeaDir`" --scope $($Mode.ToLowerInvariant()) --n $N --emit-anchors-prompt-only"
+      & $py $module --idea-dir $IdeaDir --scope $($Mode.ToLowerInvariant()) --n $N --emit-anchors-prompt-only *>> $Log
+    }
+
+    if (Test-Path $PromptPath) {
+      Set-Clipboard -Value (Get-Content -Raw -LiteralPath $PromptPath)
       Say "Шаг 1: Открой ChatGPT."
       Say "Шаг 2: Prompt Stage B уже в буфере обмена. Вставь его в ChatGPT."
       Say "Шаг 3: Скопируй обратно только JSON без текста."
       Say "Шаг 4: Вставь JSON в in\llm_response_B_anchors.json и сохрани."
       Say "Шаг 5: Запусти RUN_B.bat снова."
-      Start-Process notepad.exe -ArgumentList $prompt | Out-Null
-      Start-Process notepad.exe -ArgumentList $resp | Out-Null
-      if (Test-Path $summary) { Start-Process notepad.exe -ArgumentList $summary | Out-Null }
+      Start-Process notepad.exe -ArgumentList $PromptPath | Out-Null
+      Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
+      if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
       exit 2
     }
 
-    Say "Ошибка Stage B: не найден out\llm_prompt_B_anchors.txt."
+    Say "Ошибка Stage B: не найден файл prompt по пути $PromptPath"
     Say "Открой out\stageB_summary.txt и проверь STOP_REASON."
-    if (Test-Path $summary) { Start-Process notepad.exe -ArgumentList $summary | Out-Null }
-    Start-Process notepad.exe -ArgumentList $resp | Out-Null
+    if (Test-Path $SummaryPath) { Start-Process notepad.exe -ArgumentList $SummaryPath | Out-Null }
+    Start-Process notepad.exe -ArgumentList $RespPath | Out-Null
     exit 1
   }
 

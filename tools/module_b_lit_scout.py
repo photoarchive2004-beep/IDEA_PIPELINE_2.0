@@ -127,6 +127,13 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def parse_env(path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if not path.exists():
@@ -268,6 +275,8 @@ class StageB:
                 "STOPWORD_LIST_EN_RU_SIZE": len(STOPWORD_LIST_EN_RU),
             },
         }
+        self.prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
+        self.response_path = self.in_dir / "llm_response_B_anchors.json"
 
     def archive_previous_outputs(self) -> None:
         run_dir = self.out_dir / "_runs" / self.run_id
@@ -1844,9 +1853,11 @@ class StageB:
         write_text(self.llm_budget_path, json.dumps(self.llm_budget_state, ensure_ascii=False, indent=2) + "\n")
 
     def write_llm_anchor_prompt(self, anchors: List[str], packs: List[List[str]], reason: str) -> bool:
-        prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
+        prompt_path = self.prompt_path
         if self.llm_budget_remaining() <= 0:
             return False
+        safe_anchors = anchors or ["example anchor"]
+        safe_packs = packs or [["example anchor", "example method"]]
         txt = f"""Этап B остановлен: {reason}.
 Нужен ответ для OpenAlex в виде КОРОТКИХ английских токенов/фраз (латиница), а не предложений.
 Примеры корректных токенов: Phoxinus, HydroRIVERS, genotype-environment association, BayPass.
@@ -1864,16 +1875,35 @@ class StageB:
 Важно: drift_blacklist только на английском и только тематические направления/фразы длиной >= 5 символов.
 НЕ добавляй короткие куски вроде ob, ir, alt, gen: они ломают фильтр.
 Если сомневаешься в blacklist — лучше не добавляй элемент.
-Текущие anchors: {anchors}
-Текущие packs: {packs}
+5 шагов:
+1) Открой ChatGPT и вставь этот prompt.
+2) Попроси вернуть только JSON по схеме выше, без пояснений.
+3) Проверь JSON на валидность (скобки, кавычки, запятые).
+4) Скопируй JSON в файл ideas/<IDEA>/in/llm_response_B_anchors.json.
+5) Сохрани файл и снова запусти RUN_B.bat.
+Текущие anchors: {safe_anchors}
+Текущие packs: {safe_packs}
         """
-        write_text(prompt_path, txt)
+        write_text_atomic(prompt_path, txt)
         self.llm_prompt_created = True
         self.llm_prompts_created += 1
         return True
 
+    def user_response_present(self) -> bool:
+        p = self.response_path
+        if not p.exists():
+            return False
+        raw = read_text(p).strip()
+        if not raw or raw in {"{}", "[]"}:
+            return False
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return False
+        return isinstance(obj, dict) and len(obj) > 0
+
     def ensure_llm_response_template(self, force: bool = False) -> Path:
-        p = self.in_dir / "llm_response_B_anchors.json"
+        p = self.response_path
         if force or not p.exists():
             template = {
                 "refined_primary_token": "Phoxinus",
@@ -1888,7 +1918,7 @@ class StageB:
         return p
 
     def load_llm_anchor_response(self) -> Dict[str, Any]:
-        p = self.in_dir / "llm_response_B_anchors.json"
+        p = self.response_path
         if not p.exists():
             return {}
         try:
@@ -2006,6 +2036,7 @@ class StageB:
             f"llm_response_found = {'YES' if self.llm_info.get('found') else 'NO'}",
             f"llm_response_used = {'YES' if self.llm_info.get('used') else 'NO'}",
             f"llm_response_path = {llm_path}",
+            f"llm_prompt_path = {self.prompt_path.resolve()}",
             f"llm_response_reason = {self.llm_info.get('reason', '')}",
             f"llm_response_schema = {self.llm_info.get('schema', 'invalid')}",
             f"llm_budget_total = {self.llm_budget}",
@@ -2044,10 +2075,27 @@ class StageB:
         if wait_llm:
             lines.append(f"STOP_REASON = {stop_reason}")
             lines.append(f"WAIT_FILE = {llm_path}")
+            lines.append(f"PROMPT_FILE = {self.prompt_path.resolve()}")
             lines.append(f"LLM budget used: {self.llm_budget_used()} / {self.llm_budget}")
             if stop_reason == "llm_limit_reached_edit_json":
                 lines.append("Лимит 3 обращения к ChatGPT исчерпан. Отредактируй in/llm_response_B_anchors.json. Новый prompt не создаётся.")
-        write_text(self.out_dir / "stageB_summary.txt", "\n".join(lines) + "\n")
+        write_text_atomic(self.out_dir / "stageB_summary.txt", "\n".join(lines) + "\n")
+
+    def emit_anchors_prompt_only(self) -> int:
+        _, idea_text = self.ensure_idea_text()
+        structured = self.load_structured()
+        _, search_anchors, _, _ = self.build_anchors(idea_text, structured)
+        keywords_for_search, _ = self.get_keywords_for_search(idea_text, structured)
+        base_tokens = [x.lower() for x in self.sanitize_tokens(self.extract_keywords_tokens(keywords_for_search), context="keywords_tokens")]
+        primary_token = self.detect_primary_token(keywords_for_search, search_anchors)
+        packs = self.build_anchor_packs(primary_token, base_tokens)
+        self.ensure_llm_response_template(force=False)
+        created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], "пересоздание prompt по запросу launcher")
+        if not created:
+            print("Ожидался prompt, но не создан: лимит ChatGPT исчерпан.")
+        self.search_log["llm"] = dict(self.llm_info)
+        self.write_summary({"primary_token": primary_token, "packs_count": len(packs)}, wait_llm=True, stop_reason="emit_anchors_prompt_only")
+        return 0 if self.prompt_path.exists() else 1
 
     def round_metrics(self, round_id: int, drift_score: float, planned_queries_count: int, passed: List[Dict[str, Any]], support: List[Dict[str, Any]], ranked: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {
@@ -2063,7 +2111,7 @@ class StageB:
                      ranked_all: Optional[List[Dict[str, Any]]] = None) -> int:
         self.write_corpus(passed_rows or [], support_rows or [], ranked_all or [], allow_replace=True)
         response_path = self.ensure_llm_response_template(force=False)
-        prompt_path = self.out_dir / "llm_prompt_B_anchors.txt"
+        prompt_path = self.prompt_path
         if self.llm_budget_remaining() <= 0:
             stop_reason = "llm_limit_reached_edit_json"
             if prompt_path.exists():
@@ -2071,7 +2119,7 @@ class StageB:
             self.save_llm_budget_state(stop_reason, increment_used=False)
         else:
             created = self.write_llm_anchor_prompt(search_anchors[:20], packs[:6], reason_text)
-            self.save_llm_budget_state(stop_reason, increment_used=created)
+            self.save_llm_budget_state(stop_reason, increment_used=(created and self.user_response_present()))
             if not created:
                 stats["stop_reason"] = "internal_error_prompt_missing"
                 stats["elapsed_ms"] = int((time.time() - t0) * 1000)
@@ -2483,13 +2531,17 @@ def main() -> int:
     ap.add_argument("--scope", default="", choices=["", "balanced", "focused", "wide"])
     ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--offline-fixtures", default="")
+    ap.add_argument("--emit-anchors-prompt-only", action="store_true")
     args = ap.parse_args()
     idea = args.idea_dir or args.idea
     if not idea:
         raise SystemExit("--idea-dir (или --idea) обязателен")
     mode = args.mode or (args.scope.upper() if args.scope else "BALANCED")
     offline = Path(args.offline_fixtures) if args.offline_fixtures else None
-    return StageB(Path(idea), mode, offline).run()
+    stage = StageB(Path(idea), mode, offline)
+    if args.emit_anchors_prompt_only:
+        return stage.emit_anchors_prompt_only()
+    return stage.run()
 
 
 if __name__ == "__main__":
