@@ -325,6 +325,12 @@ class StageB:
         return {}
 
     def resolve_llm_budget_limit(self) -> int:
+        env_override = os.environ.get("STAGE_B1_LLM_LIMIT", "").strip()
+        if env_override:
+            try:
+                return max(int(env_override), 1)
+            except Exception:
+                pass
         cfg_val = self.stage_config.get("llm_limit_default", 10) if isinstance(self.stage_config, dict) else 10
         try:
             return max(int(cfg_val), 1)

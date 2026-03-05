@@ -12,6 +12,7 @@
 ## Что нового в Stage B1 (vNext)
 - Архивация `out` на каждом запуске: старые файлы перемещаются в `out/_archive/<timestamp>/`.
 - LLM-лимит мигрирован на `10` (из старых `3`).
+- Лимит LLM можно переопределить через `STAGE_B1_LLM_LIMIT` (по умолчанию `10`, с миграцией старых `limit<10`).
 - Launcher читает `STATUS`, `STOP_REASON`, `PROMPT_FILE`, `WAIT_FILE` из `stageB1_summary.txt` и не использует хардкод-пути.
 
 
