@@ -13,3 +13,9 @@
 - Архивация `out` на каждом запуске: старые файлы перемещаются в `out/_archive/<timestamp>/`.
 - LLM-лимит мигрирован на `10` (из старых `3`).
 - Launcher читает `STATUS`, `STOP_REASON`, `PROMPT_FILE`, `WAIT_FILE` из `stageB1_summary.txt` и не использует хардкод-пути.
+
+
+## Проверка после запуска (3 шага)
+1. Откройте `ideas/<IDEA>/out/stageB1_summary.txt` и проверьте `STATUS = OK` или `STATUS = DEGRADED`.
+2. Убедитесь, что в `ideas/<IDEA>/out` есть: `corpus_all.csv`, `corpus.csv`, `search_log.json`, `prisma_lite.md`, `stageB1_summary.txt`.
+3. Если нужен LLM-шаг, используйте только `PROMPT_FILE` и `WAIT_FILE` из summary: вставить prompt в ChatGPT и сохранить JSON в wait-файл, без ручных правок других JSON.

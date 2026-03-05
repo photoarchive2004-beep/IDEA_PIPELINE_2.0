@@ -88,15 +88,15 @@ SEED_QUERIES_MIN_ALIVE = 3
 OPENALEX_PER_PAGE = 200
 MAX_PER_QUERY = OPENALEX_PER_PAGE
 MAX_SEED_ITEMS_TOTAL = 1000000
-AUTO_FIX_ROUNDS = 9999
+AUTO_FIX_ROUNDS = 2
 DRIFT_TARGET = 0.30
 DRIFT_HARD_STOP = 0.60
 PRIMARY_SIGNAL_MIN = 0.20
 TOPN_FOR_METRICS = 50
-LLM_BUDGET_PER_IDEA = 0
-CITATION_CHASE_ENABLE = False
+LLM_BUDGET_PER_IDEA = 10
+CITATION_CHASE_ENABLE = True
 CITATION_TOPK = 20
-OPENALEX_EXPAND_ENABLE = False
+OPENALEX_EXPAND_ENABLE = True
 CROSSREF_ENRICH_ENABLE = False
 SEMANTIC_SEARCH_ENABLE = False
 REQUIRE_LLM = False
@@ -164,6 +164,17 @@ def norm_title(title: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-zа-я0-9 ]+", " ", (title or "").lower())).strip()
 
 
+def parse_openalex_meta_count(payload: Dict[str, Any]) -> int:
+    meta = payload.get("meta") if isinstance(payload, dict) else {}
+    if not isinstance(meta, dict):
+        return 0
+    raw = meta.get("count")
+    try:
+        return max(int(raw), 0)
+    except Exception:
+        return 0
+
+
 class StageB:
     def __init__(self, idea_dir: Path, mode: str, offline_fixtures: Optional[Path], clean_out: bool = True, clean_hard: bool = False, target_n: int = 300):
         self.idea_dir = idea_dir
@@ -203,6 +214,10 @@ class StageB:
             "run_id": self.run_id,
             "started_at": now_iso(),
             "mode": self.mode,
+            "secrets": {
+                "openalex_credential_present": bool(self.openalex_key),
+                "openalex_credential_last4": (self.openalex_key[-4:] if self.openalex_key else ""),
+            },
             "anchor_candidates": [],
             "anchor_top_display": [],
             "anchor_top_search": [],
@@ -256,6 +271,8 @@ class StageB:
         self.clean_hard = bool(clean_hard)
         self.target_n = max(int(target_n or 300), 1)
         self.llm_budget = self.resolve_llm_budget_limit()
+        self.citation_topk = int((self.stage_config.get("citation_topk", CITATION_TOPK) if isinstance(self.stage_config, dict) else CITATION_TOPK) or CITATION_TOPK)
+        self.citation_max_add = int((self.stage_config.get("citation_max_add", CITATION_MAX_ADD) if isinstance(self.stage_config, dict) else CITATION_MAX_ADD) or CITATION_MAX_ADD)
         self.llm_budget_path = self.out_dir / "llm_requests_B1.json"
         self.llm_budget_state = self.load_llm_budget_state()
         self.llm_prompts_created = 0
@@ -396,6 +413,37 @@ class StageB:
     def _request_budget_exceeded(self) -> bool:
         return False
 
+    def sanitize_params_for_log(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in (params or {}).items():
+            lk = str(k).lower()
+            if lk == "api_key":
+                out["credential"] = "***"
+                continue
+            text = str(v)
+            if self.openalex_key and self.openalex_key in text:
+                text = text.replace(self.openalex_key, "***")
+            out[k] = text
+        return out
+
+    def lint_query_press(self, query: str) -> List[str]:
+        issues: List[str] = []
+        q = (query or "").strip()
+        if not q:
+            return ["empty"]
+        if "  " in q:
+            issues.append("double_spaces")
+        if "AND AND" in q or "OR OR" in q:
+            issues.append("duplicate_boolean_operator")
+        if "()" in q:
+            issues.append("empty_group")
+        toks = [t for t in re.findall(r"[A-Za-z0-9\-]+", q.lower()) if t]
+        if len(toks) != len(set(toks)):
+            issues.append("duplicate_tokens")
+        if any(t in {"model", "analysis", "study", "data"} for t in toks):
+            issues.append("generic_terms_present")
+        return issues
+
     def request_json(self, method: str, url: str, source: str, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None, query_kind: str = "seed") -> Tuple[Dict[str, Any], int, int]:
         if self.offline_fixtures:
             raise RuntimeError("offline")
@@ -469,7 +517,7 @@ class StageB:
                     "source": source,
                     "query_kind": query_kind,
                     "endpoint_url": url,
-                    "params": params or {},
+                    "params": self.sanitize_params_for_log(params or {}),
                     "query_text": qtxt,
                     "anchor_pack_used": [],
                     "http_status": 0,
@@ -492,7 +540,7 @@ class StageB:
                 "source": source,
                 "query_kind": query_kind,
                 "endpoint_url": url,
-                "params": params or {},
+                "params": self.sanitize_params_for_log(params or {}),
                 "query_text": qtxt,
                 "anchor_pack_used": [],
                 "http_status": status_code,
@@ -507,7 +555,7 @@ class StageB:
             "source": source,
             "query_kind": query_kind,
             "endpoint_url": url,
-            "params": params or {},
+            "params": self.sanitize_params_for_log(params or {}),
             "query_text": qtxt,
             "anchor_pack_used": [],
             "http_status": status_code,
@@ -1023,7 +1071,7 @@ class StageB:
         try:
             obj, _, elapsed = self.request_json("GET", endpoint, "openalex", params=params, query_kind="probe")
             self.search_log["service_status"]["openalex"] = "ok"
-            total = int((obj.get("meta") or {}).get("count") or 0)
+            total = parse_openalex_meta_count(obj)
             return max(total, 0), elapsed
         except Exception as e:
             self.search_log["service_status"]["openalex"] = "degraded"
@@ -1156,6 +1204,7 @@ class StageB:
             self.search_log["errors"].append(f"query_preflight: {item}")
         self.search_log["query_blocks"] = {"A_primary": block_a, "B_phenomenon": block_b, "C_method": block_c}
         self.search_log["planned_queries"] = good[:6]
+        self.search_log["press_lint"] = [{"query": qx, "issues": self.lint_query_press(qx)} for qx in good[:6]]
         return good[:6]
 
 
@@ -1226,7 +1275,7 @@ class StageB:
         while len(all_items) < max(target_remaining, 1):
             params = {"search": query, "per-page": OPENALEX_PER_PAGE, "page": page, "filter": ",".join(filters)}
             obj, _, _ = self.request_json("GET", endpoint, "openalex", params=params, query_kind="seed")
-            total = int((obj.get("meta") or {}).get("count") or total)
+            total = parse_openalex_meta_count(obj) or total
             items = obj.get("results", []) or []
             if not items:
                 break
@@ -1756,35 +1805,37 @@ class StageB:
             "reasons": reasons,
         }
 
+    def build_citation_filter_params(self, mode: str, seed_ids: List[str], per_page: int) -> Dict[str, Any]:
+        cleaned = [sid.split('/')[-1] for sid in seed_ids if sid]
+        if not cleaned:
+            return {"filter": "", "per-page": per_page}
+        prefix = "cites" if mode == "forward" else "cited_by"
+        return {"filter": f"{prefix}:{'|'.join(cleaned)}", "per-page": per_page}
+
     def maybe_add_citation_chasing(self, main_rows: List[Dict[str, Any]], ranked_all: List[Dict[str, Any]],
                                    primary_token: str, keywords_tokens: List[str], must_have_tokens: List[str],
                                    packs: List[List[str]], drift_blacklist: List[str], support_tokens: List[str],
                                    baseline_drift: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], float, bool]:
         if (not CITATION_CHASE_ENABLE) or self.offline_fixtures:
             return main_rows, [], ranked_all, baseline_drift, False
-        seeds = sorted(main_rows, key=lambda r: float(r.get("score_main", 0)), reverse=True)[:CITATION_TOPK]
+        seeds = sorted(main_rows, key=lambda r: float(r.get("score_main", 0)), reverse=True)[:self.citation_topk]
+        seed_ids = [(seed.get("openalex_id") or "").strip() for seed in seeds if (seed.get("openalex_id") or "").strip()]
         added: List[Dict[str, Any]] = []
-        for seed in seeds:
-            if len(added) >= CITATION_MAX_ADD:
+        for mode, tag in (("backward", "openalex_backward"), ("forward", "openalex_forward")):
+            if len(added) >= self.citation_max_add:
                 break
-            sid = (seed.get("openalex_id") or "").strip()
-            if not sid:
+            params = self.build_citation_filter_params(mode, seed_ids[:CITATION_PER_SEED_CAP], CITATION_PER_SEED_CAP)
+            if not params.get("filter"):
                 continue
-            wid = sid.split("/")[-1]
-            for rid in (seed.get("referenced_works") or [])[:CITATION_PER_SEED_CAP]:
-                try:
-                    obj, _, _ = self.request_json("GET", f"https://api.openalex.org/works/{rid.split('/')[-1]}", "openalex", query_kind="citation")
-                    added.append(self.paper_openalex(obj, "openalex_backward"))
-                except Exception:
-                    continue
             try:
-                params = {"filter": f"cites:{wid}", "per-page": CITATION_PER_SEED_CAP}
                 obj, _, _ = self.request_json("GET", "https://api.openalex.org/works", "openalex", params=params, query_kind="citation")
                 for w in (obj.get("results") or [])[:CITATION_PER_SEED_CAP]:
-                    added.append(self.paper_openalex(w, "openalex_forward"))
+                    added.append(self.paper_openalex(w, tag))
+                    if len(added) >= self.citation_max_add:
+                        break
             except Exception:
-                pass
-        added = self.dedup(added)[:CITATION_MAX_ADD]
+                continue
+        added = self.dedup(added)[:self.citation_max_add]
         if not added:
             return main_rows, [], ranked_all, baseline_drift, False
         passed, support, ranked, drift_after, _, _ = self.apply_relevance_and_score(
@@ -2173,6 +2224,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             f"support_tokens_count = {stats.get('support_tokens_count', 0)}",
             f"support_hit_count = {stats.get('support_hit_count', 0)}",
             f"planned_queries_count = {len(self.search_log.get('planned_queries', []))}",
+            f"press_lint_issues_total = {sum(len(i.get('issues', [])) for i in self.search_log.get('press_lint', []))}",
             f"removed_duplicate_queries_count = {self.search_log.get('removed_duplicate_queries_count', 0)}",
             f"stopwords_removed = {self.search_log.get('token_sanitation', {}).get('stopwords_removed_count', 0)}",
             f"dataset_low_count = {stats.get('dataset_low_count', 0)}",
@@ -2539,10 +2591,13 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
 
         auto_fix_rounds_used = 0
         planned_round_counts = {0: len(seed_query_list), 1: 0, 2: 0}
+        seen_query_sets: Set[Tuple[str, ...]] = {tuple(seed_query_list)}
+        no_progress_streak = 0
         if (not need_llm) and drift_score > self.drift_target:
             round_id = 0
             prev_drift = drift_score
-            while drift_score > self.drift_target:
+            prev_main_count = len(passed_rows)
+            while drift_score > self.drift_target and round_id < AUTO_FIX_ROUNDS:
                 round_id += 1
                 auto_fix_rounds_used = round_id
                 top_queries = [q for q in seed_query_list if any(self.token_match(t, self.normalize_text_for_match(q)) for t in must_have_tokens[:6])]
@@ -2550,6 +2605,12 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
                     top_queries = seed_query_list[:]
                 seed_query_round = self.dedup_planned_queries(top_queries)
                 planned_round_counts[round_id] = len(seed_query_round)
+                q_key = tuple(seed_query_round)
+                if q_key in seen_query_sets:
+                    self.search_log["errors"].append(f"stopping_rule_duplicate_planned_queries_round{round_id}")
+                    self.degraded_reasons.append("duplicate_planned_queries")
+                    break
+                seen_query_sets.add(q_key)
                 if not seed_query_round:
                     break
                 seed_rows_round: List[Dict[str, Any]] = []
@@ -2584,6 +2645,17 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
                 drift_score = drift_round
                 passed_rows, support_rows, ranked_all = passed_round, support_round, ranked_round
                 round_history.append(self.round_metrics(round_id, drift_score, len(seed_query_round), passed_rows, support_rows, ranked_all))
+                delta_unique_main = len(passed_rows) - prev_main_count
+                delta_drift = round(prev_drift - drift_score, 4)
+                if delta_unique_main <= 0 and delta_drift <= 0:
+                    no_progress_streak += 1
+                else:
+                    no_progress_streak = 0
+                prev_main_count = len(passed_rows)
+                if no_progress_streak >= 2:
+                    self.search_log["errors"].append("stopping_rule_no_progress")
+                    self.degraded_reasons.append("no_progress")
+                    break
                 if drift_score <= self.drift_target or drift_score >= prev_drift:
                     break
                 prev_drift = drift_score
