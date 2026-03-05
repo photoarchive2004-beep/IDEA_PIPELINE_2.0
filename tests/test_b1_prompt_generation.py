@@ -31,3 +31,7 @@ def test_b1_emit_prompt_contains_schema_and_paths() -> None:
         assert summary_path.exists()
         summary = summary_path.read_text(encoding="utf-8")
         assert f"PROMPT_FILE = {prompt_path.resolve()}" in summary
+        assert "STATUS = WAITING_FOR_LLM" in summary
+        assert "STOP_REASON = emit_anchors_prompt_only" in summary
+        assert "WAIT_FILE =" in summary
+        assert "PROMPT_FILE =" in summary

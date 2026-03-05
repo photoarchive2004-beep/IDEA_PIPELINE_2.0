@@ -308,7 +308,11 @@ class StageB:
         return {}
 
     def resolve_llm_budget_limit(self) -> int:
-        return 0
+        cfg_val = self.stage_config.get("llm_limit_default", 10) if isinstance(self.stage_config, dict) else 10
+        try:
+            return max(int(cfg_val), 1)
+        except Exception:
+            return 10
 
     def reset_llm_budget_state(self) -> None:
         self.llm_budget_state = {
@@ -339,11 +343,25 @@ class StageB:
             except Exception:
                 pass
 
+    def archive_out_dir(self) -> Optional[Path]:
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        existing = [x for x in self.out_dir.iterdir() if x.name != "_archive"]
+        if not existing:
+            return None
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        arc = self.out_dir / "_archive" / ts
+        arc.mkdir(parents=True, exist_ok=True)
+        for item in existing:
+            shutil.move(str(item), str(arc / item.name))
+        return arc
+
     def apply_cleaning(self) -> None:
         if not self.clean_out:
             return
-        self.clear_stage_b_outputs()
-        print("Очистка предыдущих результатов Stage B1: удалены старые Stage B outputs")
+        archived_to = self.archive_out_dir()
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        if archived_to:
+            print(f"Очистка предыдущих результатов Stage B1: out архивирован в {archived_to}")
         if self.clean_hard:
             self.reset_llm_budget_state()
 
@@ -1910,13 +1928,13 @@ class StageB:
             return defaults
 
     def llm_budget_used(self) -> int:
-        return int(self.llm_prompts_created or 0)
+        return int(self.llm_budget_state.get("used", 0) or 0)
 
     def llm_budget_remaining(self) -> int:
-        return 999999999
+        return max(int(self.llm_budget) - self.llm_budget_used(), 0)
 
     def save_llm_budget_state(self, stop_reason: str, increment_used: bool, response_hash: str = "") -> None:
-        used = self.llm_budget_used() + (1 if increment_used else 0)
+        used = int(self.llm_budget_state.get("used", 0) or 0) + (1 if increment_used else 0)
         history = list(self.llm_budget_state.get("history", []))
         history.append({
             "ts": now_iso(),
@@ -2186,7 +2204,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             f"llm_prompt_path = {self.prompt_path.resolve()}",
             f"llm_response_reason = {self.llm_info.get('reason', '')}",
             f"llm_response_schema = {self.llm_info.get('schema', 'invalid')}",
-            "llm_budget = disabled",
+            f"llm_budget = {self.llm_budget}",
             f"llm_prompt_requests_total = {self.llm_budget_used()}",
             f"llm_prompt_created = {'YES' if self.llm_prompt_created else 'NO'}",
             f"llm_prompts_created = {self.llm_prompts_created}",
@@ -2224,6 +2242,8 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
             lines.append(f"аббревиатура не раскрыта: {ab}")
             self.log(f"аббревиатура не раскрыта: {ab}")
         if wait_llm:
+            status_line = "WAITING_FOR_LLM"
+            lines[0] = f"STATUS = {status_line}"
             lines.append(f"WAIT_FILE = {llm_path}")
             lines.append(f"PROMPT_FILE = {self.prompt_path.resolve()}")
             lines.append(f"llm_prompt_requests_total = {self.llm_budget_used()}")
@@ -2303,7 +2323,7 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
         self.write_summary(stats, wait_llm=True, stop_reason=stop_reason)
         self.save_checkpoint(self.search_log.get("input_hash", ""), "DEGRADED", stats)
         print(f"Этап B1 остановлен ({stop_reason}) и ждёт файл: {response_path}")
-        return 0
+        return 2
 
     def load_fixture(self) -> List[Dict[str, Any]]:
         fp = self.offline_fixtures / "openalex_seed.json" if self.offline_fixtures else None
@@ -2316,8 +2336,8 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
     def run(self) -> int:
         t0 = time.time()
         self.search_log["phase"] = "PHASE_0_CLEAN_LOAD"
-        write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2) + "\n")
         self.apply_cleaning()
+        write_text(self.search_log_path, json.dumps(self.search_log, ensure_ascii=False, indent=2) + "\n")
         self.log("Stage B1 start")
         self.log(f"llm_prompt_requests_total = {self.llm_budget_used()}")
         self.log(f"Secrets: OPENALEX_API_KEY={'***' if self.openalex_key else '(missing)'}, SEMANTIC_SCHOLAR_API_KEY={'***' if self.s2_key else '(missing)'}")
