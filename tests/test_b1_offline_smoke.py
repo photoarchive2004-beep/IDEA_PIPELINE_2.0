@@ -67,3 +67,17 @@ def test_budget_migration_from_3_to_10() -> None:
         stage = StageB(idea_dir, "BALANCED", offline_fixtures=None)
         assert stage.llm_budget == 10
         assert int(stage.llm_budget_state.get("limit", 0)) >= 10
+
+
+def test_llm_limit_env_override(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("STAGE_B1_LLM_LIMIT", "12")
+    idea = tmp_path / "IDEA-B1-LIMIT-OVERRIDE"
+    (idea / "in").mkdir(parents=True)
+    (idea / "out").mkdir(parents=True)
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    from module_b_lit_scout import StageB  # type: ignore
+
+    stage = StageB(idea, "BALANCED", offline_fixtures=None)
+    assert stage.llm_budget == 12
+    assert int(stage.llm_budget_state.get("limit", 0)) >= 12
