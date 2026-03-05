@@ -22,3 +22,15 @@
 1. Откройте `ideas/<IDEA>/out/stageB1_summary.txt` и проверьте `STATUS = OK` или `STATUS = DEGRADED`.
 2. Убедитесь, что в `ideas/<IDEA>/out` есть: `corpus_all.csv`, `corpus.csv`, `search_log.json`, `prisma_lite.md`, `stageB1_summary.txt`.
 3. Если нужен LLM-шаг, используйте только `PROMPT_FILE` и `WAIT_FILE` из summary: вставить prompt в ChatGPT и сохранить JSON в wait-файл, без ручных правок других JSON.
+
+## Проверка RUN_B: анти-«тихий вылет»
+
+Проверены и задокументированы 3 сценария:
+1. **Ошибка пути IDEA**: `RUN_B.bat` с несуществующим `IdeaDir` должен показать `FAILED code ...`, открыть `launcher_logs\\runB_last.log`, сделать `PAUSE`.
+2. **Ошибка Python (exit code != 0)**: при неуспешном завершении Python `RUN_B.bat` также должен показать `FAILED code ...`, открыть `launcher_logs\\runB_last.log`, сделать `PAUSE`.
+3. **Успех**: при успешном прогоне `RUN_B.bat` выводит `OK` и завершает работу с кодом `0`.
+
+Технические гарантии в коде:
+- `tools/run_b_launcher.ps1` всегда создаёт `launcher_logs/runB_last.log` со строкой `START run_b_launcher ...` и в `catch` дублирует ошибку в `runB_launcher_error.log` и `runB_last.log`.
+- `tools/run_b.ps1` всегда пишет `START run_b.ps1 ...`, логирует исключения и возвращает `exit 1` на ошибках.
+- `RUN_B.bat` при ошибке открывает `runB_last.log` (и только если его нет — `runB_launcher_error.log`), печатает путь логов и ждёт `PAUSE`.

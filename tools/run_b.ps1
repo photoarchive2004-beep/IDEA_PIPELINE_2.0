@@ -23,7 +23,7 @@ Set-Location $Root
 $LogDir = Join-Path $Root "launcher_logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $Log = Join-Path $LogDir "runB_last.log"
-"" | Out-File -FilePath $Log -Encoding UTF8
+"START run_b.ps1 $(Get-Date -Format o) Mode=$Mode N=$N IdeaDir=$IdeaDir CleanHard=$($CleanHard.IsPresent)" | Out-File -FilePath $Log -Encoding UTF8
 
 function Say([string]$s){ Write-Host $s }
 function Log([string]$s){ $s | Out-File -FilePath $Log -Append -Encoding UTF8 }
@@ -123,10 +123,12 @@ try {
   Say "Stage B1: проверяю зависимости..."
   Log "[CMD] $py -m pip install -r $req"
   & $py -m pip install -r $req *>> $Log
+  if ($LASTEXITCODE -ne 0) { throw "pip install завершился с кодом $LASTEXITCODE" }
 
   if (-not $hasIdea) {
     Say ""
     Say "⚠️ Не найден idea.txt. Заполни in\idea.txt и запусти RUN_B.bat снова."
+    Log "OK"
     exit 0
   }
 
@@ -167,18 +169,17 @@ try {
     Say ""
     Say "✅ Stage B1 завершена ($statusValue)."
     Say "Файлы: out\corpus.csv, out\corpus_all.csv, out\stageB1_summary.txt, out\search_log.json"
+    Log "OK"
     exit 0
   }
 
-  Say ""
-  Say "❌ Stage B1: ошибка (STOP_REASON=$stopReason). Открою лог."
-  Start-Process notepad.exe -ArgumentList $Log | Out-Null
-  exit 1
+  throw "Stage B1 завершился с кодом $rc (STOP_REASON=$stopReason)"
 }
 catch {
   Say ""
   Say "❌ Stage B1: ошибка запуска. Открою лог."
-  $_ | Out-String | Out-File -FilePath $Log -Append -Encoding UTF8
+  Log "ERROR: $($_.Exception.Message)"
+  Log ($_ | Out-String)
   Start-Process notepad.exe -ArgumentList $Log | Out-Null
   exit 1
 }
