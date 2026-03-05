@@ -8,5 +8,6 @@
   "citation_topk": 20,
   "citation_max_add": 30,
   "max_per_topic": 40,
-  "max_per_venue": 25
+  "max_per_venue": 25,
+  "clean_out_default": true
 }

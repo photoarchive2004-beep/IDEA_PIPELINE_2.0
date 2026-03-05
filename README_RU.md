@@ -15,6 +15,8 @@
 - Лимит LLM можно переопределить через `STAGE_B1_LLM_LIMIT` (по умолчанию `10`, с миграцией старых `limit<10`).
 - Launcher читает `STATUS`, `STOP_REASON`, `PROMPT_FILE`, `WAIT_FILE` из `stageB1_summary.txt` и не использует хардкод-пути.
 
+## SECURITY NOTE
+Если в старых логах/артефактах Stage B1 ранее встречался `OPENALEX_API_KEY`, ключ нужно немедленно перевыпустить в OpenAlex и обновить `config/secrets.env`.
 
 ## Проверка после запуска (3 шага)
 1. Откройте `ideas/<IDEA>/out/stageB1_summary.txt` и проверьте `STATUS = OK` или `STATUS = DEGRADED`.

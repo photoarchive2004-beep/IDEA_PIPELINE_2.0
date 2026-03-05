@@ -170,6 +170,8 @@ def parse_openalex_meta_count(payload: Dict[str, Any]) -> int:
         return 0
     raw = meta.get("count")
     try:
+        if isinstance(raw, str):
+            raw = raw.replace(",", "").strip()
         return max(int(raw), 0)
     except Exception:
         return 0
@@ -215,6 +217,8 @@ class StageB:
             "started_at": now_iso(),
             "mode": self.mode,
             "secrets": {
+                "api_key_present": bool(self.openalex_key),
+                "api_key_last4": (self.openalex_key[-4:] if self.openalex_key else ""),
                 "openalex_credential_present": bool(self.openalex_key),
                 "openalex_credential_last4": (self.openalex_key[-4:] if self.openalex_key else ""),
             },
@@ -427,6 +431,7 @@ class StageB:
                 out["credential"] = "***"
                 continue
             text = str(v)
+            text = re.sub(r"(?i)(api_key=)[^&\s]+", r"\1***", text)
             if self.openalex_key and self.openalex_key in text:
                 text = text.replace(self.openalex_key, "***")
             out[k] = text
@@ -2615,6 +2620,11 @@ JSON SCHEMA (must match exactly; notes_for_user must be empty string):
                 if q_key in seen_query_sets:
                     self.search_log["errors"].append(f"stopping_rule_duplicate_planned_queries_round{round_id}")
                     self.degraded_reasons.append("duplicate_planned_queries")
+                    if ranked_all:
+                        self.search_log["errors"].append("fallback_snowball_once")
+                        passed_rows, support_rows, ranked_all, drift_score, _ = self.maybe_add_citation_chasing(
+                            passed_rows, ranked_all, primary_token, keywords_tokens, must_have_tokens, packs, drift_blacklist, support_tokens, drift_score
+                        )
                     break
                 seen_query_sets.add(q_key)
                 if not seed_query_round:
