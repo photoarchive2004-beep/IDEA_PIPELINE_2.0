@@ -1,3 +1,12 @@
 {
-  "llm_limit_default": 10
+  "llm_limit_default": 10,
+  "scope_caps": {
+    "focused": 180,
+    "balanced": 300,
+    "wide": 450
+  },
+  "citation_topk": 20,
+  "citation_max_add": 30,
+  "max_per_topic": 40,
+  "max_per_venue": 25
 }
