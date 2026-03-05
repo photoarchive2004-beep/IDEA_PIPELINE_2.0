@@ -8,3 +8,8 @@
 
 
 В `stageB1_summary.txt` теперь всегда есть строки `STATUS = OK|DEGRADED|WAITING_FOR_LLM`, `STOP_REASON`, `PROMPT_FILE`, `WAIT_FILE`.
+
+## Что нового в Stage B1 (vNext)
+- Архивация `out` на каждом запуске: старые файлы перемещаются в `out/_archive/<timestamp>/`.
+- LLM-лимит мигрирован на `10` (из старых `3`).
+- Launcher читает `STATUS`, `STOP_REASON`, `PROMPT_FILE`, `WAIT_FILE` из `stageB1_summary.txt` и не использует хардкод-пути.

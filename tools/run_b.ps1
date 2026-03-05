@@ -127,9 +127,6 @@ try {
     exit 0
   }
 
-  $cleanStamp = Get-Date -Format "yyyyMMdd-HHmmss"
-  Say "Очистка предыдущих результатов Stage B1: out → out/_archive/$cleanStamp"
-  Clear-StageBOutputs $OutDir
   Say "Stage B1: выполняю (идея: $ideaName, mode: $Mode, N: $N)..."
   $cmdArgs = @("--idea-dir", $IdeaDir, "--scope", $($Mode.ToLowerInvariant()), "--n", "$N", "--clean-out")
   if ($CleanHard) { $cmdArgs += "--clean-hard" }
@@ -137,8 +134,33 @@ try {
   & $py $module @cmdArgs *>> $Log
   $rc = $LASTEXITCODE
 
+  $statusValue = Read-SummaryValue $SummaryPath "STATUS" ""
+  $stopReason = Read-SummaryValue $SummaryPath "STOP_REASON" ""
+  $promptFile = Read-SummaryValue $SummaryPath "PROMPT_FILE" $PromptPath
+  $waitFile = Read-SummaryValue $SummaryPath "WAIT_FILE" $RespPath
+
+  if (($rc -eq 2) -or ($statusValue -eq "WAITING_FOR_LLM")) {
+    Say ""
+    Say "⏸️ Stage B1 ждёт JSON-ответ ChatGPT."
+    Say "PROMPT_FILE: $promptFile"
+    Say "WAIT_FILE:   $waitFile"
+    if (Test-Path $promptFile) {
+      Start-Process notepad.exe -ArgumentList $promptFile | Out-Null
+      Set-Clipboard -Value (Get-Content -LiteralPath $promptFile -Raw)
+      } else {
+      Say "⚠️ PROMPT_FILE не найден: $promptFile"
+    }
+    Say "PROMPT скопирован в буфер обмена. Вставьте его в ChatGPT и сохраните ответ JSON в WAIT_FILE."
+    Read-Host "Нажмите Enter после сохранения JSON" | Out-Null
+    if (Test-Path $waitFile) {
+      Say "JSON найден. Перезапускаю Stage B1..."
+      & $py $module @cmdArgs *>> $Log
+      $rc = $LASTEXITCODE
+      $statusValue = Read-SummaryValue $SummaryPath "STATUS" "DEGRADED"
+    }
+  }
+
   if ($rc -eq 0) {
-    $statusValue = Read-SummaryValue $SummaryPath "STATUS" "OK"
     Say ""
     Say "✅ Stage B1 завершена ($statusValue)."
     Say "Файлы: out\corpus.csv, out\corpus_all.csv, out\stageB1_summary.txt, out\search_log.json"
@@ -146,7 +168,7 @@ try {
   }
 
   Say ""
-  Say "❌ Stage B1: ошибка. Открою лог."
+  Say "❌ Stage B1: ошибка (STOP_REASON=$stopReason). Открою лог."
   Start-Process notepad.exe -ArgumentList $Log | Out-Null
   exit 1
 }
