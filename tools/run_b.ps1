@@ -14,6 +14,9 @@ $ErrorActionPreference = "Stop"
 $OutputEncoding = [Text.UTF8Encoding]::new($false)
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
+if (-not $env:STAGE_B1_LLM_LIMIT -or [string]::IsNullOrWhiteSpace($env:STAGE_B1_LLM_LIMIT)) {
+  $env:STAGE_B1_LLM_LIMIT = "10"
+}
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
